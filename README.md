@@ -10,6 +10,9 @@
 
 The IDA MCP Recursive Export Shim is a multithreaded command-line utility that communicates directly with an `ida-pro-mcp` server. It starts from the function under the current IDA cursor, an explicit address, or a function name; recursively follows direct `CALL` instructions and cross-function tail `JMP` instructions; and exports assembly, Hex-Rays pseudocode, graph relationships, failures, timing, retries, health data, and run statistics.
 
+<img width="1167" height="1142" alt="image" src="https://github.com/user-attachments/assets/ba591a17-5e17-49c0-880c-9a994ba2d318" />
+
+
 ## Requirements
 
 | Requirement | Description |
