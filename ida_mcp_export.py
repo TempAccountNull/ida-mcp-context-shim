@@ -6,6 +6,7 @@ Uses curl for Streamable HTTP MCP JSON-RPC requests, as requested.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -126,7 +127,6 @@ class CurlMcpClient:
         self.timeout = timeout
         self.session_id: str | None = None
         self.request_id = 0
-        vlog(2, "MCP", f"Created client url={self.url} timeout={self.timeout}s curl={self.curl}")
 
     def _post(self, method: str, params: dict[str, Any] | None = None, *, notification: bool = False) -> Any:
         payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
@@ -574,8 +574,457 @@ def enable_windows_ansi() -> None:
         pass
 
 
+class WindowsConsoleFont:
+    """Temporarily use one readable font size for dense verbose views.
+
+    Verbose level 1 keeps the user's normal console font. Verbose levels 2-6
+    all use the same modestly reduced target height so the full live dashboard
+    fits without progressively shrinking higher levels into unreadable text.
+    The original font is restored automatically when the exporter exits.
+    Windows Terminal/ConPTY may reject the legacy font API; in that case the
+    exporter simply keeps the current font.
+    """
+
+    AUTO_HEIGHT = {2: 13, 3: 13, 4: 13, 5: 13, 6: 13}
+
+    def __init__(self) -> None:
+        self._restore = None
+
+    def apply_for_verbose(self, level: int) -> bool:
+        if os.name != "nt" or not sys.stdout.isatty() or level < 2:
+            return False
+        target_height = self.AUTO_HEIGHT.get(min(6, int(level)))
+        if not target_height:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class COORD(ctypes.Structure):
+                _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+            class CONSOLE_FONT_INFOEX(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.ULONG),
+                    ("nFont", wintypes.DWORD),
+                    ("dwFontSize", COORD),
+                    ("FontFamily", wintypes.UINT),
+                    ("FontWeight", wintypes.UINT),
+                    ("FaceName", wintypes.WCHAR * 32),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+            kernel32.GetStdHandle.restype = wintypes.HANDLE
+            kernel32.GetCurrentConsoleFontEx.argtypes = [
+                wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(CONSOLE_FONT_INFOEX)
+            ]
+            kernel32.GetCurrentConsoleFontEx.restype = wintypes.BOOL
+            kernel32.SetCurrentConsoleFontEx.argtypes = [
+                wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(CONSOLE_FONT_INFOEX)
+            ]
+            kernel32.SetCurrentConsoleFontEx.restype = wintypes.BOOL
+
+            handle = kernel32.GetStdHandle(wintypes.DWORD(-11 & 0xFFFFFFFF))
+            if not handle or handle == wintypes.HANDLE(-1).value:
+                return False
+
+            original = CONSOLE_FONT_INFOEX()
+            original.cbSize = ctypes.sizeof(CONSOLE_FONT_INFOEX)
+            if not kernel32.GetCurrentConsoleFontEx(handle, False, ctypes.byref(original)):
+                return False
+
+            old_height = int(original.dwFontSize.Y)
+            old_width = int(original.dwFontSize.X)
+            if old_height <= 0 or old_height <= target_height:
+                return False
+
+            updated = CONSOLE_FONT_INFOEX()
+            ctypes.memmove(ctypes.byref(updated), ctypes.byref(original), ctypes.sizeof(original))
+            updated.cbSize = ctypes.sizeof(CONSOLE_FONT_INFOEX)
+            updated.dwFontSize.Y = target_height
+            if old_width > 0:
+                updated.dwFontSize.X = max(1, round(old_width * target_height / old_height))
+
+            if not kernel32.SetCurrentConsoleFontEx(handle, False, ctypes.byref(updated)):
+                return False
+
+            def restore() -> None:
+                try:
+                    kernel32.SetCurrentConsoleFontEx(handle, False, ctypes.byref(original))
+                except Exception:
+                    pass
+
+            self._restore = restore
+            atexit.register(self.restore)
+            return True
+        except Exception:
+            return False
+
+    def restore(self) -> None:
+        restore, self._restore = self._restore, None
+        if restore is not None:
+            restore()
+
+
+CONSOLE_FONT = WindowsConsoleFont()
+
+
+class WindowsConsoleLayout:
+    """Temporarily give Verbose 2-6 the tested classic-cmd layout.
+
+    The console buffer remains wide enough for the dense verbose fields, while
+    the outer Command Prompt window is resized to the user's tested
+    1200 x 1181 pixel dimensions.  This keeps all dashboard rows visible at the
+    shared readable font size without making Verbose 3-6 progressively smaller.
+    Modern Windows Terminal/ConPTY may reject the legacy window APIs; in that
+    case the current window is left untouched and normal complete-field
+    trimming still applies.
+    """
+
+    TARGET_COLUMNS = 200
+    TARGET_ROWS = 86
+    TARGET_PIXEL_WIDTH = 1200
+    TARGET_PIXEL_HEIGHT = 1181
+
+    def __init__(self) -> None:
+        self._restore = None
+
+    def apply_for_verbose(self, level: int) -> bool:
+        if os.name != "nt" or not sys.stdout.isatty() or int(level) < 2:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class COORD(ctypes.Structure):
+                _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+            class SMALL_RECT(ctypes.Structure):
+                _fields_ = [
+                    ("Left", wintypes.SHORT),
+                    ("Top", wintypes.SHORT),
+                    ("Right", wintypes.SHORT),
+                    ("Bottom", wintypes.SHORT),
+                ]
+
+            class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", COORD),
+                    ("dwCursorPosition", COORD),
+                    ("wAttributes", wintypes.WORD),
+                    ("srWindow", SMALL_RECT),
+                    ("dwMaximumWindowSize", COORD),
+                ]
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("Left", wintypes.LONG),
+                    ("Top", wintypes.LONG),
+                    ("Right", wintypes.LONG),
+                    ("Bottom", wintypes.LONG),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+            kernel32.GetStdHandle.restype = wintypes.HANDLE
+            kernel32.GetConsoleScreenBufferInfo.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(CONSOLE_SCREEN_BUFFER_INFO)
+            ]
+            kernel32.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
+            kernel32.GetLargestConsoleWindowSize.argtypes = [wintypes.HANDLE]
+            kernel32.GetLargestConsoleWindowSize.restype = COORD
+            kernel32.SetConsoleScreenBufferSize.argtypes = [wintypes.HANDLE, COORD]
+            kernel32.SetConsoleScreenBufferSize.restype = wintypes.BOOL
+            kernel32.SetConsoleWindowInfo.argtypes = [
+                wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(SMALL_RECT)
+            ]
+            kernel32.SetConsoleWindowInfo.restype = wintypes.BOOL
+            kernel32.GetConsoleWindow.argtypes = []
+            kernel32.GetConsoleWindow.restype = wintypes.HWND
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+            user32.GetWindowRect.restype = wintypes.BOOL
+            user32.MoveWindow.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL
+            ]
+            user32.MoveWindow.restype = wintypes.BOOL
+
+            handle = kernel32.GetStdHandle(wintypes.DWORD(-11 & 0xFFFFFFFF))
+            if not handle or handle == ctypes.c_void_p(-1).value:
+                return False
+
+            original = CONSOLE_SCREEN_BUFFER_INFO()
+            if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(original)):
+                return False
+
+            hwnd = kernel32.GetConsoleWindow()
+            original_rect = RECT()
+            have_window_rect = bool(hwnd and user32.GetWindowRect(hwnd, ctypes.byref(original_rect)))
+
+            largest = kernel32.GetLargestConsoleWindowSize(handle)
+            target_width = min(self.TARGET_COLUMNS, max(1, int(largest.X)))
+            target_height = min(self.TARGET_ROWS, max(1, int(largest.Y)))
+
+            current_width = int(original.srWindow.Right) - int(original.srWindow.Left) + 1
+            current_height = int(original.srWindow.Bottom) - int(original.srWindow.Top) + 1
+            if current_width == target_width and current_height == target_height:
+                return False
+
+            original_window = SMALL_RECT(
+                original.srWindow.Left, original.srWindow.Top,
+                original.srWindow.Right, original.srWindow.Bottom,
+            )
+            original_buffer = COORD(original.dwSize.X, original.dwSize.Y)
+
+            # Shrink the visible rectangle first when necessary, then size the
+            # backing buffer, and finally set the requested visible rectangle.
+            if target_width < current_width or target_height < current_height:
+                interim = SMALL_RECT(0, 0, min(current_width, target_width) - 1,
+                                     min(current_height, target_height) - 1)
+                if not kernel32.SetConsoleWindowInfo(handle, True, ctypes.byref(interim)):
+                    return False
+
+            target_buffer = COORD(
+                max(target_width, int(original.dwSize.X)),
+                max(target_height, int(original.dwSize.Y)),
+            )
+            if not kernel32.SetConsoleScreenBufferSize(handle, target_buffer):
+                return False
+
+            target_window = SMALL_RECT(0, 0, target_width - 1, target_height - 1)
+            if not kernel32.SetConsoleWindowInfo(handle, True, ctypes.byref(target_window)):
+                try:
+                    kernel32.SetConsoleWindowInfo(handle, True, ctypes.byref(original_window))
+                    kernel32.SetConsoleScreenBufferSize(handle, original_buffer)
+                except Exception:
+                    pass
+                return False
+
+            # Match the manually tested outer Command Prompt dimensions.  The
+            # 200-column backing buffer is intentionally retained, so a narrow
+            # horizontal scrollbar can still expose exceptionally long Verbose
+            # 6 payload/header lines without forcing a smaller font.
+            if have_window_rect:
+                if not user32.MoveWindow(
+                    hwnd,
+                    int(original_rect.Left),
+                    int(original_rect.Top),
+                    self.TARGET_PIXEL_WIDTH,
+                    self.TARGET_PIXEL_HEIGHT,
+                    True,
+                ):
+                    try:
+                        kernel32.SetConsoleWindowInfo(handle, True, ctypes.byref(original_window))
+                        kernel32.SetConsoleScreenBufferSize(handle, original_buffer)
+                    except Exception:
+                        pass
+                    return False
+
+            def restore() -> None:
+                try:
+                    # The window must fit inside the buffer while restoring.
+                    restore_buffer = COORD(
+                        max(int(original_buffer.X), int(original_window.Right) + 1),
+                        max(int(original_buffer.Y), int(original_window.Bottom) + 1),
+                    )
+                    kernel32.SetConsoleScreenBufferSize(handle, restore_buffer)
+                    kernel32.SetConsoleWindowInfo(handle, True, ctypes.byref(original_window))
+                    kernel32.SetConsoleScreenBufferSize(handle, original_buffer)
+                    if have_window_rect:
+                        user32.MoveWindow(
+                            hwnd,
+                            int(original_rect.Left),
+                            int(original_rect.Top),
+                            int(original_rect.Right - original_rect.Left),
+                            int(original_rect.Bottom - original_rect.Top),
+                            True,
+                        )
+                except Exception:
+                    pass
+
+            self._restore = restore
+            atexit.register(self.restore)
+            return True
+        except Exception:
+            return False
+
+    def restore(self) -> None:
+        restore, self._restore = self._restore, None
+        if restore is not None:
+            restore()
+
+
+CONSOLE_LAYOUT = WindowsConsoleLayout()
+
+
 def color(text: str, code: str) -> str:
     return f"{code}{text}{Colors.RESET}" if sys.stdout.isatty() else text
+
+
+_SEMANTIC_KEYS = (
+    r"rc|duration|age/dur|response_bytes|bytes|retries|timeouts|failures|"
+    r"page_size|page|pages|offset|insns|instructions|lines|max_instructions|"
+    r"function_timeout|depth|candidate|candidates|resolving|edges|accepted|targets|"
+    r"found|queued|active|processed|discovered_total|next_frontier|skip|skipped|unresolved|"
+    r"dup|duplicates|chars|asm_chars|pseudo_chars|source|type|target|function|"
+    r"addr|address|instruction|request_id|session|id"
+)
+
+_SEMANTIC_DETAIL_RE = re.compile(
+    rf'(?P<json_field>"(?:{_SEMANTIC_KEYS})"\s*:\s*(?:"[^"\r\n]*"|[^,\}}\]\s]+))'
+    r"|(?P<http>\b(?:POST|GET|PUT|PATCH|DELETE)\b)"
+    r"|(?P<ok>\bOK\b)"
+    r"|(?P<mcp>\bMCP=[^\s|]+)"
+    r"|(?P<method>\bmethod=[^\s|]+)"
+    r"|(?P<request>\brequest_id=[^\s|]+)"
+    r"|(?P<session>\bsession=[^\s|]+)"
+    rf"|(?P<metric>\b(?:{_SEMANTIC_KEYS})=[^\s|,]+)"
+    r"|(?P<arrow_target>->\s+[^\s|,\}]+)"
+    r"|(?P<address>\b(?:0x)?[0-9A-Fa-f]{10,16}\b)"
+    r"|(?P<success>\b(?:Complete|Completed|Finished)\b)"
+    r"|(?P<calling>\bCalling\b)"
+    r"|(?P<start>\b(?:Start|Assigned)\b)"
+    r"|(?P<failure>\b(?:Failed|Failure|Timed out|Timeout)\b)",
+    re.IGNORECASE,
+)
+
+
+def _parse_numeric(value: str) -> int | None:
+    clean = value.strip().strip('"').replace(",", "")
+    try:
+        return int(clean, 0)
+    except ValueError:
+        return None
+
+
+def _metric_value_tone(key_lower: str, value: str) -> str:
+    numeric = _parse_numeric(value)
+    if key_lower in {"rc", "failures", "timeouts", "unresolved"}:
+        if numeric == 0:
+            return Colors.GREEN + Colors.BOLD
+        return Colors.RED + Colors.BOLD
+    if key_lower in {"dup", "duplicates", "retries"}:
+        return Colors.GREEN + Colors.BOLD if numeric == 0 else Colors.YELLOW + Colors.BOLD
+    if key_lower in {"page_size", "page", "pages", "max_instructions", "function_timeout", "depth"}:
+        return Colors.YELLOW + Colors.BOLD
+    if key_lower == "offset":
+        return Colors.CYAN + Colors.BOLD
+    if key_lower in {"insns", "instructions", "lines"}:
+        return Colors.GREEN + Colors.BOLD
+    if key_lower in {"candidate", "candidates", "resolving", "edges", "accepted", "found", "processed", "discovered_total"}:
+        return Colors.GREEN + Colors.BOLD
+    if key_lower in {"target", "targets"}:
+        return Colors.MAGENTA + Colors.BOLD
+    if key_lower in {"queued", "active", "next_frontier"}:
+        return Colors.YELLOW + Colors.BOLD
+    if key_lower in {"response_bytes", "bytes", "chars", "asm_chars", "pseudo_chars", "duration", "age/dur"}:
+        return Colors.CYAN + Colors.BOLD
+    if key_lower in {"request_id", "id"}:
+        return Colors.YELLOW + Colors.BOLD
+    if key_lower == "session":
+        return Colors.MAGENTA
+    if key_lower in {"type", "source"}:
+        return Colors.MAGENTA
+    if key_lower in {"function", "addr", "address", "instruction"}:
+        return Colors.CYAN + Colors.BOLD
+    if key_lower in {"skip", "skipped"}:
+        return Colors.GREEN + Colors.BOLD if numeric == 0 else Colors.YELLOW + Colors.BOLD
+    return Colors.WHITE
+
+
+def highlight_debug_detail(text: str) -> str:
+    """Color high-value request fields without changing the displayed text."""
+    if not sys.stdout.isatty():
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        group = match.lastgroup
+        if group == "json_field":
+            parsed = re.match(r'"([^"]+)"(\s*:\s*)(.*)', token)
+            if not parsed:
+                return token
+            key, separator, raw_value = parsed.groups()
+            key_text = color(f'"{key}"', Colors.DIM)
+            value_text = color(raw_value, _metric_value_tone(key.lower(), raw_value))
+            return key_text + separator + value_text
+        if group == "http":
+            verb = token.upper()
+            tone = {
+                "POST": Colors.CYAN,
+                "GET": Colors.GREEN,
+                "PUT": Colors.YELLOW,
+                "PATCH": Colors.MAGENTA,
+                "DELETE": Colors.RED,
+            }.get(verb, Colors.CYAN)
+            return color(token, tone + Colors.BOLD)
+        if group == "ok":
+            return color(token, Colors.GREEN + Colors.BOLD)
+        if group == "mcp":
+            key, value = token.split("=", 1)
+            return color(key + "=", Colors.DIM) + color(value, Colors.BLUE + Colors.BOLD)
+        if group == "method":
+            key, value = token.split("=", 1)
+            return color(key + "=", Colors.DIM) + color(value, Colors.BLUE + Colors.BOLD)
+        if group == "request":
+            key, value = token.split("=", 1)
+            return color(key + "=", Colors.DIM) + color(value, Colors.YELLOW + Colors.BOLD)
+        if group == "session":
+            key, value = token.split("=", 1)
+            return color(key + "=", Colors.DIM) + color(value, Colors.MAGENTA)
+        if group == "metric":
+            key, value = token.split("=", 1)
+            key_text = color(key + "=", Colors.DIM)
+            return key_text + color(value, _metric_value_tone(key.lower(), value))
+        if group == "arrow_target":
+            arrow, target = token.split(None, 1)
+            return color(arrow, Colors.DIM) + " " + color(target, Colors.MAGENTA + Colors.BOLD)
+        if group == "address":
+            return color(token, Colors.CYAN + Colors.BOLD)
+        if group == "success":
+            return color(token, Colors.GREEN + Colors.BOLD)
+        if group == "calling":
+            return color(token, Colors.BLUE + Colors.BOLD)
+        if group == "start":
+            return color(token, Colors.WHITE + Colors.BOLD)
+        if group == "failure":
+            return color(token, Colors.RED + Colors.BOLD)
+        return token
+
+    return _SEMANTIC_DETAIL_RE.sub(replace, text)
+
+
+def stage_color(stage: str) -> str:
+    if stage == "Completed":
+        return Colors.GREEN + Colors.BOLD
+    if stage in {"Failed", "Timed out"}:
+        return Colors.RED + Colors.BOLD
+    if stage in {"Retrying", "Waiting for MCP", "Downloading MCP result"}:
+        return Colors.YELLOW + Colors.BOLD
+    if stage in {"Decompiling", "Resolving target", "Resolving targets"}:
+        return Colors.MAGENTA + Colors.BOLD
+    if stage in {"Exporting assembly", "Reading disassembly", "Discovering", "Exporting"}:
+        return Colors.BLUE + Colors.BOLD
+    return Colors.WHITE
+
+
+def category_color(category: str) -> str:
+    if category in {"MCP", "MCP-DOWNLOAD"}:
+        return Colors.CYAN + Colors.BOLD
+    if category == "TOOL":
+        return Colors.BLUE + Colors.BOLD
+    if category == "RETRY":
+        return Colors.YELLOW + Colors.BOLD
+    if category == "TIMEOUT" or "FAIL" in category:
+        return Colors.RED + Colors.BOLD
+    if category.startswith("WORKER-"):
+        return Colors.GREEN + Colors.BOLD
+    if category.startswith(("DISCOVERY", "RESOLVE")):
+        return Colors.MAGENTA
+    if category.startswith("EXPORT"):
+        return Colors.BLUE
+    return Colors.WHITE
 
 
 def status(stage: str, message: str, *, tone: str = "cyan") -> None:
@@ -880,6 +1329,14 @@ class LiveDebugPanel:
                     # Keep the useful stage instead of replacing it with "raw".
                     pass
 
+    def reset(self) -> None:
+        """Clear stage-specific debug history before the next pipeline stage."""
+        with self.lock:
+            self.events.clear()
+            self.workers.clear()
+            self.category_counts.clear()
+            self.total_events = 0
+
     @staticmethod
     def _watch_state(age: float, request_age: float = 0.0) -> tuple[str, str]:
         # These labels are diagnostic hints, not proof that a worker is dead.
@@ -895,7 +1352,41 @@ class LiveDebugPanel:
     @staticmethod
     def _trim(text: str, width: int) -> str:
         text = text.replace("\r", " ").replace("\n", " ")
-        return text if len(text) <= width else text[: max(0, width - 3)] + "..."
+        if len(text) <= width:
+            return text
+
+        # Never leave unreadable fragments such as ``re...`` or ``rc...``.
+        # Prefer removing the final incomplete field entirely. If there is no
+        # sensible separator, fall back to a clean hard cut without ellipsis.
+        cut = text[: max(0, width)].rstrip()
+        safe_positions = [
+            cut.rfind(" | "),
+            cut.rfind("  "),
+            cut.rfind(" "),
+            cut.rfind(","),
+        ]
+        safe = max(safe_positions)
+        if safe >= max(8, width // 2):
+            cut = cut[:safe]
+        return cut.rstrip(" |,;:")
+
+    @classmethod
+    def _join_complete_parts(cls, parts: list[str], width: int) -> str:
+        """Join diagnostic fields while only displaying complete fields."""
+        clean = [part.strip() for part in parts if part and part.strip() and part.strip() != "-"]
+        if not clean:
+            return "-"
+
+        output = ""
+        for part in clean:
+            candidate = part if not output else f"{output} | {part}"
+            if len(candidate) <= width:
+                output = candidate
+                continue
+            if not output:
+                output = cls._trim(part, width)
+            break
+        return output or "-"
 
     def _event_limit(self) -> int:
         return {1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 18}[self.level]
@@ -956,10 +1447,14 @@ class LiveDebugPanel:
                 function = self._trim(worker.function, 42 if self.level == 1 else 20)
                 watch_pad = " " * max(0, 10 - len(watch))
 
+                stage_plain = self._trim(worker.stage, 22)
+                stage_text = color(stage_plain, stage_color(worker.stage))
+                stage_pad = " " * max(0, 22 - len(stage_plain))
+
                 if self.level == 1:
                     lines.append(
                         f"{name:<18.18} {color(watch, watch_color)}{watch_pad} "
-                        f"{format_duration(age):<12} {self._trim(worker.stage, 22):<22} {function}"
+                        f"{format_duration(age):<12} {stage_text}{stage_pad} {function}"
                     )
                     continue
 
@@ -968,9 +1463,12 @@ class LiveDebugPanel:
                     detail_parts.append(worker.detail)
                 if self.level >= 3 and worker.request_method != "-":
                     req_age = format_duration(request_age) if request_age else f"{worker.request_duration:.3f}s"
-                    detail_parts.append(
-                        f"MCP={worker.request_method} rc={worker.request_rc} age/dur={req_age} bytes={worker.request_bytes:,}"
-                    )
+                    request_fields = [f"MCP={worker.request_method}", f"age/dur={req_age}"]
+                    if worker.request_rc not in {"", "-", "..."}:
+                        request_fields.append(f"rc={worker.request_rc}")
+                    if worker.request_bytes:
+                        request_fields.append(f"bytes={worker.request_bytes:,}")
+                    detail_parts.append(" ".join(request_fields))
                 if self.level >= 4 and (worker.page or worker.instructions or worker.offset):
                     detail_parts.append(
                         f"page={worker.page} offset={worker.offset:,} insns={worker.instructions:,}"
@@ -982,12 +1480,10 @@ class LiveDebugPanel:
                     )
                 if worker.retries:
                     detail_parts.append(f"retries={worker.retries}")
-                if not detail_parts:
-                    detail_parts.append("-")
-                detail = self._trim(" | ".join(detail_parts), 90)
+                detail = highlight_debug_detail(self._join_complete_parts(detail_parts, 90))
                 lines.append(
                     f"{name:<18.18} {color(watch, watch_color)}{watch_pad} "
-                    f"{format_duration(age):<12} {self._trim(worker.stage, 22):<22} "
+                    f"{format_duration(age):<12} {stage_text}{stage_pad} "
                     f"{function:<20} {detail}"
                 )
 
@@ -1007,27 +1503,40 @@ class LiveDebugPanel:
             lines += [
                 "",
                 color("Current Function Statistics", Colors.YELLOW + Colors.BOLD),
-                f"Worker: {name}  Watch: {watch}  Function: {worker.function}  Address: {worker.address}",
-                f"Stage: {worker.stage}  Elapsed: {format_duration(elapsed)}  Last progress: {format_duration(age)} ago",
+                (
+                    f"Worker: {color(name, Colors.WHITE + Colors.BOLD)}  "
+                    f"Watch: {color(watch, watched[name][1])}  "
+                    f"Function: {color(worker.function, Colors.WHITE + Colors.BOLD)}  "
+                    f"Address: {color(worker.address, Colors.CYAN + Colors.BOLD)}"
+                ),
+                f"Stage: {color(worker.stage, stage_color(worker.stage))}  Elapsed: {format_duration(elapsed)}  Last progress: {format_duration(age)} ago",
             ]
             if self.level >= 2:
-                lines.append(f"Current detail: {self._trim(worker.detail, 150)}  Retries: {worker.retries}")
+                detail_text = highlight_debug_detail(self._trim(worker.detail, 150))
+                retry_text = color(str(worker.retries), Colors.YELLOW + Colors.BOLD) if worker.retries else color("0", Colors.DIM)
+                lines.append(f"Current detail: {detail_text}  Retries: {retry_text}")
             if self.level >= 3:
                 req_text = format_duration(request_age) if request_age else f"{worker.request_duration:.3f}s"
-                lines.append(
-                    f"MCP method: {worker.request_method}  Request age/duration: {req_text}  "
-                    f"RC: {worker.request_rc}  Response bytes: {worker.request_bytes:,}"
-                )
+                mcp_fields = [f"MCP method={worker.request_method}", f"age/dur={req_text}"]
+                if worker.request_rc not in {"", "-", "..."}:
+                    mcp_fields.append(f"rc={worker.request_rc}")
+                if worker.request_bytes:
+                    mcp_fields.append(f"response_bytes={worker.request_bytes:,}")
+                mcp_line = "  ".join(mcp_fields)
+                lines.append(highlight_debug_detail(mcp_line))
             if self.level >= 4:
                 lines.append(
-                    f"Pages read: {worker.page:,}  Offset: {worker.offset:,}  "
-                    f"Instructions read: {worker.instructions:,}"
+                    f"{color('Pages read:', Colors.YELLOW + Colors.BOLD)} {color(f'{worker.page:,}', Colors.YELLOW + Colors.BOLD)}  "
+                    f"{color('Offset:', Colors.CYAN + Colors.BOLD)} {color(f'{worker.offset:,}', Colors.CYAN + Colors.BOLD)}  "
+                    f"{color('Instructions read:', Colors.GREEN + Colors.BOLD)} {color(f'{worker.instructions:,}', Colors.GREEN + Colors.BOLD)}"
                 )
             if self.level >= 5:
                 lines.append(
-                    f"Targets resolved: {worker.candidates_done:,}/{worker.candidates_total:,}  "
-                    f"Accepted edges: {worker.edges:,}  Skipped: {worker.skipped:,}  "
-                    f"Duplicates: {worker.duplicates:,}  Unresolved: {worker.unresolved:,}"
+                    f"{color('Targets resolved:', Colors.MAGENTA + Colors.BOLD)} {color(f'{worker.candidates_done:,}/{worker.candidates_total:,}', Colors.MAGENTA + Colors.BOLD)}  "
+                    f"{color('Accepted edges:', Colors.GREEN + Colors.BOLD)} {color(f'{worker.edges:,}', Colors.GREEN + Colors.BOLD)}  "
+                    f"Skipped: {color(f'{worker.skipped:,}', Colors.GREEN + Colors.BOLD if worker.skipped == 0 else Colors.YELLOW + Colors.BOLD)}  "
+                    f"Duplicates: {color(f'{worker.duplicates:,}', Colors.GREEN + Colors.BOLD if worker.duplicates == 0 else Colors.YELLOW + Colors.BOLD)}  "
+                    f"Unresolved: {color(f'{worker.unresolved:,}', Colors.GREEN + Colors.BOLD if worker.unresolved == 0 else Colors.RED + Colors.BOLD)}"
                 )
 
         # V3+ includes aggregate MCP/request metrics. V4+ paging metrics. V5+
@@ -1035,29 +1544,45 @@ class LiveDebugPanel:
         # the bounded recent-event table below.
         if self.level >= 3:
             mcp_total = counts.get("MCP", 0) + counts.get("MCP-DOWNLOAD", 0)
+            retry_count = counts.get("RETRY", 0)
+            timeout_count = counts.get("TIMEOUT", 0)
+            lifecycle_count = counts.get("WORKER-DISCOVER", 0) + counts.get("WORKER-EXPORT", 0)
             lines += [
                 "",
                 color("Live Counters", Colors.YELLOW + Colors.BOLD),
-                f"MCP events: {mcp_total:,}  Retries: {counts.get('RETRY', 0):,}  "
-                f"Timeouts: {counts.get('TIMEOUT', 0):,}  Failures: "
-                f"{counts.get('WORKER-DISCOVER', 0) + counts.get('WORKER-EXPORT', 0):,} worker lifecycle events",
+                (
+                    f"MCP events: {color(f'{mcp_total:,}', Colors.CYAN + Colors.BOLD)}  "
+                    f"Retries: {color(f'{retry_count:,}', Colors.GREEN + Colors.BOLD if retry_count == 0 else Colors.YELLOW + Colors.BOLD)}  "
+                    f"Timeouts: {color(f'{timeout_count:,}', Colors.GREEN + Colors.BOLD if timeout_count == 0 else Colors.RED + Colors.BOLD)}  "
+                    f"Worker lifecycle events: {color(f'{lifecycle_count:,}', Colors.WHITE + Colors.BOLD)}"
+                ),
             ]
         if self.level >= 4:
+            disassembly_pages = counts.get("DISCOVERY-PAGE", 0) + counts.get("EXPORT-DISASM", 0)
+            progress_checkpoints = counts.get("DISCOVERY-PROGRESS", 0)
+            full_result_downloads = counts.get("MCP-DOWNLOAD", 0)
             lines.append(
-                f"Disassembly pages: {counts.get('DISCOVERY-PAGE', 0) + counts.get('EXPORT-DISASM', 0):,}  "
-                f"Progress checkpoints: {counts.get('DISCOVERY-PROGRESS', 0):,}  "
-                f"Full-result downloads: {counts.get('MCP-DOWNLOAD', 0):,}"
+                f"Disassembly pages: {color(f'{disassembly_pages:,}', Colors.YELLOW + Colors.BOLD)}  "
+                f"Progress checkpoints: {color(f'{progress_checkpoints:,}', Colors.CYAN + Colors.BOLD)}  "
+                f"Full-result downloads: {color(f'{full_result_downloads:,}', Colors.GREEN + Colors.BOLD)}"
             )
         if self.level >= 5:
+            resolved_edges = counts.get("DISCOVERY-EDGE", 0)
+            resolution_attempts = counts.get("DISCOVERY-RESOLVE", 0)
+            skipped_targets = counts.get("DISCOVERY-SKIP", 0)
             lines.append(
-                f"Resolved edges: {counts.get('DISCOVERY-EDGE', 0):,}  "
-                f"Resolution attempts: {counts.get('DISCOVERY-RESOLVE', 0):,}  "
-                f"Skipped targets: {counts.get('DISCOVERY-SKIP', 0):,}"
+                f"Resolved edges: {color(f'{resolved_edges:,}', Colors.GREEN + Colors.BOLD)}  "
+                f"Resolution attempts: {color(f'{resolution_attempts:,}', Colors.CYAN + Colors.BOLD)}  "
+                f"Skipped targets: {color(f'{skipped_targets:,}', Colors.YELLOW + Colors.BOLD)}"
             )
         if self.level >= 6:
+            raw_payloads = counts.get("MCP-PAYLOAD", 0)
+            header_events = counts.get("MCP-HEADERS", 0)
+            curl_commands = counts.get("CURL", 0)
             lines.append(
-                f"Raw payloads: {counts.get('MCP-PAYLOAD', 0):,}  Headers: {counts.get('MCP-HEADERS', 0):,}  "
-                f"Curl commands: {counts.get('CURL', 0):,}"
+                f"Raw payloads: {color(f'{raw_payloads:,}', Colors.MAGENTA + Colors.BOLD)}  "
+                f"Headers: {color(f'{header_events:,}', Colors.BLUE + Colors.BOLD)}  "
+                f"Curl commands: {color(f'{curl_commands:,}', Colors.CYAN + Colors.BOLD)}"
             )
 
         lines += [
@@ -1072,9 +1597,13 @@ class LiveDebugPanel:
             for event in events:
                 age = now - event.when
                 message_width = 140 if self.level == 6 else 105
+                category_plain = event.category[:22]
+                category_text = color(category_plain, category_color(event.category))
+                category_pad = " " * max(0, 22 - len(category_plain))
+                message_text = highlight_debug_detail(self._trim(event.message, message_width))
                 lines.append(
                     f"{format_duration(age):<10} {event.level:<3} {event.thread:<18.18} "
-                    f"{event.category:<22.22} {self._trim(event.message, message_width)}"
+                    f"{category_text}{category_pad} {message_text}"
                 )
         lines.append("")
         return lines
@@ -1088,11 +1617,146 @@ class WorkerActivity:
     detail: str = ""
 
 
+class StageConsole:
+    """Keep the fixed header and only the currently active stage visible."""
+
+    def __init__(self, header_lines: list[str]) -> None:
+        self.enabled = sys.stdout.isatty()
+        self.header_lines = list(header_lines)
+        self.stage_name = ""
+
+    def lines(self) -> list[str]:
+        return [
+            *self.header_lines,
+            f"{color('Current stage:', Colors.CYAN + Colors.BOLD)} {color(self.stage_name, Colors.WHITE + Colors.BOLD)}",
+        ]
+
+    @staticmethod
+    def _clear_console_locked() -> None:
+        """Erase the complete console buffer and return the cursor to (0, 0).
+
+        This deliberately uses the native Windows console API instead of ANSI
+        clear-screen sequences. ANSI ``2J`` only clears the visible viewport in
+        several Windows console hosts, leaving every previous dashboard frame in
+        scrollback. Clearing every buffer cell removes that stale context while
+        avoiding the stray ``]`` produced by unsupported ``3J`` handling.
+        """
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class COORD(ctypes.Structure):
+                    _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+                class SMALL_RECT(ctypes.Structure):
+                    _fields_ = [
+                        ("Left", wintypes.SHORT),
+                        ("Top", wintypes.SHORT),
+                        ("Right", wintypes.SHORT),
+                        ("Bottom", wintypes.SHORT),
+                    ]
+
+                class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+                    _fields_ = [
+                        ("dwSize", COORD),
+                        ("dwCursorPosition", COORD),
+                        ("wAttributes", wintypes.WORD),
+                        ("srWindow", SMALL_RECT),
+                        ("dwMaximumWindowSize", COORD),
+                    ]
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+                kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+                kernel32.GetStdHandle.restype = wintypes.HANDLE
+                kernel32.GetConsoleScreenBufferInfo.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(CONSOLE_SCREEN_BUFFER_INFO),
+                ]
+                kernel32.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
+                kernel32.FillConsoleOutputCharacterW.argtypes = [
+                    wintypes.HANDLE,
+                    wintypes.WCHAR,
+                    wintypes.DWORD,
+                    COORD,
+                    ctypes.POINTER(wintypes.DWORD),
+                ]
+                kernel32.FillConsoleOutputCharacterW.restype = wintypes.BOOL
+                kernel32.FillConsoleOutputAttribute.argtypes = [
+                    wintypes.HANDLE,
+                    wintypes.WORD,
+                    wintypes.DWORD,
+                    COORD,
+                    ctypes.POINTER(wintypes.DWORD),
+                ]
+                kernel32.FillConsoleOutputAttribute.restype = wintypes.BOOL
+                kernel32.SetConsoleCursorPosition.argtypes = [wintypes.HANDLE, COORD]
+                kernel32.SetConsoleCursorPosition.restype = wintypes.BOOL
+
+                handle = kernel32.GetStdHandle(wintypes.DWORD(-11 & 0xFFFFFFFF))
+                info = CONSOLE_SCREEN_BUFFER_INFO()
+                invalid_handle = ctypes.c_void_p(-1).value
+                if handle not in (None, 0, invalid_handle) and kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
+                    origin = COORD(0, 0)
+                    cells = int(info.dwSize.X) * int(info.dwSize.Y)
+                    written = wintypes.DWORD(0)
+
+                    # The function signature is declared explicitly above. Without
+                    # it, ctypes can marshal the fill character incorrectly and
+                    # write visible Unicode glyphs instead of ordinary spaces.
+                    ok_chars = kernel32.FillConsoleOutputCharacterW(
+                        handle,
+                        " ",
+                        wintypes.DWORD(cells),
+                        origin,
+                        ctypes.byref(written),
+                    )
+                    ok_attrs = kernel32.FillConsoleOutputAttribute(
+                        handle,
+                        info.wAttributes,
+                        wintypes.DWORD(cells),
+                        origin,
+                        ctypes.byref(written),
+                    )
+                    ok_cursor = kernel32.SetConsoleCursorPosition(handle, origin)
+                    if ok_chars and ok_attrs and ok_cursor:
+                        return
+            except Exception:
+                pass
+
+            # Fallback for unusual Windows hosts where the native handle is not
+            # available. This is only used for an interactive console.
+            os.system("cls")
+            return
+
+        sys.stdout.write("\x1b[H\x1b[2J")
+        sys.stdout.flush()
+
+    def start(self, name: str) -> None:
+        with _console_lock:
+            self.stage_name = name
+            self._render_stage_locked(clear=self.enabled)
+
+    def switch(self, name: str) -> None:
+        with _console_lock:
+            self.stage_name = name
+            self._render_stage_locked(clear=self.enabled)
+
+    def _render_stage_locked(self, *, clear: bool) -> None:
+        if clear:
+            self._clear_console_locked()
+        for line in self.lines():
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+
 class LiveStatusBase:
     """Fixed multi-line worker dashboard that redraws in place."""
 
-    def __init__(self, health: HealthMonitor, stats: RunStats, workers: int, prefix: str):
+    def __init__(self, health: HealthMonitor, stats: RunStats, workers: int, prefix: str, frame_prefix: Callable[[], list[str]] | None = None):
         self.health = health
+        self.frame_prefix = frame_prefix
         self.stats = stats
         self.worker_count = workers
         self.worker_prefix = prefix
@@ -1162,9 +1826,13 @@ class LiveStatusBase:
                 }.get(activity.state, Colors.WHITE)
                 state = color(activity.state, state_color + Colors.BOLD)
                 elapsed = self._duration(now - activity.started)
-                function_text = f"{activity.info.name} @ {activity.info.addr}"
+                function_text = (
+                    f"{color(activity.info.name, Colors.WHITE + Colors.BOLD)} "
+                    f"{color('@', Colors.DIM)} "
+                    f"{color(activity.info.addr, Colors.CYAN + Colors.BOLD)}"
+                )
                 if activity.detail:
-                    function_text += f"  {activity.detail}"
+                    function_text += f"  {highlight_debug_detail(activity.detail)}"
             # ANSI color codes do not consume console columns, so pad the plain
             # state first and then color it.
             plain_state = activity.state if activity.state != "Idle" else "Idle"
@@ -1177,6 +1845,51 @@ class LiveStatusBase:
         match = re.search(r"_(\d+)$", name)
         return name.rsplit("_", 1)[0], int(match.group(1)) if match else 999999
 
+    @classmethod
+    def _fit_console_width(cls, text: str) -> str:
+        """Prevent wrapping without leaving partial, unreadable tail fields."""
+        try:
+            width = max(40, os.get_terminal_size(sys.stdout.fileno()).columns - 1)
+        except (OSError, ValueError):
+            width = 119
+        if len(cls._strip_ansi(text)) <= width:
+            return text
+
+        output: list[str] = []
+        visible = 0
+        index = 0
+        last_safe_output_len = 0
+        last_safe_visible = 0
+        while index < len(text) and visible < width:
+            if text[index] == "\x1b":
+                match = re.match(r"\x1b\[[0-9;]*m", text[index:])
+                if match:
+                    output.append(match.group(0))
+                    index += len(match.group(0))
+                    continue
+            char = text[index]
+            output.append(char)
+            visible += 1
+            index += 1
+            if char.isspace() or char in {"|", ",", ";"}:
+                last_safe_output_len = len(output)
+                last_safe_visible = visible
+
+        # When a row is wider than the terminal, discard the incomplete final
+        # token instead of showing fragments such as ``re...`` or ``rc...``.
+        if index < len(text) and last_safe_visible >= max(8, width // 2):
+            output = output[:last_safe_output_len]
+        output.append(Colors.RESET)
+        return "".join(output).rstrip()
+
+    def _erase_previous_locked(self) -> None:
+        if not self.rendered_lines:
+            return
+        sys.stdout.write(f"\x1b[{self.rendered_lines}F")
+        for _ in range(self.rendered_lines):
+            sys.stdout.write("\x1b[2K\n")
+        sys.stdout.write(f"\x1b[{self.rendered_lines}F")
+
     def _draw_locked(self, lines: list[str]) -> None:
         if not sys.stdout.isatty():
             return
@@ -1184,14 +1897,22 @@ class LiveStatusBase:
         if self.last_draw and now - self.last_draw < 0.20:
             return
         self.last_draw = now
-        if self.rendered_lines:
-            sys.stdout.write(f"\x1b[{self.rendered_lines}F")
-        for line in lines:
+        full_lines = [*(self.frame_prefix() if self.frame_prefix is not None else []), *lines]
+        fitted_lines = [self._fit_console_width(line) for line in full_lines]
+        # Redraw in place without clearing the console buffer. Clearing every
+        # cell on every tick causes the visible flash. Cursor-home keeps the
+        # current frame anchored at the top, each row is replaced, and J removes
+        # any leftover rows from a previously taller frame. Full buffer clearing
+        # is reserved for actual stage transitions in StageConsole.switch().
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.write("\x1b[H")
+        for line in fitted_lines:
             sys.stdout.write("\x1b[2K")
             sys.stdout.write(line)
             sys.stdout.write("\n")
+        sys.stdout.write("\x1b[J")
         sys.stdout.flush()
-        self.rendered_lines = len(lines)
+        self.rendered_lines = len(fitted_lines)
 
     def _tick(self) -> None:
         while not self.stop_event.wait(1.0):
@@ -1203,18 +1924,22 @@ class LiveStatusBase:
         self.finished = True
         self.stop_event.set()
         self.ticker.join(timeout=1.5)
+        if sys.stdout.isatty():
+            with _console_lock:
+                sys.stdout.write("\x1b[?25h")
+                sys.stdout.flush()
 
     def _render_locked(self) -> None:
         raise NotImplementedError
 
 
 class DiscoveryStatusLine(LiveStatusBase):
-    def __init__(self, root: FunctionInfo, health: HealthMonitor, stats: RunStats, workers: int):
+    def __init__(self, root: FunctionInfo, health: HealthMonitor, stats: RunStats, workers: int, frame_prefix: Callable[[], list[str]] | None = None):
         self.found = 1
         self.queued = 1
         self.scanned = 0
         self.root = root
-        super().__init__(health, stats, workers, "ida-discover")
+        super().__init__(health, stats, workers, "ida-discover", frame_prefix)
         with _console_lock:
             self._render_locked()
 
@@ -1224,12 +1949,12 @@ class DiscoveryStatusLine(LiveStatusBase):
             *debug_lines,
             color("Discovery Status", Colors.CYAN + Colors.BOLD),
             (
-                f"Found: {color(f'{self.found:,}', Colors.GREEN + Colors.BOLD)}  "
-                f"Queued: {color(f'{self.queued:,}', Colors.YELLOW + Colors.BOLD)}  "
-                f"Active: {color(f'{self._active_count():,}', Colors.BLUE + Colors.BOLD)}  "
-                f"Processed: {color(f'{self.scanned:,}', Colors.WHITE + Colors.BOLD)}  "
-                f"Elapsed: {color(format_duration(self.stats.elapsed()), Colors.WHITE + Colors.BOLD)}  "
-                f"Health: {self._health_text()}"
+                f"{color('Found:', Colors.GREEN + Colors.BOLD)} {color(f'{self.found:,}', Colors.GREEN + Colors.BOLD)}  "
+                f"{color('Queued:', Colors.YELLOW + Colors.BOLD)} {color(f'{self.queued:,}', Colors.YELLOW + Colors.BOLD)}  "
+                f"{color('Active:', Colors.BLUE + Colors.BOLD)} {color(f'{self._active_count():,}', Colors.BLUE + Colors.BOLD)}  "
+                f"{color('Processed:', Colors.CYAN + Colors.BOLD)} {color(f'{self.scanned:,}', Colors.CYAN + Colors.BOLD)}  "
+                f"{color('Elapsed:', Colors.WHITE + Colors.BOLD)} {color(format_duration(self.stats.elapsed()), Colors.WHITE + Colors.BOLD)}  "
+                f"{color('Health:', Colors.GREEN + Colors.BOLD)} {self._health_text()}"
             ),
             "",
             *self._worker_rows(),
@@ -1271,10 +1996,10 @@ class DiscoveryStatusLine(LiveStatusBase):
 
 
 class ExportStatusLine(LiveStatusBase):
-    def __init__(self, total: int, health: HealthMonitor, stats: RunStats, workers: int):
+    def __init__(self, total: int, health: HealthMonitor, stats: RunStats, workers: int, frame_prefix: Callable[[], list[str]] | None = None):
         self.total = total
         self.completed = 0
-        super().__init__(health, stats, workers, "ida-export")
+        super().__init__(health, stats, workers, "ida-export", frame_prefix)
         with _console_lock:
             self._render_locked()
 
@@ -1284,11 +2009,11 @@ class ExportStatusLine(LiveStatusBase):
             *debug_lines,
             color("Export Status", Colors.CYAN + Colors.BOLD),
             (
-                f"Completed: {color(f'{self.completed:,}/{self.total:,}', Colors.GREEN + Colors.BOLD)}  "
-                f"Active: {color(f'{self._active_count():,}', Colors.BLUE + Colors.BOLD)}  "
-                f"Remaining: {color(f'{max(0, self.total - self.completed):,}', Colors.YELLOW + Colors.BOLD)}  "
-                f"Elapsed: {color(format_duration(self.stats.elapsed()), Colors.WHITE + Colors.BOLD)}  "
-                f"Health: {self._health_text()}"
+                f"{color('Completed:', Colors.GREEN + Colors.BOLD)} {color(f'{self.completed:,}/{self.total:,}', Colors.GREEN + Colors.BOLD)}  "
+                f"{color('Active:', Colors.BLUE + Colors.BOLD)} {color(f'{self._active_count():,}', Colors.BLUE + Colors.BOLD)}  "
+                f"{color('Remaining:', Colors.YELLOW + Colors.BOLD)} {color(f'{max(0, self.total - self.completed):,}', Colors.YELLOW + Colors.BOLD)}  "
+                f"{color('Elapsed:', Colors.WHITE + Colors.BOLD)} {color(format_duration(self.stats.elapsed()), Colors.WHITE + Colors.BOLD)}  "
+                f"{color('Health:', Colors.GREEN + Colors.BOLD)} {self._health_text()}"
             ),
             "",
             *self._worker_rows(),
@@ -1403,6 +2128,10 @@ def parse_args() -> argparse.Namespace:
         "--verbose", nargs="?", const=1, default=0, type=int, choices=range(0, 7), metavar="LEVEL",
         help="Enable diagnostic output at level 1-6. --verbose alone selects level 1.",
     )
+    p.add_argument(
+        "--no-console-resize", action="store_true",
+        help="Do not adjust the Windows console font or resize the Verbose 2-6 console window.",
+    )
     # Accepted for compatibility, but unlimited traversal remains mandatory.
     p.add_argument("--depth", type=int, default=-1, help=argparse.SUPPRESS)
     p.add_argument("--max-functions", type=int, default=0, help=argparse.SUPPRESS)
@@ -1420,7 +2149,7 @@ def discover_one(
     pool: ThreadClients, health: HealthMonitor, info: FunctionInfo, page_size: int,
     retries: int, retry_delay: float, stats: RunStats, function_timeout: int, progress: DiscoveryStatusLine | None = None,
 ) -> tuple[FunctionInfo, list[dict[str, str]], str | None]:
-    vlog(2, "WORKER-DISCOVER", f"Assigned {info.name} @ {info.addr} depth={info.depth} source={info.source}")
+    vlog(1, "WORKER-DISCOVER", f"Assigned {info.name} @ {info.addr} depth={info.depth} source={info.source}")
     if progress:
         progress.worker_started(info)
     try:
@@ -1429,7 +2158,7 @@ def discover_one(
             retries=retries, retry_delay=retry_delay, stats=stats,
             on_retry=(lambda attempt, maximum, delay: progress.worker_retry(info, attempt, maximum, delay)) if progress else None,
         )
-        vlog(2, "WORKER-DISCOVER", f"Finished {info.name} @ {info.addr} edges={len(edges)}")
+        vlog(1, "WORKER-DISCOVER", f"Finished {info.name} @ {info.addr} edges={len(edges)}")
         return info, edges, None
     except Exception as exc:
         vlog(1, "WORKER-DISCOVER", f"Failed {info.name} @ {info.addr}: {type(exc).__name__}: {exc}")
@@ -1509,7 +2238,7 @@ def export_one(
     retries: int, retry_delay: float, stats: RunStats,
     progress: ExportStatusLine | None = None,
 ) -> tuple[FunctionInfo, str, str, list[dict[str, str]]]:
-    vlog(2, "WORKER-EXPORT", f"Assigned {info.name} @ {info.addr} depth={info.depth}")
+    vlog(1, "WORKER-EXPORT", f"Assigned {info.name} @ {info.addr} depth={info.depth}")
     if progress:
         progress.notify("Preparing", info)
     local_failures: list[dict[str, str]] = []
@@ -1537,7 +2266,7 @@ def export_one(
         local_failures.append({"addr": info.addr, "name": info.name, "stage": "decompile", "error": str(exc)})
     if progress:
         progress.notify("Completed", info)
-    vlog(2, "WORKER-EXPORT", f"Finished {info.name} @ {info.addr} asm_chars={len(asm)} pseudo_chars={len(pseudo)} failures={len(local_failures)}")
+    vlog(1, "WORKER-EXPORT", f"Finished {info.name} @ {info.addr} asm_chars={len(asm)} pseudo_chars={len(pseudo)} failures={len(local_failures)}")
     return info, asm, pseudo, local_failures
 
 def main() -> int:
@@ -1545,8 +2274,10 @@ def main() -> int:
     args = parse_args()
     VERBOSE = VerboseLogger(args.verbose)
     stats = RunStats()
-    vlog(1, "STARTUP", f"Arguments: {vars(args)}")
     enable_windows_ansi()
+    if not args.no_console_resize:
+        CONSOLE_FONT.apply_for_verbose(args.verbose)
+        CONSOLE_LAYOUT.apply_for_verbose(args.verbose)
     args.page_size = min(50000, max(1, args.page_size))
     workers = auto_workers(args.workers)
 
@@ -1588,14 +2319,19 @@ def main() -> int:
 
     worker_mode = "manual" if args.workers > 0 else "auto"
 
-    console_print(f"{color('IDA MCP:', Colors.CYAN + Colors.BOLD)} {color(control.url, Colors.WHITE)}")
     server_text = f"{init.get('serverInfo', {}).get('name', 'unknown')} {init.get('serverInfo', {}).get('version', '')}".rstrip()
-    console_print(f"{color('Server:', Colors.CYAN + Colors.BOLD)}  {color(server_text, Colors.WHITE)}")
-    console_print(f"{color('Workers:', Colors.CYAN + Colors.BOLD)} {color(str(workers), Colors.WHITE + Colors.BOLD)} {color(f'({worker_mode})', Colors.DIM)}")
-    if args.verbose:
-        console_print(f"{color('Verbose:', Colors.CYAN + Colors.BOLD)} level {args.verbose} (live Debug Status enabled above worker status)")
     root_display = format_function(FunctionInfo(root_addr, root_name, 0, ''))
-    console_print(f"{color('Root:', Colors.CYAN + Colors.BOLD)}    {root_display}")
+    header_lines = [
+        f"{color('IDA MCP:', Colors.CYAN + Colors.BOLD)} {color(control.url, Colors.WHITE)}",
+        f"{color('Server:', Colors.CYAN + Colors.BOLD)}  {color(server_text, Colors.WHITE)}",
+        f"{color('Workers:', Colors.CYAN + Colors.BOLD)} {color(str(workers), Colors.WHITE + Colors.BOLD)} {color(f'({worker_mode})', Colors.DIM)}",
+    ]
+    if args.verbose:
+        header_lines.append(f"{color('Verbose:', Colors.CYAN + Colors.BOLD)} level {args.verbose} (live Debug Status enabled above worker status)")
+    header_lines.append(f"{color('Root:', Colors.CYAN + Colors.BOLD)}    {root_display}")
+
+    stage_console = StageConsole(header_lines)
+    stage_console.start("Scanning Functions")
 
     root_source = "--address" if args.address else ("--function" if args.function else "IDA cursor")
     root = FunctionInfo(root_addr, root_name, 0, root_source)
@@ -1607,7 +2343,7 @@ def main() -> int:
     if args.verbose and sys.stdout.isatty():
         VERBOSE.attach_panel(LiveDebugPanel(args.verbose, max_events={1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 18}[args.verbose]))
     stats.discovery_started = time.monotonic()
-    discovery_status = DiscoveryStatusLine(root, health, stats, workers) if sys.stdout.isatty() else None
+    discovery_status = DiscoveryStatusLine(root, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
     if not sys.stdout.isatty():
         console_print(color("Discovering reachable functions...", Colors.CYAN + Colors.BOLD))
     all_functions, graph_edges, failures = discover_all_functions_parallel(
@@ -1616,11 +2352,13 @@ def main() -> int:
     if discovery_status:
         discovery_status.finish(len(all_functions))
     stats.discovery_finished = time.monotonic()
-    console_print(f"{color('Functions discovered:', Colors.CYAN + Colors.BOLD)} {color(str(len(all_functions)), Colors.GREEN + Colors.BOLD)}")
+    if VERBOSE.panel is not None:
+        VERBOSE.panel.reset()
+    stage_console.switch("Exporting Disassembly")
     results: dict[int | str, tuple[FunctionInfo, str, str]] = {}
     total = len(all_functions)
     stats.export_started = time.monotonic()
-    export_status = ExportStatusLine(total, health, stats, workers) if sys.stdout.isatty() else None
+    export_status = ExportStatusLine(total, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
     if args.verbose:
         vlog(1, "EXPORT", f"Starting export of {total} functions with {workers} workers")
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ida-export") as executor:
@@ -1640,6 +2378,9 @@ def main() -> int:
     vlog(1, "EXPORT", f"Export extraction complete functions={len(results)} failures={len(failures)}")
     stats.export_finished = time.monotonic()
     health.stop()
+    if VERBOSE.panel is not None:
+        VERBOSE.panel.reset()
+    stage_console.switch("Finalize Results")
 
     exported: list[dict[str, Any]] = []
     # Preserve deterministic discovery order in output files even though extraction is concurrent.
