@@ -1,279 +1,205 @@
 ============================================================
-Acknowledgements
+LEGAL DISCLAIMER
 ============================================================
 
-A huge thank you to mrexodia for creating the excellent
-ida-pro-mcp project.
+The shim is being provided for educational purposes only to help aid
+research against bad actors. Misusing it outside its original intentions
+may be illegal and is your responsibility. The owner of this repository
+cannot and will not be held liable for any consequences. Always follow
+your local laws and use this toolkit responsibly.
 
-This shim builds on top of that plugin by using it as the
-communication layer to recursively discover, export, and
-organize large portions of an IDA database into a format
-that's easier for both humans and LLMs to understand.
+============================================================
 
-Project:
-https://github.com/mrexodia/ida-pro-mcp
+IDA MCP Recursive Export Shim
 
-IDA MCP Recursive Exporter
-==========================
+Export the complete reachable function context from IDA Pro through ida-pro-mcp instead of analyzing one function at a time.
 
-Exports every function reachable from a selected root function in IDA Pro through ida-pro-mcp.
+The IDA MCP Recursive Export Shim is a multithreaded command-line utility that communicates directly with an ida-pro-mcp server. It starts from the function under the current IDA cursor, an explicit address, or a function name; recursively follows direct CALL instructions and cross-function tail JMP instructions; and exports assembly, Hex-Rays pseudocode, graph relationships, failures, timing, and run statistics.
 
-REQUIREMENTS
-------------
+Requirements
 
-- IDA Pro with the target database open
-- ida-pro-mcp running and connected to that IDA instance
-- Python 3.10 or newer
-- curl available in PATH
+| Requirement | Description |
+|---|---|
+| Python | Python 3.10 or newer |
+| IDA Pro | The target database must be open |
+| ida-pro-mcp | Must be running and connected to the intended IDA instance |
+| curl | curl.exe on modern Windows, or curl on another platform |
+| Hex-Rays | Optional, but required for pseudocode output |
 
-BASIC USAGE
------------
+No third-party Python packages are required.
 
-Use the function currently selected in IDA:
+Quick Start
 
+cmd
+run_export.cmd
 run_export.cmd --server 13339
-
-Use an explicit function address:
-
 run_export.cmd --server 13339 --address 0x7FF6E3BF5C90
+run_export.cmd --server 13339 --function UpdatePlayerStates
 
-The 0x prefix is optional:
 
-run_export.cmd --server 13339 --address 7FF6E3BF5C90
+If neither --address nor --function is supplied, the exporter uses the function under the current IDA cursor.
 
-Use an IDA function name:
+What the Exporter Does
 
-run_export.cmd --server 13339 --function sub_7FF6E3BF5C90
+| Stage | Description |
+|---:|---|
+| 1 | Connects to the selected ida-pro-mcp server and verifies that the required MCP tools are available. |
+| 2 | Resolves the root function from --address, --function, or the current IDA cursor. |
+| 3 | Recursively disassembles reachable functions. |
+| 4 | Follows direct CALL instructions and cross-function tail JMP instructions. |
+| 5 | Ignores local jumps such as loc_xxx. |
+| 6 | Deduplicates functions by canonical address. |
+| 7 | Exports assembly and Hex-Rays pseudocode using multiple workers. |
+| 8 | Downloads the complete result automatically when MCP returns a truncated preview with a download URL. |
+| 9 | Retries transient failures and resets the affected worker session before retrying. |
+| 10 | Monitors MCP health and pauses new work while the server is unavailable. |
+| 11 | Writes deterministic output files and a JSON manifest after processing completes. |
 
---address and --function cannot be used together. If neither is supplied, the exporter uses the function under the current IDA cursor.
+Command-Line Arguments
 
-RECOMMENDED COMMAND
--------------------
+Every argument accepted by the current exporter is listed below.
 
+| Argument | Accepted value | Default | Description |
+|---|---|---|---|
+| --server | Port, host:port, or full URL | 13337 | Selects the ida-pro-mcp endpoint. /mcp is appended when missing. |
+| --function | Function name or address | Current IDA cursor | Selects the root by IDA function name or address. Cannot be combined with --address. |
+| --address | Numeric address | Current IDA cursor | Selects the root using an explicit address. The 0x prefix is optional. Cannot be combined with --function. |
+| --output | Directory path | ida_exports | Sets the parent output directory. |
+| --page-size | Integer from 1 through 50000 | 50000 | Sets disassembly instructions requested per page. Values are clamped to the supported range. |
+| --include-external | Flag | Disabled | Accepted and recorded in the manifest. The current build does not yet use it to alter traversal filtering. |
+| --workers | Integer | 0 meaning automatic | Sets concurrent MCP workers. Automatic selection uses 4 through 16 workers; manual values are clamped to 1 through 32. |
+| --timeout | Seconds | 600 | Limits one curl/MCP request. Use 0 to disable the per-request timeout. |
+| --function-timeout | Seconds | 300 | Limits the complete discovery pass for one function. Use 0 to disable it. |
+| --retries | Integer | 3 | Sets retry attempts after a failed or timed-out MCP operation. |
+| --retry-delay | Seconds; decimals allowed | 5.0 | Sets the base retry delay. Delay increases by attempt number. |
+| --health-interval | Seconds | 120 | Sets the interval between MCP health checks. |
+| --health-timeout | Seconds | 20 | Sets the timeout for each health-check request. |
+| --curl | Executable name or path | curl.exe on Windows; curl elsewhere | Overrides the curl executable. |
+| --list-tools | Flag | Disabled | Prints enabled MCP tools and exits without exporting. |
+| --verbose | Optional level from 0 through 6 | 0 | Enables progressive diagnostics. --verbose without a number selects level 1. |
+| --depth | Integer | -1 | Hidden compatibility argument. Accepted but does not limit traversal. |
+| --max-functions | Integer | 0 | Hidden compatibility argument. Accepted but does not cap traversal. |
+
+Complete syntax:
+
+run_export.cmd [--server <endpoint>] [--function <name-or-address> OR --address <address>] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]]
+
+Root Selection Rules
+
+| Command | Root used |
+|---|---|
+| run_export.cmd | Function under the current IDA cursor |
+| run_export.cmd --function UpdatePlayerStates | IDA function named UpdatePlayerStates |
+| run_export.cmd --function sub_7FF6E3BF5C90 | IDA function with that generated name |
+| run_export.cmd --function 0x7FF6E3BF5C90 | Function resolved from that address |
+| run_export.cmd --address 7FF6E3BF5C90 | Function resolved from that numeric address |
+
+--function and --address are mutually exclusive. Supplying both causes argument parsing to fail before connecting to MCP.
+
+Verbose Diagnostics
+
+Pass --verbose or --verbose LEVEL to display a live Debug Status panel above the normal Discovery Status or Export Status dashboard. Each level includes the information from all lower levels.
+
+| Level | Information added |
+|---:|---|
+| 0 | Normal dashboard only; verbose diagnostics are disabled. |
+| 1 | Worker watchdog state, progress age, current stage, current function, lifecycle events, graph-level progress, and failures. |
+| 2 | Worker assignments, operation details, retries, stage transitions, and worker start/finish activity. |
+| 3 | MCP methods and tool calls, request duration, curl return code, response byte count, and request-level timing. |
+| 4 | Disassembly page number, page offset, instruction totals, paging progress, and unique candidate totals. Recommended when a worker appears stuck. |
+| 5 | Target resolution, accepted graph edges, duplicate edges, skipped targets, unresolved targets, and detailed traversal counters. |
+| 6 | Curl command construction, JSON-RPC request payloads, response headers, and individual CALL/JMP candidate diagnostics. Response-body previews are intentionally not displayed. |
+
+Examples:
+
+cmd
+run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --verbose
+run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --verbose 4
+run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --timeout 30 --function-timeout 300 --verbose 6
+
+
+The live verbose panel is enabled only when standard output is an interactive terminal. When output is redirected to a file or pipe, verbose events can still be emitted, but the in-place terminal panel is not attached.
+
+Worker Watchdog States
+
+Watchdog labels are based on the time since the worker's most recent progress event.
+
+| State | Progress age | Meaning |
+|---|---:|---|
+| LIVE | Less than 30 seconds | Recent progress was observed. |
+| SLOW | 30 seconds to less than 2 minutes | The operation is taking longer than normal but may still be progressing. |
+| STALLED? | 2 minutes to less than 10 minutes | No recent progress event has been observed. Investigation may be useful. |
+| FROZEN? | 10 minutes or longer | The worker has been quiet for a long period. This is a warning, not proof that IDA or MCP is dead. |
+
+Large or heavily obfuscated functions can legitimately remain in a warning state while IDA is working.
+
+Current Function Statistics
+
+When verbose output is enabled, the dashboard shows a Current Function Statistics panel. It automatically focuses on the most concerning active worker in this order:
+
+1. FROZEN?
+2. STALLED?
+3. SLOW
+4. Longest-running LIVE worker
+
+| Statistic | Description |
+|---|---|
+| Worker | Worker thread currently selected for detailed display |
+| Function | Current function name |
+| Address | Current function address |
+| Stage | Current discovery or export stage |
+| Elapsed | Total time spent on the current assignment |
+| Last progress | Time since the worker last reported measurable progress |
+| Instructions read | Cumulative disassembly instructions processed for the current function |
+| Pages downloaded | Number of disassembly pages fetched |
+| CALL instructions | Direct call candidates observed |
+| JMP instructions | Jump candidates observed and considered for tail-call traversal |
+| Unique targets | Deduplicated candidate targets found |
+| Resolved targets | Targets successfully resolved to functions |
+| Accepted edges | New call-graph edges added |
+| Duplicates | Already-known edges or functions encountered again |
+| Skipped | Local, unsupported, or intentionally ignored targets |
+| Unresolved | Candidate targets that could not be resolved |
+| Retries | Retry attempts associated with the selected worker operation |
+| MCP request | Most recent MCP method or tool operation |
+
+Timeout and Retry Behavior
+
+--timeout and --function-timeout control different scopes.
+
+| Setting | Scope |
+|---|---|
+| --timeout | One curl/MCP request |
+| --function-timeout | The complete recursive discovery pass for one function |
+
+Recommended diagnostic command:
+
+cmd
 run_export.cmd ^
   --server 13339 ^
   --address 0x7FF6E3BF5C90 ^
-  --timeout 600 ^
+  --timeout 30 ^
+  --function-timeout 300 ^
   --retries 3 ^
   --retry-delay 5 ^
   --health-interval 120 ^
-  --health-timeout 20
+  --health-timeout 20 ^
+  --verbose 4
 
-COMMAND-LINE OPTIONS
---------------------
 
---server <port|host:port|URL>
-    ida-pro-mcp server. Default: 13337
+With --retries 3 --retry-delay 5, retry delays are:
 
---address <address>
-    Explicit root address, with or without 0x.
+| Retry | Delay |
+|---:|---:|
+| 1 | 5 seconds |
+| 2 | 10 seconds |
+| 3 | 15 seconds |
 
---function <name|address>
-    Root function name or address.
+Live Dashboard
 
---output <directory>
-    Parent output directory. Default: ida_exports
+The exporter uses fixed worker rows that are redrawn in place. Completed workers return to Idle, their elapsed timer resets, and the row is reused for the next assignment. This prevents stale functions from remaining visible and avoids a continuously scrolling console.
 
---workers <count>
-    Number of concurrent MCP workers. Default: 0, which selects automatically.
-    The automatic maximum is 16 workers.
-
---timeout <seconds>
-    Maximum time for one MCP request. Default: 600.
-    Use 0 to disable request timeouts, although a finite timeout is recommended so retries can activate.
-
---retries <count>
-    Number of retries after a request failure. Default: 3.
-
---retry-delay <seconds>
-    Base delay between retries. Default: 5.
-    Delays increase by attempt: 5, 10, and 15 seconds with the defaults.
-
---health-interval <seconds>
-    Interval between MCP health checks. Default: 120 seconds.
-
---health-timeout <seconds>
-    Maximum time allowed for one health check. Default: 20 seconds.
-
---page-size <count>
-    Maximum instructions requested per disassembly page. Default and maximum: 50000.
-
---include-external
-    Attempts to include external or imported functions when resolvable.
-
---list-tools
-    Prints enabled MCP tools and exits.
-
-WHAT IT DOES
-------------
-
-1. Connects to ida-pro-mcp.
-2. Resolves the root from --address, --function, or the current IDA cursor.
-3. Recursively disassembles reachable functions.
-4. Follows direct CALL instructions and cross-function tail JMP instructions.
-5. Ignores local jumps such as loc_xxx.
-6. Deduplicates functions by canonical address.
-7. Exports assembly and Hex-Rays pseudocode.
-8. Downloads complete MCP results when ida-pro-mcp returns a truncated preview with a download URL.
-9. Retries transient request failures.
-10. Checks MCP health every two minutes by default.
-11. Records failures, timing, retries, health checks, and exported functions in the manifest.
-
-LIVE STATUS
------------
-
-Discovery example:
-
-Discovering  Found 3,006  Queued 28  Active 2  Elapsed 00:12:18  Health OK 1m42s  Waiting ida-discover_7 12m18s  sub_7FF6E3A2BF70 @ 0x7ff6e3a2bf70
-
-Export example:
-
-Exporting  45,012/95,509  Active 16  Elapsed 00:48:31  Health OK 0m37s  Waiting ida-export_4 3m12s  sub_7FF6E4123450 @ 0x7ff6e4123450
-
-The live line shows:
-
-- total elapsed runtime
-- functions found
-- queued work
-- active workers
-- time since the last successful health check
-- the longest-running worker
-- how long that worker has been waiting
-- the function assigned to that worker
-
-A growing worker timer means the exporter is waiting on that IDA/MCP request and is not silently frozen.
-
-HEALTH CHECKS
--------------
-
-Every 120 seconds by default, a dedicated session verifies that ida-pro-mcp can initialize and provide the required tools.
-
-The live line may show:
-
-Health CHECK
-Health OK 0m00s
-Health FAIL
-
-When health fails, new operations pause. Recovery checks run every 10 seconds until MCP is available again, then processing resumes.
-
-RETRIES
--------
-
-Failed operations retry automatically. With the defaults:
-
-Retry 1: wait 5 seconds
-Retry 2: wait 10 seconds
-Retry 3: wait 15 seconds
-
-A worker session is reset before retrying so a damaged MCP session is not reused.
-
-FINAL STATISTICS
-----------------
-
-At the end of the run, the exporter prints a summary similar to:
-
-============================================================
-Export Summary
-============================================================
-Functions discovered : 95,509
-Function records     : 95,509
-Fully successful     : 95,500
-Partial/failed       : 9
-Failure operations   : 12
-Retry attempts       : 27
-Recovered by retry   : 18
-Health checks        : 42
-Health failures      : 1
-Health recoveries    : 1
-Discovery time       : 00:14:38
-Export time          : 01:02:17
-Total runtime        : 01:16:55
-Output size          : 295.50 MB
-============================================================
-
-Definitions:
-
-Fully successful
-    Function records with no final discovery, disassembly, or decompilation failure.
-
-Partial/failed
-    Unique functions that still had at least one failed operation after all retries.
-
-Failure operations
-    Total final failed stages. One function can have more than one failed stage.
-
-Retry attempts
-    Total retry attempts made across discovery, disassembly, and decompilation.
-
-Recovered by retry
-    Operations that initially failed but later completed successfully.
-
-Health failures
-    Failed health-check probes.
-
-Health recoveries
-    Times the health monitor transitioned from failed back to healthy.
-
-OUTPUT FILES
-------------
-
-ida_exports\
-  function_<root>\
-    Main_<root>_function_we_are_in.txt
-    Extracted_referenced_functions_in_<root>.txt
-    Extracted_called_functions_<root>_pseudocode.txt
-    Manifest_<root>.json
-
-The manifest also contains timing, retry, health, graph-edge, failure, and exported-function data.
-
-EXAMPLES
---------
-
-Current cursor function:
-
-run_export.cmd --server 13339
-
-Explicit address:
-
-run_export.cmd --server 13339 --address 0x7FF6E3BF5C90
-
-Function name:
-
-run_export.cmd --server 13339 --function UpdatePlayerStates
-
-Use eight workers:
-
-run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --workers 8
-
-Allow fifteen minutes per request and five retries:
-
-run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --timeout 900 --retries 5
-
-Check health every minute:
-
-run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --health-interval 60
-
-TROUBLESHOOTING
----------------
-
-If IDA temporarily freezes during a large or obfuscated function, watch the longest worker timer and health state. IDA may resume and complete the request normally.
-
-If curl reports connection refused, confirm that ida-pro-mcp is still running on the selected port. The exporter will retry request failures and pause new work when the health monitor detects an outage.
-
-If 16 workers make IDA unstable, reduce the count:
-
-run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --workers 8
-
-Press Ctrl+C to stop the exporter intentionally.
-
-MULTI-WORKER LIVE DASHBOARD
----------------------------
-
-Discovery and export now display a fixed dashboard with one row for every worker.
-The dashboard is redrawn in place and does not append a new status line for every update.
-
-Example:
-
+text
 Discovery Status
 Found: 1,653  Queued: 563  Active: 15  Processed: 1,090  Elapsed: 00:01:31  Health: OK 00:01:30 ago
 
@@ -283,13 +209,95 @@ ida-discover_0     Scanning       00:00:04   sub_7FF6E34D4BC0 @ 0x7ff6e34d4bc0
 ida-discover_1     Retrying       00:00:17   sub_7FF6E329DE60 @ 0x7ff6e329de60  attempt 1/3, retry in 5s
 ida-discover_2     Idle           00:00:00   -
 
-When a worker finishes:
 
-- its previous function name is removed immediately
-- its state becomes Idle
-- its elapsed time resets to 00:00:00
-- its function field becomes -
-- the same row is reused when that worker receives another function
+Output Files
 
-This makes each worker's current state clear without leaving stale information on screen.
-The dashboard redraw is rate-limited to avoid slowing large exports while still updating continuously.
+Each run creates a directory named after the resolved root function.
+
+text
+ida_exports/
+└── function_<RootFunction>/
+    ├── Main_<RootFunction>_function_we_are_in.txt
+    ├── Extracted_referenced_functions_in_<RootFunction>.txt
+    ├── Extracted_called_functions_<RootFunction>_pseudocode.txt
+    └── Manifest_<RootFunction>.json
+
+
+| File | Description | Primary use |
+|---|---|---|
+| Main_<RootFunction>_function_we_are_in.txt | Contains the selected root function, including identifying metadata, its assembly, and its Hex-Rays pseudocode when available. | First file to open when beginning analysis of the selected function. |
+| Extracted_referenced_functions_in_<RootFunction>.txt | Contains assembly for every recursively discovered reachable function, written in deterministic discovery order. | Low-level reverse engineering, instruction verification, signature work, and complete call-context review. |
+| Extracted_called_functions_<RootFunction>_pseudocode.txt | Contains Hex-Rays pseudocode for the same recursively discovered functions. | High-level logic analysis, documentation, and LLM-assisted understanding. |
+| Manifest_<RootFunction>.json | Contains machine-readable root data, worker settings, request and health settings, timing, retries, health statistics, graph edges, failures, exported functions, and output paths. | Automation, validation, troubleshooting, dashboards, and downstream tooling. |
+
+Final Statistics
+
+At completion, the exporter reports:
+
+| Statistic | Meaning |
+|---|---|
+| Functions discovered | Unique reachable functions found during traversal |
+| Function records | Function entries written to the export set |
+| Fully successful | Functions with no final discovery, disassembly, or decompilation failure |
+| Partial/failed | Unique functions with at least one final failed operation |
+| Failure operations | Total failed stages; one function can contribute more than one failure |
+| Retry attempts | Total retry attempts across operations |
+| Recovered by retry | Operations that failed initially and later succeeded |
+| Health checks | MCP health probes performed |
+| Health failures | Failed health probes |
+| Health recoveries | Transitions from unhealthy back to healthy |
+| Discovery time | Time spent finding the reachable call graph |
+| Export time | Time spent extracting full assembly and pseudocode |
+| Total runtime | Complete run time |
+| Output size | Combined size of the four generated files |
+
+Examples
+
+| Goal | Command |
+|---|---|
+| Export current cursor function | run_export.cmd --server 13339 |
+| Export by address | run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 |
+| Export by function name | run_export.cmd --server 13339 --function UpdatePlayerStates |
+| Use eight workers | run_export.cmd --server 13339 --address 0x7FF6E3BF5C90 --workers 8 |
+| Use a custom output directory | run_export.cmd --output E:\IDAExports --function UpdatePlayerStates |
+| Allow fifteen minutes per request | run_export.cmd --timeout 900 --function UpdatePlayerStates |
+| Disable request timeout | run_export.cmd --timeout 0 --function UpdatePlayerStates |
+| Disable per-function discovery timeout | run_export.cmd --function-timeout 0 --function UpdatePlayerStates |
+| Increase retries | run_export.cmd --retries 5 --function UpdatePlayerStates |
+| Check health every minute | run_export.cmd --health-interval 60 --function UpdatePlayerStates |
+| Show enabled MCP tools | run_export.cmd --server 13339 --list-tools |
+| Use detailed paging diagnostics | run_export.cmd --function UpdatePlayerStates --verbose 4 |
+| Use full communication diagnostics | run_export.cmd --function UpdatePlayerStates --verbose 6 |
+
+Troubleshooting
+
+| Problem | Suggested action |
+|---|---|
+| curl is not found | Confirm modern Windows curl is available, add curl to PATH, or pass --curl <full-path>. |
+| Connection refused | Confirm ida-pro-mcp is running on the selected host and port. |
+| Required MCP tool missing | Run --list-tools and verify that lookup_funcs, disasm, and decompile are enabled. |
+| IDA becomes unstable with many workers | Reduce the count, for example --workers 8 or --workers 4. |
+| A worker appears frozen | Use --verbose 4 to inspect page, instruction, and target-resolution progress. |
+| One function repeatedly times out | Increase --function-timeout, reduce --page-size, or inspect the function manually in IDA. |
+| Individual MCP requests time out | Increase --timeout; keep it finite so automatic retries can activate. |
+| Pseudocode is missing | Confirm Hex-Rays is installed and the function can be decompiled in IDA. |
+
+Press Ctrl+C to stop the exporter intentionally.
+
+Designed For
+
+- Reverse engineering
+- Binary analysis
+- Vulnerability research
+- Malware analysis
+- Program documentation
+- Call-graph exploration
+- LLM-assisted code understanding
+
+License
+
+MIT
+
+Acknowledgements
+
+A huge thank you to mrexodia for creating the excellent ida-pro-mcp project. This exporter uses that plugin as its communication layer to recursively discover, extract, and organize large portions of an IDA database into a format that is easier for both humans and language models to understand.
