@@ -206,40 +206,6 @@ To keep your current console layout:
 run_export.cmd --server 13338 --function draw_debug_info --verbose 6 --timeout 30 --no-console-resize
 ```
 
-## In-Place Redraw and No Flicker
-
-During a live stage, the exporter anchors the frame at the top of the console and replaces the current rows instead of appending a new dashboard every second. The cursor is hidden while the live dashboard is active and restored when the panel closes.
-
-A complete console-buffer clear is used only when switching between the three major stages. This removes obsolete stage information without causing a full-screen flash on every live update.
-
-## Diagnostic Color Scheme
-
-Colors are semantic and are applied consistently across Worker Debug, Current Function Statistics, Recent Debug Events, Discovery/Export Status, and the lower worker table.
-
-| Data | Color behavior |
-|---|---|
-| `LIVE`, `OK`, successful completions, `rc=0` | Green |
-| Failed operations, timeouts, unresolved failures, nonzero error codes | Red |
-| Waiting, retries, page sizes, page counts, offsets, limits | Yellow |
-| Addresses and byte/timing fields | Cyan |
-| Request IDs and numeric request fields | Yellow |
-| Session IDs and targets | Magenta |
-| Discovery/disassembly/export stages | Stage-specific blue or magenta |
-| `POST` and other HTTP verbs | Colored separately from `Calling` tool messages |
-| Event categories | Category-specific colors |
-
-Both `key=value` fields and JSON-style fields are colored, including examples such as:
-
-```text
-offset=0
-page_size=50000
-target=sub_7FF6E3BF5C90
-"offset": 0
-"addr": "0x7ff6e3bf5c90"
-```
-
-Rows are shortened only at complete field boundaries. Unreadable partial tails such as `re...` or `rc...` are removed rather than printed.
-
 ## Worker Watchdog States
 
 Watchdog labels are based on the time since a worker's most recent progress event.
