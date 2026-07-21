@@ -99,16 +99,6 @@ The table below lists every command-line argument accepted by the current export
 run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
 ```
 
-## Root Selection Rules
-
-| Command | Root used |
-|---|---|
-| `run_export.cmd` | Function under the current IDA cursor |
-| `run_export.cmd --function UpdatePlayerStates` | IDA function named `UpdatePlayerStates` |
-| `run_export.cmd --function sub_7FF6E3BF5C90` | IDA function with that generated name |
-| `run_export.cmd --function 0x7FF6E3BF5C90` | Function resolved from that address |
-| `run_export.cmd --address 7FF6E3BF5C90` | Function resolved from that numeric address |
-
 `--function` and `--address` are mutually exclusive. Supplying both fails during argument parsing before MCP is contacted.
 
 # Verbose Diagnostics
@@ -130,18 +120,6 @@ The live panel is attached only when standard output is an interactive terminal.
 ## Windows Console Layout
 
 Automatic resizing applies only to an interactive Windows console and can be disabled with `--no-console-resize`.
-
-| Verbose level | Automatic layout |
-|---:|---|
-| `0` | Existing console layout is retained. |
-| `1` | Existing font and window size are retained. |
-| `2` through `6` | Uses the shared tested layout described below. |
-
-For Verbose 2 through 6, the exporter attempts to use:
-
-The same readable size is used for every level from 2 through 6; higher verbose levels do not progressively shrink the text. The original font, buffer, visible window, and outer window dimensions are restored automatically when the exporter exits.
-
-Classic Command Prompt supports these legacy APIs most reliably. Windows Terminal and other ConPTY hosts may reject some or all resize operations; in that case, the exporter keeps the current layout and continues normally.
 
 To keep your current console layout:
 
