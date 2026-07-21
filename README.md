@@ -4,7 +4,7 @@
 
 ---
 
-# IDA MCP Recursive Export Shim
+# IDA MCP Export Shim
 
 > Export the complete reachable function context from IDA Pro through `ida-pro-mcp` instead of analyzing one function at a time.
 
@@ -38,21 +38,6 @@ If neither `--address` nor `--function` is supplied, the exporter uses the funct
 
 The tested diagnostic form used during development is:
 
-```cmd
-run_export.cmd --server 13338 --function draw_debug_info --verbose 6 --timeout 30
-```
-
-Use the same command with any verbose level from `1` through `6`:
-
-```cmd
-run_export.cmd --server 13338 --function draw_debug_info --verbose 1 --timeout 30
-run_export.cmd --server 13338 --function draw_debug_info --verbose 2 --timeout 30
-run_export.cmd --server 13338 --function draw_debug_info --verbose 3 --timeout 30
-run_export.cmd --server 13338 --function draw_debug_info --verbose 4 --timeout 30
-run_export.cmd --server 13338 --function draw_debug_info --verbose 5 --timeout 30
-run_export.cmd --server 13338 --function draw_debug_info --verbose 6 --timeout 30
-```
-
 ## Three Console Stages
 
 The exporter keeps the startup header visible and labels the active stage exactly as follows:
@@ -66,16 +51,6 @@ Current stage: Finalize Results
 ### Scanning Functions
 
 The exporter recursively discovers reachable functions, follows direct calls and cross-function tail jumps, resolves targets, deduplicates addresses, and builds the graph.
-
-### Exporting Disassembly
-
-The exporter retrieves the complete assembly and Hex-Rays pseudocode for every discovered function using the configured worker pool.
-
-### Finalize Results
-
-The exporter writes the four output files, creates the manifest, calculates final statistics, and prints the summary.
-
-At a stage transition, the completed stage is removed and the fixed startup header is redrawn with only the new current stage. During normal live updates inside a stage, the dashboard is redrawn in place rather than clearing the entire console. This avoids flashing, prevents old dashboard frames from accumulating, and keeps only current information visible.
 
 ## What the Exporter Does
 
@@ -150,31 +125,6 @@ Pass `--verbose` or `--verbose LEVEL` to display a live **Debug Status** panel a
 | `5` | Target resolution, accepted graph edges, duplicate edges, skipped targets, unresolved targets, and traversal counters. |
 | `6` | Curl command construction, JSON-RPC payloads, response headers, and individual `CALL`/`JMP` candidate diagnostics. Response-body previews are intentionally not displayed. |
 
-Useful commands:
-
-```cmd
-:: Default live dashboard
-run_export.cmd --server 13338 --function draw_debug_info
-
-:: Worker and watchdog diagnostics
-run_export.cmd --server 13338 --function draw_debug_info --verbose 1 --timeout 30
-
-:: Detailed worker activity
-run_export.cmd --server 13338 --function draw_debug_info --verbose 2 --timeout 30
-
-:: MCP request diagnostics
-run_export.cmd --server 13338 --function draw_debug_info --verbose 3 --timeout 30
-
-:: Paging diagnostics
-run_export.cmd --server 13338 --function draw_debug_info --verbose 4 --timeout 30
-
-:: Target and graph diagnostics
-run_export.cmd --server 13338 --function draw_debug_info --verbose 5 --timeout 30
-
-:: Full payload, curl, and header diagnostics
-run_export.cmd --server 13338 --function draw_debug_info --verbose 6 --timeout 30
-```
-
 The live panel is attached only when standard output is an interactive terminal. When output is redirected to a file or pipe, the in-place dashboard is not attached.
 
 ## Windows Console Layout
@@ -188,13 +138,6 @@ Automatic resizing applies only to an interactive Windows console and can be dis
 | `2` through `6` | Uses the shared tested layout described below. |
 
 For Verbose 2 through 6, the exporter attempts to use:
-
-```text
-Font height:       13 pixels
-Console columns:   200
-Console rows:      86
-Outer window size: 1200 x 1181 pixels
-```
 
 The same readable size is used for every level from 2 through 6; higher verbose levels do not progressively shrink the text. The original font, buffer, visible window, and outer window dimensions are restored automatically when the exporter exits.
 
@@ -389,10 +332,10 @@ Press `Ctrl+C` to stop the exporter intentionally.
 - Call-graph exploration
 - LLM-assisted code understanding
 
-# License
-
-MIT
-
 # Acknowledgements
 
 A huge thank you to **mrexodia** for creating the excellent [`ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) project. This exporter uses that plugin as its communication layer to recursively discover, extract, and organize large portions of an IDA database into a format that is easier for both humans and language models to understand.
+
+# License
+
+MIT
