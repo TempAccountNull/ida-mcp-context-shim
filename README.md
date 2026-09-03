@@ -78,6 +78,7 @@ The table below lists every command-line argument accepted by the current export
 | **`--function`** | Function name or address | Current IDA cursor | Selects the root by IDA function name or address. Examples: `UpdatePlayerStates`, `sub_7FF6E3BF5C90`, or `0x7FF6E3BF5C90`. Cannot be combined with `--address`. |
 | **`--address`** | Numeric address | Current IDA cursor | Selects the root using an explicit address. The `0x` prefix is optional. Cannot be combined with `--function`. |
 | **`--all-fns`** | Flag | Disabled | Exports every function in the database instead of walking from a root. Ignores `--function`, `--address`, and the cursor. Requires the `list_funcs` tool. Output goes to `all_functions/`. |
+| **`--files-separate`** | Flag | Disabled | Writes each function to its own `asm/<name>.asm` and `cpp/<name>.cpp` instead of combined files. Names use the function name plus address for uniqueness. Combines with `--all-fns`. |
 | **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates `function_<RootFunction>/` (or `all_functions/` with `--all-fns`) inside it, each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
 | **`--page-size`** | Integer from `1` to `50000` | `50000` | Sets the maximum disassembly instructions requested per page. Values outside the supported range are clamped. Smaller values generate more MCP requests. |
 | **`--include-external`** | Flag | Disabled | Accepted and recorded in the manifest. In the current build, it does not yet change traversal filtering. |
@@ -98,7 +99,7 @@ The table below lists every command-line argument accepted by the current export
 ## Complete Syntax
 
 ```cmd
-run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
+run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--files-separate] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
 ```
 
 `--function` and `--address` are mutually exclusive. Supplying both fails during argument parsing before MCP is contacted.
@@ -238,6 +239,8 @@ ida_exports/
 
 With `--all-fns` the directory is `all_functions/`, holding `asm/all_functions_disassembly.asm`, `cpp/all_functions_pseudocode.cpp`, and `Manifest_all_functions.json`.
 
+With `--files-separate` (either mode) each function is written to its own `asm/<name>_<addr>.asm` and `cpp/<name>_<addr>.cpp`.
+
 | File | Description | Primary use |
 |---|---|---|
 | **`asm/Main_<RootFunction>_function_we_are_in.asm`** | Root function metadata and assembly. | Entry point for analysis. |
@@ -275,6 +278,7 @@ At completion, the exporter reports:
 | Export by address | `run_export.cmd --server 13339 --address 0x7FF6E3BF5C90` |
 | Export by function name | `run_export.cmd --server 13339 --function UpdatePlayerStates` |
 | Export every function | `run_export.cmd --server 13339 --all-fns` |
+| Export every function, one file each | `run_export.cmd --server 13339 --all-fns --files-separate` |
 | Use eight workers | `run_export.cmd --server 13339 --function UpdatePlayerStates --workers 8` |
 | Use a custom output directory | `run_export.cmd --output E:\IDAExports --function UpdatePlayerStates` |
 | Allow fifteen minutes per request | `run_export.cmd --timeout 900 --function UpdatePlayerStates` |

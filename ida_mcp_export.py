@@ -107,6 +107,18 @@ def safe_name(value: str) -> str:
     return value.strip("._") or "function"
 
 
+def function_file_stem(info: FunctionInfo, used: set[str]) -> str:
+    """Filesystem-safe, collision-free stem for one function's per-function files."""
+    base = safe_name(info.name)[:120]
+    addr = info.addr.lower().replace("0x", "")
+    stem = base if addr in base.lower() else f"{base}_{addr}"
+    candidate, n = stem, 2
+    while candidate.lower() in used:
+        candidate, n = f"{stem}_{n}", n + 1
+    used.add(candidate.lower())
+    return candidate
+
+
 def addr_key(value: str) -> int | str:
     try:
         return int(value, 0)
@@ -2114,6 +2126,8 @@ def parse_args() -> argparse.Namespace:
     roots.add_argument("--address", help="Explicit root address, with or without 0x (example: 0x7FF6E3BF5C90).")
     p.add_argument("--all-fns", action="store_true",
                    help="Export every function in the IDB (entire function list) instead of only functions reachable from a root. Ignores --function/--address/cursor.")
+    p.add_argument("--files-separate", action="store_true",
+                   help="Write each function to its own asm/<name>.asm and cpp/<name>.cpp file instead of combined files. Works with or without --all-fns.")
     p.add_argument("--output", default="ida_exports", help="Parent output directory")
     p.add_argument("--page-size", type=int, default=50000, help="Instructions per disasm request, max 50000")
     p.add_argument("--include-external", action="store_true", help="Attempt to export external/import functions too")
@@ -2435,7 +2449,18 @@ def main() -> int:
 
     exported: list[dict[str, Any]] = []
     # Preserve deterministic discovery order in output files even though extraction is concurrent.
-    if args.all_fns:
+    if args.files_separate:
+        # One file per function: asm/<stem>.asm and cpp/<stem>.cpp.
+        used_stems: set[str] = set()
+        for info in all_functions:
+            _, asm, pseudo = results[addr_key(info.addr)]
+            stem = function_file_stem(info, used_stems)
+            with (asm_dir / f"{stem}.asm").open("w", encoding="utf-8", newline="\n") as fp:
+                write_section(fp, "FUNCTION ASSEMBLY", info, asm)
+            with (cpp_dir / f"{stem}.cpp").open("w", encoding="utf-8", newline="\n") as fp:
+                write_section(fp, "FUNCTION PSEUDOCODE", info, pseudo)
+            exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
+    elif args.all_fns:
         # Every function is a peer: all disassembly to one .asm, all pseudocode to one .cpp.
         with referenced_asm_path.open("w", encoding="utf-8", newline="\n") as asm_fp, \
              called_pseudo_path.open("w", encoding="utf-8", newline="\n") as pseudo_fp:
@@ -2491,6 +2516,9 @@ def main() -> int:
         "failures": failures,
         "exported_functions": exported,
         "files": ({
+            "asm_dir": str(asm_dir),
+            "cpp_dir": str(cpp_dir),
+        } if args.files_separate else {
             "disassembly": str(referenced_asm_path),
             "pseudocode": str(called_pseudo_path),
         } if args.all_fns else {
@@ -2505,7 +2533,7 @@ def main() -> int:
     failed_functions = {addr_key(item.get("addr", "")) for item in failures if item.get("addr")}
     fully_successful = max(0, len(exported) - len(failed_functions))
     partial_or_failed = len(failed_functions)
-    output_size = sum(path.stat().st_size for path in (main_asm_path, main_cpp_path, referenced_asm_path, called_pseudo_path, manifest_path) if path is not None and path.exists())
+    output_size = sum(p.stat().st_size for p in out_dir.rglob("*") if p.is_file())
 
     console_print(color("=" * 60, Colors.CYAN))
     console_print(color("Export Summary", Colors.CYAN + Colors.BOLD))
@@ -2528,11 +2556,15 @@ def main() -> int:
     if failures:
         status("WARN", f"{len(failures):,} extraction/discovery failures; see manifest", tone="yellow")
     console_print(color("Created:", Colors.CYAN + Colors.BOLD))
-    if not args.all_fns:
-        console_print(f"  {color(str(main_asm_path), Colors.GREEN)}")
-        console_print(f"  {color(str(main_cpp_path), Colors.GREEN)}")
-    console_print(f"  {color(str(referenced_asm_path), Colors.GREEN)}")
-    console_print(f"  {color(str(called_pseudo_path), Colors.GREEN)}")
+    if args.files_separate:
+        console_print(f"  {color(str(asm_dir), Colors.GREEN)}  ({len(exported):,} .asm files)")
+        console_print(f"  {color(str(cpp_dir), Colors.GREEN)}  ({len(exported):,} .cpp files)")
+    else:
+        if not args.all_fns:
+            console_print(f"  {color(str(main_asm_path), Colors.GREEN)}")
+            console_print(f"  {color(str(main_cpp_path), Colors.GREEN)}")
+        console_print(f"  {color(str(referenced_asm_path), Colors.GREEN)}")
+        console_print(f"  {color(str(called_pseudo_path), Colors.GREEN)}")
     console_print(f"  {color(str(manifest_path), Colors.GREEN)}")
     return 0
 
