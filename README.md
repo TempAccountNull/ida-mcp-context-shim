@@ -8,7 +8,7 @@
 
 > Export the complete reachable function context from IDA Pro through `ida-pro-mcp` instead of analyzing one function at a time.
 
-The IDA MCP Recursive Export Shim is a multithreaded command-line utility that communicates directly with an `ida-pro-mcp` server. It starts from the function under the current IDA cursor, an explicit address, or a function name; recursively follows direct `CALL` instructions and cross-function tail `JMP` instructions; and exports assembly, Hex-Rays pseudocode, graph relationships, failures, timing, retries, health data, and run statistics.
+The IDA MCP Recursive Export Shim is a multithreaded command-line utility that communicates directly with an `ida-pro-mcp` server. It starts from the function under the current IDA cursor, an explicit address, or a function name; recursively follows direct `CALL` instructions and cross-function tail `JMP` instructions; and exports assembly, Hex-Rays pseudocode, graph relationships, failures, timing, retries, health data, and run statistics. Pass `--all-fns` to skip traversal and export every function in the database instead.
 
 <img width="1167" height="1142" alt="image" src="https://github.com/user-attachments/assets/ba591a17-5e17-49c0-880c-9a994ba2d318" />
 
@@ -32,6 +32,7 @@ run_export.cmd
 run_export.cmd --server 13339
 run_export.cmd --server 13339 --address 0x7FF6E3BF5C90
 run_export.cmd --server 13339 --function UpdatePlayerStates
+run_export.cmd --server 13339 --all-fns
 ```
 
 If neither `--address` nor `--function` is supplied, the exporter uses the function under the current IDA cursor.
@@ -76,7 +77,8 @@ The table below lists every command-line argument accepted by the current export
 | **`--server`** | Port, `host:port`, or full URL | `13337` | Selects the `ida-pro-mcp` endpoint. A port such as `13339` becomes `http://127.0.0.1:13339/mcp`. A host and port such as `192.168.1.10:13337` becomes `http://192.168.1.10:13337/mcp`. A full HTTP or HTTPS URL is accepted. `/mcp` is appended when missing. |
 | **`--function`** | Function name or address | Current IDA cursor | Selects the root by IDA function name or address. Examples: `UpdatePlayerStates`, `sub_7FF6E3BF5C90`, or `0x7FF6E3BF5C90`. Cannot be combined with `--address`. |
 | **`--address`** | Numeric address | Current IDA cursor | Selects the root using an explicit address. The `0x` prefix is optional. Cannot be combined with `--function`. |
-| **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates `function_<RootFunction>` inside it. Relative paths are resolved from the current working directory. |
+| **`--all-fns`** | Flag | Disabled | Exports every function in the database instead of walking from a root. Ignores `--function`, `--address`, and the cursor. Requires the `list_funcs` tool. Output goes to `all_functions/`. |
+| **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates `function_<RootFunction>/` (or `all_functions/` with `--all-fns`) inside it, each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
 | **`--page-size`** | Integer from `1` to `50000` | `50000` | Sets the maximum disassembly instructions requested per page. Values outside the supported range are clamped. Smaller values generate more MCP requests. |
 | **`--include-external`** | Flag | Disabled | Accepted and recorded in the manifest. In the current build, it does not yet change traversal filtering. |
 | **`--workers`** | Integer | `0` meaning automatic | Sets concurrent MCP worker threads. Automatic mode uses the CPU count and chooses from 4 through 16 workers. Manual values are clamped to 1 through 32. Each worker owns a separate initialized MCP session. |
@@ -96,7 +98,7 @@ The table below lists every command-line argument accepted by the current export
 ## Complete Syntax
 
 ```cmd
-run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
+run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
 ```
 
 `--function` and `--address` are mutually exclusive. Supplying both fails during argument parsing before MCP is contacted.
@@ -220,22 +222,28 @@ ida-discover_2     Idle           00:00:00   -
 
 # Output Files
 
-Each run creates a directory named after the resolved root function.
+Each run creates a directory named after the resolved root function. Disassembly (`.asm`) goes in `asm/`, pseudocode (`.cpp`) in `cpp/`.
 
 ```text
 ida_exports/
 └── function_<RootFunction>/
-    ├── Main_<RootFunction>_function_we_are_in.txt
-    ├── Extracted_referenced_functions_in_<RootFunction>.txt
-    ├── Extracted_called_functions_<RootFunction>_pseudocode.txt
+    ├── asm/
+    │   ├── Main_<RootFunction>_function_we_are_in.asm
+    │   └── Extracted_referenced_functions_in_<RootFunction>.asm
+    ├── cpp/
+    │   ├── Main_<RootFunction>_function_we_are_in.cpp
+    │   └── Extracted_called_functions_<RootFunction>_pseudocode.cpp
     └── Manifest_<RootFunction>.json
 ```
 
+With `--all-fns` the directory is `all_functions/`, holding `asm/all_functions_disassembly.asm`, `cpp/all_functions_pseudocode.cpp`, and `Manifest_all_functions.json`.
+
 | File | Description | Primary use |
 |---|---|---|
-| **`Main_<RootFunction>_function_we_are_in.txt`** | Selected root function metadata, assembly, and Hex-Rays pseudocode when available. | Entry point for analysis. |
-| **`Extracted_referenced_functions_in_<RootFunction>.txt`** | Assembly for every recursively discovered reachable function in deterministic discovery order. | Low-level reverse engineering, signature work, and instruction verification. |
-| **`Extracted_called_functions_<RootFunction>_pseudocode.txt`** | Hex-Rays pseudocode for the recursively discovered functions. | High-level logic analysis, documentation, and LLM-assisted review. |
+| **`asm/Main_<RootFunction>_function_we_are_in.asm`** | Root function metadata and assembly. | Entry point for analysis. |
+| **`cpp/Main_<RootFunction>_function_we_are_in.cpp`** | Root function Hex-Rays pseudocode when available. | Entry point for analysis. |
+| **`asm/Extracted_referenced_functions_in_<RootFunction>.asm`** | Assembly for every reachable function in deterministic discovery order. | Low-level reverse engineering, signature work, and instruction verification. |
+| **`cpp/Extracted_called_functions_<RootFunction>_pseudocode.cpp`** | Hex-Rays pseudocode for the reachable functions. | High-level logic analysis, documentation, and LLM-assisted review. |
 | **`Manifest_<RootFunction>.json`** | Machine-readable root information, worker/request settings, timing, retries, health data, graph edges, failures, exported functions, and output paths. | Automation, validation, dashboards, and troubleshooting. |
 
 # Final Statistics
@@ -266,6 +274,7 @@ At completion, the exporter reports:
 | Export current cursor function | `run_export.cmd --server 13339` |
 | Export by address | `run_export.cmd --server 13339 --address 0x7FF6E3BF5C90` |
 | Export by function name | `run_export.cmd --server 13339 --function UpdatePlayerStates` |
+| Export every function | `run_export.cmd --server 13339 --all-fns` |
 | Use eight workers | `run_export.cmd --server 13339 --function UpdatePlayerStates --workers 8` |
 | Use a custom output directory | `run_export.cmd --output E:\IDAExports --function UpdatePlayerStates` |
 | Allow fifteen minutes per request | `run_export.cmd --timeout 900 --function UpdatePlayerStates` |

@@ -2112,6 +2112,8 @@ def parse_args() -> argparse.Namespace:
     roots = p.add_mutually_exclusive_group()
     roots.add_argument("--function", help="Function name or address. Omit to use the current IDA cursor function.")
     roots.add_argument("--address", help="Explicit root address, with or without 0x (example: 0x7FF6E3BF5C90).")
+    p.add_argument("--all-fns", action="store_true",
+                   help="Export every function in the IDB (entire function list) instead of only functions reachable from a root. Ignores --function/--address/cursor.")
     p.add_argument("--output", default="ida_exports", help="Parent output directory")
     p.add_argument("--page-size", type=int, default=50000, help="Instructions per disasm request, max 50000")
     p.add_argument("--include-external", action="store_true", help="Attempt to export external/import functions too")
@@ -2269,6 +2271,35 @@ def export_one(
     vlog(1, "WORKER-EXPORT", f"Finished {info.name} @ {info.addr} asm_chars={len(asm)} pseudo_chars={len(pseudo)} failures={len(local_failures)}")
     return info, asm, pseudo, local_failures
 
+def fetch_all_functions(client: CurlMcpClient, page: int = 200) -> list[FunctionInfo]:
+    """Enumerate every function in the IDB via list_funcs pagination (for --all-fns).
+
+    ida-pro-mcp's paginate() returns next_offset = offset + count, or None once the
+    end of the list is reached. A page of 200 stays under the MCP output-preview
+    threshold so pages arrive inline with a reliable next_offset. Every function is
+    tagged depth 1 so its disassembly and pseudocode land in the export files.
+    """
+    functions: list[FunctionInfo] = []
+    seen: set[int | str] = set()
+    offset = 0
+    while True:
+        result = normalize_tool_item(client.call_tool("list_funcs", {"queries": {"offset": offset, "count": page}}))
+        entry = result[0] if isinstance(result, list) and result else result
+        rows = entry.get("data", []) if isinstance(entry, dict) else []
+        for row in rows:
+            addr = str(row.get("addr", ""))
+            key = addr_key(addr)
+            if not addr or key in seen:
+                continue
+            seen.add(key)
+            functions.append(FunctionInfo(addr, str(row.get("name") or addr), 1, "list_funcs"))
+        next_offset = entry.get("next_offset") if isinstance(entry, dict) else None
+        if not isinstance(next_offset, int) or next_offset <= offset:
+            break
+        offset = next_offset
+    return functions
+
+
 def main() -> int:
     global VERBOSE
     args = parse_args()
@@ -2291,8 +2322,12 @@ def main() -> int:
     if args.list_tools:
         print("\n".join(sorted(tools)))
         return 0
+    if args.all_fns and "list_funcs" not in tools:
+        raise McpError("--all-fns requires the 'list_funcs' tool, which is disabled or unavailable.")
 
-    if args.address:
+    if args.all_fns:
+        root_addr, root_name = "0x0", "all_functions"
+    elif args.address:
         address = args.address.strip()
         if not address.lower().startswith("0x"):
             address = "0x" + address
@@ -2310,12 +2345,22 @@ def main() -> int:
             root_name = resolved_name
 
     stem = safe_name(root_name)
-    out_dir = Path(args.output).resolve() / f"function_{stem}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    main_path = out_dir / f"Main_{stem}_function_we_are_in.txt"
-    referenced_asm_path = out_dir / f"Extracted_referenced_functions_in_{stem}.txt"
-    called_pseudo_path = out_dir / f"Extracted_called_functions_{stem}_pseudocode.txt"
-    manifest_path = out_dir / f"Manifest_{stem}.json"
+    out_dir = Path(args.output).resolve() / ("all_functions" if args.all_fns else f"function_{stem}")
+    asm_dir = out_dir / "asm"   # disassembly (.asm) files
+    cpp_dir = out_dir / "cpp"   # pseudocode (.cpp) files
+    asm_dir.mkdir(parents=True, exist_ok=True)
+    cpp_dir.mkdir(parents=True, exist_ok=True)
+    if args.all_fns:
+        main_asm_path = main_cpp_path = None  # no single "main" function in --all-fns mode
+        referenced_asm_path = asm_dir / "all_functions_disassembly.asm"
+        called_pseudo_path = cpp_dir / "all_functions_pseudocode.cpp"
+        manifest_path = out_dir / "Manifest_all_functions.json"
+    else:
+        main_asm_path = asm_dir / f"Main_{stem}_function_we_are_in.asm"
+        main_cpp_path = cpp_dir / f"Main_{stem}_function_we_are_in.cpp"
+        referenced_asm_path = asm_dir / f"Extracted_referenced_functions_in_{stem}.asm"
+        called_pseudo_path = cpp_dir / f"Extracted_called_functions_{stem}_pseudocode.cpp"
+        manifest_path = out_dir / f"Manifest_{stem}.json"
 
     worker_mode = "manual" if args.workers > 0 else "auto"
 
@@ -2333,7 +2378,7 @@ def main() -> int:
     stage_console = StageConsole(header_lines)
     stage_console.start("Scanning Functions")
 
-    root_source = "--address" if args.address else ("--function" if args.function else "IDA cursor")
+    root_source = "--all-fns" if args.all_fns else ("--address" if args.address else ("--function" if args.function else "IDA cursor"))
     root = FunctionInfo(root_addr, root_name, 0, root_source)
     clients = ThreadClients(args)
     health = HealthMonitor(args, required, stats)
@@ -2343,14 +2388,20 @@ def main() -> int:
     if args.verbose and sys.stdout.isatty():
         VERBOSE.attach_panel(LiveDebugPanel(args.verbose, max_events={1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 18}[args.verbose]))
     stats.discovery_started = time.monotonic()
-    discovery_status = DiscoveryStatusLine(root, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
-    if not sys.stdout.isatty():
-        console_print(color("Discovering reachable functions...", Colors.CYAN + Colors.BOLD))
-    all_functions, graph_edges, failures = discover_all_functions_parallel(
-        clients, health, root, args.page_size, workers, args.retries, args.retry_delay, stats, args.function_timeout, discovery_status
-    )
-    if discovery_status:
-        discovery_status.finish(len(all_functions))
+    if args.all_fns:
+        console_print(color("Enumerating entire function list...", Colors.CYAN + Colors.BOLD))
+        all_functions = fetch_all_functions(control)
+        graph_edges, failures = [], []
+        console_print(color(f"Enumerated {len(all_functions):,} functions from IDB", Colors.CYAN + Colors.BOLD))
+    else:
+        discovery_status = DiscoveryStatusLine(root, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
+        if not sys.stdout.isatty():
+            console_print(color("Discovering reachable functions...", Colors.CYAN + Colors.BOLD))
+        all_functions, graph_edges, failures = discover_all_functions_parallel(
+            clients, health, root, args.page_size, workers, args.retries, args.retry_delay, stats, args.function_timeout, discovery_status
+        )
+        if discovery_status:
+            discovery_status.finish(len(all_functions))
     stats.discovery_finished = time.monotonic()
     if VERBOSE.panel is not None:
         VERBOSE.panel.reset()
@@ -2384,18 +2435,29 @@ def main() -> int:
 
     exported: list[dict[str, Any]] = []
     # Preserve deterministic discovery order in output files even though extraction is concurrent.
-    with main_path.open("w", encoding="utf-8", newline="\n") as main_fp, \
-         referenced_asm_path.open("w", encoding="utf-8", newline="\n") as asm_fp, \
-         called_pseudo_path.open("w", encoding="utf-8", newline="\n") as pseudo_fp:
-        for info in all_functions:
-            _, asm, pseudo = results[addr_key(info.addr)]
-            if info.depth == 0:
-                write_section(main_fp, "MAIN FUNCTION ASSEMBLY", info, asm)
-                write_section(main_fp, "MAIN FUNCTION PSEUDOCODE", info, pseudo)
-            else:
-                write_section(asm_fp, "REFERENCED/CALLED FUNCTION ASSEMBLY", info, asm)
-                write_section(pseudo_fp, "CALLED FUNCTION PSEUDOCODE", info, pseudo)
-            exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
+    if args.all_fns:
+        # Every function is a peer: all disassembly to one .asm, all pseudocode to one .cpp.
+        with referenced_asm_path.open("w", encoding="utf-8", newline="\n") as asm_fp, \
+             called_pseudo_path.open("w", encoding="utf-8", newline="\n") as pseudo_fp:
+            for info in all_functions:
+                _, asm, pseudo = results[addr_key(info.addr)]
+                write_section(asm_fp, "FUNCTION ASSEMBLY", info, asm)
+                write_section(pseudo_fp, "FUNCTION PSEUDOCODE", info, pseudo)
+                exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
+    else:
+        with main_asm_path.open("w", encoding="utf-8", newline="\n") as main_asm_fp, \
+             main_cpp_path.open("w", encoding="utf-8", newline="\n") as main_cpp_fp, \
+             referenced_asm_path.open("w", encoding="utf-8", newline="\n") as asm_fp, \
+             called_pseudo_path.open("w", encoding="utf-8", newline="\n") as pseudo_fp:
+            for info in all_functions:
+                _, asm, pseudo = results[addr_key(info.addr)]
+                if info.depth == 0:
+                    write_section(main_asm_fp, "MAIN FUNCTION ASSEMBLY", info, asm)
+                    write_section(main_cpp_fp, "MAIN FUNCTION PSEUDOCODE", info, pseudo)
+                else:
+                    write_section(asm_fp, "REFERENCED/CALLED FUNCTION ASSEMBLY", info, asm)
+                    write_section(pseudo_fp, "CALLED FUNCTION PSEUDOCODE", info, pseudo)
+                exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
 
     manifest = {
         "server": control.url,
@@ -2428,18 +2490,22 @@ def main() -> int:
         "function_limit_reached": False,
         "failures": failures,
         "exported_functions": exported,
-        "files": {
-            "main": str(main_path),
+        "files": ({
+            "disassembly": str(referenced_asm_path),
+            "pseudocode": str(called_pseudo_path),
+        } if args.all_fns else {
+            "main_assembly": str(main_asm_path),
+            "main_pseudocode": str(main_cpp_path),
             "referenced_assembly": str(referenced_asm_path),
             "called_pseudocode": str(called_pseudo_path),
-        },
+        }),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     failed_functions = {addr_key(item.get("addr", "")) for item in failures if item.get("addr")}
     fully_successful = max(0, len(exported) - len(failed_functions))
     partial_or_failed = len(failed_functions)
-    output_size = sum(path.stat().st_size for path in (main_path, referenced_asm_path, called_pseudo_path, manifest_path) if path.exists())
+    output_size = sum(path.stat().st_size for path in (main_asm_path, main_cpp_path, referenced_asm_path, called_pseudo_path, manifest_path) if path is not None and path.exists())
 
     console_print(color("=" * 60, Colors.CYAN))
     console_print(color("Export Summary", Colors.CYAN + Colors.BOLD))
@@ -2462,7 +2528,9 @@ def main() -> int:
     if failures:
         status("WARN", f"{len(failures):,} extraction/discovery failures; see manifest", tone="yellow")
     console_print(color("Created:", Colors.CYAN + Colors.BOLD))
-    console_print(f"  {color(str(main_path), Colors.GREEN)}")
+    if not args.all_fns:
+        console_print(f"  {color(str(main_asm_path), Colors.GREEN)}")
+        console_print(f"  {color(str(main_cpp_path), Colors.GREEN)}")
     console_print(f"  {color(str(referenced_asm_path), Colors.GREEN)}")
     console_print(f"  {color(str(called_pseudo_path), Colors.GREEN)}")
     console_print(f"  {color(str(manifest_path), Colors.GREEN)}")
