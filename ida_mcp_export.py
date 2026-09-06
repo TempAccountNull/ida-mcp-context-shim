@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2129,6 +2130,11 @@ def parse_args() -> argparse.Namespace:
                    help="Export every function in the IDB (entire function list) instead of only functions reachable from a root. Ignores --function/--address/cursor.")
     p.add_argument("--files-separate", action="store_true",
                    help="Write each function to its own asm/<name>.asm and cpp/<name>.cpp file instead of combined files. Works with or without --all-fns.")
+    kinds = p.add_mutually_exclusive_group()
+    kinds.add_argument("--asm-only", action="store_true",
+                       help="Export only disassembly (.asm); skip pseudocode. Much faster: decompilation is ~90%% of export time.")
+    kinds.add_argument("--cpp-only", action="store_true",
+                       help="Export only pseudocode (.cpp); skip disassembly.")
     p.add_argument("--output", default="ida_exports", help="Parent output directory")
     p.add_argument("--page-size", type=int, default=50000, help="Instructions per disasm request, max 50000")
     p.add_argument("--include-external", action="store_true", help="Attempt to export external/import functions too")
@@ -2253,38 +2259,117 @@ def discover_all_functions_parallel(
 def export_one(
     clients: ThreadClients, health: HealthMonitor, info: FunctionInfo, page_size: int,
     retries: int, retry_delay: float, stats: RunStats,
-    progress: ExportStatusLine | None = None,
+    progress: ExportStatusLine | None = None, want_asm: bool = True, want_cpp: bool = True,
 ) -> tuple[FunctionInfo, str, str, list[dict[str, str]]]:
     vlog(1, "WORKER-EXPORT", f"Assigned {info.name} @ {info.addr} depth={info.depth}")
     if progress:
         progress.notify("Preparing", info)
     local_failures: list[dict[str, str]] = []
-    try:
-        if progress:
-            progress.notify("Disassembling", info)
-        asm = run_with_retry(
-            clients, health, lambda: fetch_full_disasm(clients.get(), info.addr, page_size),
-            retries=retries, retry_delay=retry_delay, stats=stats,
-            on_retry=(lambda attempt, maximum, delay: progress.retry(info, attempt, maximum, delay)) if progress else None,
-        )
-    except Exception as exc:
-        asm = f"; Disassembly failed after {retries + 1} attempts: {exc}\n"
-        local_failures.append({"addr": info.addr, "name": info.name, "stage": "disasm", "error": str(exc)})
-    try:
-        if progress:
-            progress.notify("Decompiling", info)
-        pseudo = run_with_retry(
-            clients, health, lambda: fetch_decompile(clients.get(), info.addr),
-            retries=retries, retry_delay=retry_delay, stats=stats,
-            on_retry=(lambda attempt, maximum, delay: progress.retry(info, attempt, maximum, delay)) if progress else None,
-        )
-    except Exception as exc:
-        pseudo = f"/* Decompilation failed after {retries + 1} attempts: {exc} */\n"
-        local_failures.append({"addr": info.addr, "name": info.name, "stage": "decompile", "error": str(exc)})
+    asm = ""
+    if want_asm:
+        try:
+            if progress:
+                progress.notify("Disassembling", info)
+            asm = run_with_retry(
+                clients, health, lambda: fetch_full_disasm(clients.get(), info.addr, page_size),
+                retries=retries, retry_delay=retry_delay, stats=stats,
+                on_retry=(lambda attempt, maximum, delay: progress.retry(info, attempt, maximum, delay)) if progress else None,
+            )
+        except Exception as exc:
+            asm = f"; Disassembly failed after {retries + 1} attempts: {exc}\n"
+            local_failures.append({"addr": info.addr, "name": info.name, "stage": "disasm", "error": str(exc)})
+    pseudo = ""
+    if want_cpp:
+        try:
+            if progress:
+                progress.notify("Decompiling", info)
+            pseudo = run_with_retry(
+                clients, health, lambda: fetch_decompile(clients.get(), info.addr),
+                retries=retries, retry_delay=retry_delay, stats=stats,
+                on_retry=(lambda attempt, maximum, delay: progress.retry(info, attempt, maximum, delay)) if progress else None,
+            )
+        except Exception as exc:
+            pseudo = f"/* Decompilation failed after {retries + 1} attempts: {exc} */\n"
+            local_failures.append({"addr": info.addr, "name": info.name, "stage": "decompile", "error": str(exc)})
     if progress:
         progress.notify("Completed", info)
     vlog(1, "WORKER-EXPORT", f"Finished {info.name} @ {info.addr} asm_chars={len(asm)} pseudo_chars={len(pseudo)} failures={len(local_failures)}")
     return info, asm, pseudo, local_failures
+
+def export_batch(
+    clients: ThreadClients, health: HealthMonitor, infos: list[FunctionInfo], page_size: int,
+    retries: int, retry_delay: float, stats: RunStats, progress: ExportStatusLine | None = None,
+    want_asm: bool = True, want_cpp: bool = True,
+) -> list[tuple[FunctionInfo, str, str, list[dict[str, str]]]]:
+    """Export a chunk of functions in one analyze_batch call (asm and/or pseudocode).
+
+    IDA services MCP requests serially, so the win is collapsing 2*N per-function
+    calls (disasm + decompile) into one call per chunk, removing per-call curl/HTTP
+    overhead. Functions whose disasm exceeds max_disasm_insns fall back to the paged
+    fetch_full_disasm so nothing is silently truncated. want_asm/want_cpp skip the
+    kind disabled by --cpp-only/--asm-only (decompilation is ~90% of export time).
+    """
+    if not infos:
+        return []
+    if progress:
+        progress.notify("Exporting", infos[0], f"batch of {len(infos)}")
+    # Request the server's per-function ceiling (analyze_batch clamps max_disasm_insns
+    # to 50000). A function longer than that returns truncated=True and is re-fetched
+    # in full by the paged fetch_full_disasm fallback below, so all of it is captured
+    # regardless of --page-size.
+    max_insns = 50000
+    queries = [{
+        "addr": info.addr,
+        "include_disasm": want_asm, "include_decompile": want_cpp,
+        "include_xrefs": False, "include_callers": False, "include_callees": False,
+        "include_strings": False, "include_constants": False,
+        "include_basic_blocks": False, "include_proto": False,
+        "max_disasm_insns": max_insns,
+    } for info in infos]
+    raw = run_with_retry(
+        clients, health,
+        lambda: normalize_tool_item(clients.get().call_tool("analyze_batch", {"queries": queries})),
+        retries=retries, retry_delay=retry_delay, stats=stats,
+        on_retry=(lambda a, mx, d: progress.retry(infos[0], a, mx, d)) if progress else None,
+    )
+    by_addr = {addr_key(str(r.get("addr") or r.get("target") or "")): r for r in (raw or []) if isinstance(r, dict)}
+    out: list[tuple[FunctionInfo, str, str, list[dict[str, str]]]] = []
+    for info in infos:
+        r = by_addr.get(addr_key(info.addr)) or {}
+        analysis = r.get("analysis") or {}
+        failures: list[dict[str, str]] = []
+        pseudo = ""
+        if want_cpp:
+            code = analysis.get("decompile")
+            if code is None:
+                err = analysis.get("decompile_error") or r.get("error") or "no result"
+                pseudo = f"/* Decompilation failed: {err} */\n"
+                failures.append({"addr": info.addr, "name": info.name, "stage": "decompile", "error": str(err)})
+            else:
+                pseudo = str(code) + "\n"
+        asm = ""
+        if want_asm:
+            disasm = analysis.get("disasm") or {}
+            lines = disasm.get("lines") or []
+            if disasm.get("truncated"):
+                try:
+                    asm = run_with_retry(
+                        clients, health, lambda: fetch_full_disasm(clients.get(), info.addr, page_size),
+                        retries=retries, retry_delay=retry_delay, stats=stats,
+                    )
+                except Exception as exc:
+                    asm = "\n".join(lines).rstrip() + f"\n; [disasm truncated at {disasm.get('instruction_count')} instructions; full fetch failed: {exc}]\n"
+            elif not lines:
+                err = r.get("error") or "no disassembly returned"
+                asm = f"; Disassembly unavailable: {err}\n"
+                failures.append({"addr": info.addr, "name": info.name, "stage": "disasm", "error": str(err)})
+            else:
+                asm = "\n".join(lines).rstrip() + "\n"
+        out.append((info, asm, pseudo, failures))
+        if progress:
+            progress.notify("Completed", info)
+    return out
+
 
 def get_module_name(control: CurlMcpClient, tools: dict) -> str:
     """Best-effort input module/file name for output naming; '' if unavailable."""
@@ -2376,8 +2461,7 @@ def main() -> int:
         raise McpError("--all-fns requires the 'list_funcs' tool, which is disabled or unavailable.")
 
     if args.all_fns:
-        module = safe_name(get_module_name(control, tools) or "target")
-        root_addr, root_name = "0x0", f"{module}_all_functions_{'split' if args.files_separate else 'aio'}"
+        root_addr, root_name = "0x0", "all_functions"
     elif args.address:
         address = args.address.strip()
         if not address.lower().startswith("0x"):
@@ -2395,22 +2479,30 @@ def main() -> int:
         if resolved_name != root_addr:
             root_name = resolved_name
 
+    want_asm = not args.cpp_only   # disassembly (.asm) output
+    want_cpp = not args.asm_only   # pseudocode (.cpp) output
+    module = safe_name(get_module_name(control, tools) or "target")
     stem = safe_name(root_name)
-    out_dir = Path(args.output).resolve() / (stem if args.all_fns else f"function_{stem}")
+    # Group every run for this binary under a <module>/ parent folder.
+    run_folder = f"all_functions_{'split' if args.files_separate else 'aio'}" if args.all_fns else f"function_{stem}"
+    out_dir = Path(args.output).resolve() / module / run_folder
+    out_dir.mkdir(parents=True, exist_ok=True)
     asm_dir = out_dir / "asm"   # disassembly (.asm) files
     cpp_dir = out_dir / "cpp"   # pseudocode (.cpp) files
-    asm_dir.mkdir(parents=True, exist_ok=True)
-    cpp_dir.mkdir(parents=True, exist_ok=True)
+    if want_asm:
+        asm_dir.mkdir(parents=True, exist_ok=True)
+    if want_cpp:
+        cpp_dir.mkdir(parents=True, exist_ok=True)
     if args.all_fns:
         main_asm_path = main_cpp_path = None  # no single "main" function in --all-fns mode
-        referenced_asm_path = asm_dir / "all_functions_disassembly.asm"
-        called_pseudo_path = cpp_dir / "all_functions_pseudocode.cpp"
+        referenced_asm_path = asm_dir / "all_functions_disassembly.asm" if want_asm else None
+        called_pseudo_path = cpp_dir / "all_functions_pseudocode.cpp" if want_cpp else None
         manifest_path = out_dir / "Manifest_all_functions.json"
     else:
-        main_asm_path = asm_dir / f"Main_{stem}_function_we_are_in.asm"
-        main_cpp_path = cpp_dir / f"Main_{stem}_function_we_are_in.cpp"
-        referenced_asm_path = asm_dir / f"Extracted_referenced_functions_in_{stem}.asm"
-        called_pseudo_path = cpp_dir / f"Extracted_called_functions_{stem}_pseudocode.cpp"
+        main_asm_path = asm_dir / f"Main_{stem}_function_we_are_in.asm" if want_asm else None
+        main_cpp_path = cpp_dir / f"Main_{stem}_function_we_are_in.cpp" if want_cpp else None
+        referenced_asm_path = asm_dir / f"Extracted_referenced_functions_in_{stem}.asm" if want_asm else None
+        called_pseudo_path = cpp_dir / f"Extracted_called_functions_{stem}_pseudocode.cpp" if want_cpp else None
         manifest_path = out_dir / f"Manifest_{stem}.json"
 
     worker_mode = "manual" if args.workers > 0 else "auto"
@@ -2475,18 +2567,33 @@ def main() -> int:
     export_status = ExportStatusLine(total, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
     if args.verbose:
         vlog(1, "EXPORT", f"Starting export of {total} functions with {workers} workers")
+    use_batch = args.all_fns and "analyze_batch" in tools
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ida-export") as executor:
         # Work remains fully concurrent. Every worker updates the same in-place
         # status line as it changes stage; final files are still written later in
         # deterministic discovery order.
-        ordered_futures = [
-            executor.submit(export_one, clients, health, info, args.page_size, args.retries, args.retry_delay, stats, export_status)
-            for info in all_functions
-        ]
-        for future in ordered_futures:
-            info, asm, pseudo, local_failures = future.result()
-            failures.extend(local_failures)
-            results[addr_key(info.addr)] = (info, asm, pseudo)
+        if use_batch:
+            # Bulk path: analyze_batch collapses disasm+decompile for a chunk of
+            # functions into a single MCP call. ponytail: chunk=150 caps response
+            # size; raise it for fewer round-trips if the server handles it.
+            chunk = 150
+            batches = [all_functions[i:i + chunk] for i in range(0, len(all_functions), chunk)]
+            for future in [
+                executor.submit(export_batch, clients, health, b, args.page_size, args.retries, args.retry_delay, stats, export_status, want_asm, want_cpp)
+                for b in batches
+            ]:
+                for info, asm, pseudo, local_failures in future.result():
+                    failures.extend(local_failures)
+                    results[addr_key(info.addr)] = (info, asm, pseudo)
+        else:
+            ordered_futures = [
+                executor.submit(export_one, clients, health, info, args.page_size, args.retries, args.retry_delay, stats, export_status, want_asm, want_cpp)
+                for info in all_functions
+            ]
+            for future in ordered_futures:
+                info, asm, pseudo, local_failures = future.result()
+                failures.extend(local_failures)
+                results[addr_key(info.addr)] = (info, asm, pseudo)
     if export_status:
         export_status.finish()
     vlog(1, "EXPORT", f"Export extraction complete functions={len(results)} failures={len(failures)}")
@@ -2499,39 +2606,68 @@ def main() -> int:
     exported: list[dict[str, Any]] = []
     # Preserve deterministic discovery order in output files even though extraction is concurrent.
     if args.files_separate:
-        # One file per function: asm/<stem>.asm and cpp/<stem>.cpp.
+        # One file per function: asm/<stem>.asm and/or cpp/<stem>.cpp.
         used_stems: set[str] = set()
         for info in all_functions:
             _, asm, pseudo = results[addr_key(info.addr)]
-            stem = function_file_stem(info, used_stems)
-            with (asm_dir / f"{stem}.asm").open("w", encoding="utf-8", newline="\n") as fp:
-                write_section(fp, "FUNCTION ASSEMBLY", info, asm)
-            with (cpp_dir / f"{stem}.cpp").open("w", encoding="utf-8", newline="\n") as fp:
-                write_section(fp, "FUNCTION PSEUDOCODE", info, pseudo)
+            fstem = function_file_stem(info, used_stems)
+            if want_asm:
+                with (asm_dir / f"{fstem}.asm").open("w", encoding="utf-8", newline="\n") as fp:
+                    write_section(fp, "FUNCTION ASSEMBLY", info, asm)
+            if want_cpp:
+                with (cpp_dir / f"{fstem}.cpp").open("w", encoding="utf-8", newline="\n") as fp:
+                    write_section(fp, "FUNCTION PSEUDOCODE", info, pseudo)
             exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
     elif args.all_fns:
         # Every function is a peer: all disassembly to one .asm, all pseudocode to one .cpp.
-        with referenced_asm_path.open("w", encoding="utf-8", newline="\n") as asm_fp, \
-             called_pseudo_path.open("w", encoding="utf-8", newline="\n") as pseudo_fp:
+        with ExitStack() as stack:
+            asm_fp = stack.enter_context(referenced_asm_path.open("w", encoding="utf-8", newline="\n")) if want_asm else None
+            pseudo_fp = stack.enter_context(called_pseudo_path.open("w", encoding="utf-8", newline="\n")) if want_cpp else None
             for info in all_functions:
                 _, asm, pseudo = results[addr_key(info.addr)]
-                write_section(asm_fp, "FUNCTION ASSEMBLY", info, asm)
-                write_section(pseudo_fp, "FUNCTION PSEUDOCODE", info, pseudo)
+                if asm_fp:
+                    write_section(asm_fp, "FUNCTION ASSEMBLY", info, asm)
+                if pseudo_fp:
+                    write_section(pseudo_fp, "FUNCTION PSEUDOCODE", info, pseudo)
                 exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
     else:
-        with main_asm_path.open("w", encoding="utf-8", newline="\n") as main_asm_fp, \
-             main_cpp_path.open("w", encoding="utf-8", newline="\n") as main_cpp_fp, \
-             referenced_asm_path.open("w", encoding="utf-8", newline="\n") as asm_fp, \
-             called_pseudo_path.open("w", encoding="utf-8", newline="\n") as pseudo_fp:
+        with ExitStack() as stack:
+            main_asm_fp = stack.enter_context(main_asm_path.open("w", encoding="utf-8", newline="\n")) if want_asm else None
+            main_cpp_fp = stack.enter_context(main_cpp_path.open("w", encoding="utf-8", newline="\n")) if want_cpp else None
+            asm_fp = stack.enter_context(referenced_asm_path.open("w", encoding="utf-8", newline="\n")) if want_asm else None
+            pseudo_fp = stack.enter_context(called_pseudo_path.open("w", encoding="utf-8", newline="\n")) if want_cpp else None
             for info in all_functions:
                 _, asm, pseudo = results[addr_key(info.addr)]
                 if info.depth == 0:
-                    write_section(main_asm_fp, "MAIN FUNCTION ASSEMBLY", info, asm)
-                    write_section(main_cpp_fp, "MAIN FUNCTION PSEUDOCODE", info, pseudo)
+                    if main_asm_fp:
+                        write_section(main_asm_fp, "MAIN FUNCTION ASSEMBLY", info, asm)
+                    if main_cpp_fp:
+                        write_section(main_cpp_fp, "MAIN FUNCTION PSEUDOCODE", info, pseudo)
                 else:
-                    write_section(asm_fp, "REFERENCED/CALLED FUNCTION ASSEMBLY", info, asm)
-                    write_section(pseudo_fp, "CALLED FUNCTION PSEUDOCODE", info, pseudo)
+                    if asm_fp:
+                        write_section(asm_fp, "REFERENCED/CALLED FUNCTION ASSEMBLY", info, asm)
+                    if pseudo_fp:
+                        write_section(pseudo_fp, "CALLED FUNCTION PSEUDOCODE", info, pseudo)
                 exported.append({"addr": info.addr, "name": info.name, "depth": info.depth, "source": info.source})
+
+    files_map: dict[str, str] = {}
+    if args.files_separate:
+        if want_asm:
+            files_map["asm_dir"] = str(asm_dir)
+        if want_cpp:
+            files_map["cpp_dir"] = str(cpp_dir)
+    elif args.all_fns:
+        if want_asm:
+            files_map["disassembly"] = str(referenced_asm_path)
+        if want_cpp:
+            files_map["pseudocode"] = str(called_pseudo_path)
+    else:
+        if want_asm:
+            files_map["main_assembly"] = str(main_asm_path)
+            files_map["referenced_assembly"] = str(referenced_asm_path)
+        if want_cpp:
+            files_map["main_pseudocode"] = str(main_cpp_path)
+            files_map["called_pseudocode"] = str(called_pseudo_path)
 
     manifest = {
         "server": control.url,
@@ -2564,18 +2700,7 @@ def main() -> int:
         "function_limit_reached": False,
         "failures": failures,
         "exported_functions": exported,
-        "files": ({
-            "asm_dir": str(asm_dir),
-            "cpp_dir": str(cpp_dir),
-        } if args.files_separate else {
-            "disassembly": str(referenced_asm_path),
-            "pseudocode": str(called_pseudo_path),
-        } if args.all_fns else {
-            "main_assembly": str(main_asm_path),
-            "main_pseudocode": str(main_cpp_path),
-            "referenced_assembly": str(referenced_asm_path),
-            "called_pseudocode": str(called_pseudo_path),
-        }),
+        "files": files_map,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -2606,14 +2731,14 @@ def main() -> int:
         status("WARN", f"{len(failures):,} extraction/discovery failures; see manifest", tone="yellow")
     console_print(color("Created:", Colors.CYAN + Colors.BOLD))
     if args.files_separate:
-        console_print(f"  {color(str(asm_dir), Colors.GREEN)}  ({len(exported):,} .asm files)")
-        console_print(f"  {color(str(cpp_dir), Colors.GREEN)}  ({len(exported):,} .cpp files)")
+        if want_asm:
+            console_print(f"  {color(str(asm_dir), Colors.GREEN)}  ({len(exported):,} .asm files)")
+        if want_cpp:
+            console_print(f"  {color(str(cpp_dir), Colors.GREEN)}  ({len(exported):,} .cpp files)")
     else:
-        if not args.all_fns:
-            console_print(f"  {color(str(main_asm_path), Colors.GREEN)}")
-            console_print(f"  {color(str(main_cpp_path), Colors.GREEN)}")
-        console_print(f"  {color(str(referenced_asm_path), Colors.GREEN)}")
-        console_print(f"  {color(str(called_pseudo_path), Colors.GREEN)}")
+        for path in (main_asm_path, main_cpp_path, referenced_asm_path, called_pseudo_path):
+            if path is not None:
+                console_print(f"  {color(str(path), Colors.GREEN)}")
     console_print(f"  {color(str(manifest_path), Colors.GREEN)}")
     return 0
 

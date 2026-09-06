@@ -77,9 +77,11 @@ The table below lists every command-line argument accepted by the current export
 | **`--server`** | Port, `host:port`, or full URL | `13337` | Selects the `ida-pro-mcp` endpoint. A port such as `13339` becomes `http://127.0.0.1:13339/mcp`. A host and port such as `192.168.1.10:13337` becomes `http://192.168.1.10:13337/mcp`. A full HTTP or HTTPS URL is accepted. `/mcp` is appended when missing. |
 | **`--function`** | Function name or address | Current IDA cursor | Selects the root by IDA function name or address. Examples: `UpdatePlayerStates`, `sub_7FF6E3BF5C90`, or `0x7FF6E3BF5C90`. Cannot be combined with `--address`. |
 | **`--address`** | Numeric address | Current IDA cursor | Selects the root using an explicit address. The `0x` prefix is optional. Cannot be combined with `--function`. |
-| **`--all-fns`** | Flag | Disabled | Exports every function in the database instead of walking from a root. Ignores `--function`, `--address`, and the cursor. Requires the `list_funcs` tool. Output goes to `<module>_all_functions_aio/` (or `_split` with `--files-separate`). |
+| **`--all-fns`** | Flag | Disabled | Exports every function in the database instead of walking from a root. Ignores `--function`, `--address`, and the cursor. Requires the `list_funcs` tool. Output goes to `<module>/all_functions_aio/` (or `<module>/all_functions_split/` with `--files-separate`). |
 | **`--files-separate`** | Flag | Disabled | Writes each function to its own `asm/<name>.asm` and `cpp/<name>.cpp` instead of combined files. Names use the function name plus address for uniqueness. Combines with `--all-fns`. |
-| **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates `function_<RootFunction>/` (or `<module>_all_functions_aio/` / `<module>_all_functions_split/` with `--all-fns`) inside it, each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
+| **`--asm-only`** | Flag | Disabled | Export only disassembly (`.asm`); skip pseudocode. Much faster — decompilation is ~90% of export time. Mutually exclusive with `--cpp-only`. |
+| **`--cpp-only`** | Flag | Disabled | Export only pseudocode (`.cpp`); skip disassembly. Mutually exclusive with `--asm-only`. |
+| **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates a `<module>/` folder (named after the binary) inside it, containing one run subfolder — `function_<RootFunction>/`, or `all_functions_aio/` / `all_functions_split/` with `--all-fns` — each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
 | **`--page-size`** | Integer from `1` to `50000` | `50000` | Sets the maximum disassembly instructions requested per page. Values outside the supported range are clamped. Smaller values generate more MCP requests. |
 | **`--include-external`** | Flag | Disabled | Accepted and recorded in the manifest. In the current build, it does not yet change traversal filtering. |
 | **`--workers`** | Integer | `0` meaning automatic | Sets concurrent MCP worker threads. Automatic mode uses the CPU count and chooses from 4 through 16 workers. Manual values are clamped to 1 through 32. Each worker owns a separate initialized MCP session. |
@@ -99,7 +101,7 @@ The table below lists every command-line argument accepted by the current export
 ## Complete Syntax
 
 ```cmd
-run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--files-separate] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
+run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--files-separate] [--asm-only | --cpp-only] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
 ```
 
 `--function` and `--address` are mutually exclusive. Supplying both fails during argument parsing before MCP is contacted.
@@ -223,23 +225,24 @@ ida-discover_2     Idle           00:00:00   -
 
 # Output Files
 
-Each run creates a directory named after the resolved root function. Disassembly (`.asm`) goes in `asm/`, pseudocode (`.cpp`) in `cpp/`.
+Each run goes under a `<module>/` folder (named after the binary) with one run subfolder inside. Disassembly (`.asm`) goes in `asm/`, pseudocode (`.cpp`) in `cpp/`.
 
 ```text
 ida_exports/
-└── function_<RootFunction>/
-    ├── asm/
-    │   ├── Main_<RootFunction>_function_we_are_in.asm
-    │   └── Extracted_referenced_functions_in_<RootFunction>.asm
-    ├── cpp/
-    │   ├── Main_<RootFunction>_function_we_are_in.cpp
-    │   └── Extracted_called_functions_<RootFunction>_pseudocode.cpp
-    └── Manifest_<RootFunction>.json
+└── <module>/                                # e.g. hexx64.dll
+    └── function_<RootFunction>/             # all_functions_aio/ or all_functions_split/ with --all-fns
+        ├── asm/
+        │   ├── Main_<RootFunction>_function_we_are_in.asm
+        │   └── Extracted_referenced_functions_in_<RootFunction>.asm
+        ├── cpp/
+        │   ├── Main_<RootFunction>_function_we_are_in.cpp
+        │   └── Extracted_called_functions_<RootFunction>_pseudocode.cpp
+        └── Manifest_<RootFunction>.json
 ```
 
-With `--all-fns` the directory is `<module>_all_functions_aio/`, holding `asm/all_functions_disassembly.asm`, `cpp/all_functions_pseudocode.cpp`, and `Manifest_all_functions.json`. Adding `--files-separate` names it `<module>_all_functions_split/` instead. `<module>` is the input file name reported by the MCP server.
+With `--all-fns` the run subfolder is `all_functions_aio/`, holding `asm/all_functions_disassembly.asm`, `cpp/all_functions_pseudocode.cpp`, and `Manifest_all_functions.json`; `--files-separate` makes it `all_functions_split/` with one `asm/<name>_<addr>.asm` and `cpp/<name>_<addr>.cpp` per function. `<module>` is the input file name reported by the MCP server.
 
-With `--files-separate` (either mode) each function is written to its own `asm/<name>_<addr>.asm` and `cpp/<name>_<addr>.cpp`.
+`--asm-only` omits the `cpp/` folder; `--cpp-only` omits `asm/`.
 
 | File | Description | Primary use |
 |---|---|---|
@@ -279,6 +282,7 @@ At completion, the exporter reports:
 | Export by function name | `run_export.cmd --server 13339 --function UpdatePlayerStates` |
 | Export every function | `run_export.cmd --server 13339 --all-fns` |
 | Export every function, one file each | `run_export.cmd --server 13339 --all-fns --files-separate` |
+| Export every function, disassembly only (fastest) | `run_export.cmd --server 13339 --all-fns --asm-only` |
 | Use eight workers | `run_export.cmd --server 13339 --function UpdatePlayerStates --workers 8` |
 | Use a custom output directory | `run_export.cmd --output E:\IDAExports --function UpdatePlayerStates` |
 | Allow fifteen minutes per request | `run_export.cmd --timeout 900 --function UpdatePlayerStates` |
