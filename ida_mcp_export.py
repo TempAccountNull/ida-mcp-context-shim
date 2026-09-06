@@ -10,6 +10,7 @@ import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2285,13 +2286,45 @@ def export_one(
     vlog(1, "WORKER-EXPORT", f"Finished {info.name} @ {info.addr} asm_chars={len(asm)} pseudo_chars={len(pseudo)} failures={len(local_failures)}")
     return info, asm, pseudo, local_failures
 
-def fetch_all_functions(client: CurlMcpClient, page: int = 200) -> list[FunctionInfo]:
+def get_module_name(control: CurlMcpClient, tools: dict) -> str:
+    """Best-effort input module/file name for output naming; '' if unavailable."""
+    if "server_health" in tools:
+        try:
+            health = normalize_tool_item(control.call_tool("server_health", {}))
+            if isinstance(health, dict):
+                name = health.get("module") or Path(str(health.get("input_path", ""))).name
+                if name:
+                    return str(name)
+        except Exception:
+            pass
+    return ""
+
+
+def _install_bail_handler() -> None:
+    """Ctrl+C / Ctrl+Break -> stop immediately. Worker threads and the executor's
+    atexit join would otherwise defer the interrupt until in-flight MCP calls end;
+    os._exit skips that join for an instant bail (partial output files may result)."""
+    def _bail(signum, frame):
+        try:
+            sys.stderr.write("\nInterrupted - stopping now.\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(130)
+    signal.signal(signal.SIGINT, _bail)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _bail)
+
+
+def fetch_all_functions(client: CurlMcpClient, page: int = 5000,
+                        progress: Callable[[int], None] | None = None) -> list[FunctionInfo]:
     """Enumerate every function in the IDB via list_funcs pagination (for --all-fns).
 
-    ida-pro-mcp's paginate() returns next_offset = offset + count, or None once the
-    end of the list is reached. A page of 200 stays under the MCP output-preview
-    threshold so pages arrive inline with a reliable next_offset. Every function is
-    tagged depth 1 so its disassembly and pseudocode land in the export files.
+    paginate() returns next_offset = offset + count, or None once the end of the
+    list is reached. call_tool transparently follows the MCP download_url when a
+    large page is previewed, so a big page keeps the round-trip count (and
+    wall-clock) low on large binaries. progress(count_so_far) is called after each
+    page. Every function is tagged depth 1 so both asm and pseudocode are exported.
     """
     functions: list[FunctionInfo] = []
     seen: set[int | str] = set()
@@ -2307,6 +2340,8 @@ def fetch_all_functions(client: CurlMcpClient, page: int = 200) -> list[Function
                 continue
             seen.add(key)
             functions.append(FunctionInfo(addr, str(row.get("name") or addr), 1, "list_funcs"))
+        if progress:
+            progress(len(functions))
         next_offset = entry.get("next_offset") if isinstance(entry, dict) else None
         if not isinstance(next_offset, int) or next_offset <= offset:
             break
@@ -2317,6 +2352,7 @@ def fetch_all_functions(client: CurlMcpClient, page: int = 200) -> list[Function
 def main() -> int:
     global VERBOSE
     args = parse_args()
+    _install_bail_handler()
     VERBOSE = VerboseLogger(args.verbose)
     stats = RunStats()
     enable_windows_ansi()
@@ -2340,7 +2376,8 @@ def main() -> int:
         raise McpError("--all-fns requires the 'list_funcs' tool, which is disabled or unavailable.")
 
     if args.all_fns:
-        root_addr, root_name = "0x0", "all_functions"
+        module = safe_name(get_module_name(control, tools) or "target")
+        root_addr, root_name = "0x0", f"{module}_all_functions_{'split' if args.files_separate else 'aio'}"
     elif args.address:
         address = args.address.strip()
         if not address.lower().startswith("0x"):
@@ -2359,7 +2396,7 @@ def main() -> int:
             root_name = resolved_name
 
     stem = safe_name(root_name)
-    out_dir = Path(args.output).resolve() / ("all_functions" if args.all_fns else f"function_{stem}")
+    out_dir = Path(args.output).resolve() / (stem if args.all_fns else f"function_{stem}")
     asm_dir = out_dir / "asm"   # disassembly (.asm) files
     cpp_dir = out_dir / "cpp"   # pseudocode (.cpp) files
     asm_dir.mkdir(parents=True, exist_ok=True)
@@ -2403,8 +2440,20 @@ def main() -> int:
         VERBOSE.attach_panel(LiveDebugPanel(args.verbose, max_events={1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 18}[args.verbose]))
     stats.discovery_started = time.monotonic()
     if args.all_fns:
-        console_print(color("Enumerating entire function list...", Colors.CYAN + Colors.BOLD))
-        all_functions = fetch_all_functions(control)
+        enum_tty = sys.stdout.isatty()
+        enum_t0 = time.monotonic()
+        def _enum_progress(n: int) -> None:
+            if enum_tty:
+                with _console_lock:
+                    sys.stdout.write(f"\r{color('Scanning Functions:', Colors.CYAN + Colors.BOLD)} enumerated {n:,} functions  ({time.monotonic() - enum_t0:.0f}s)   ")
+                    sys.stdout.flush()
+        if not enum_tty:
+            console_print(color("Enumerating entire function list...", Colors.CYAN + Colors.BOLD))
+        all_functions = fetch_all_functions(control, progress=_enum_progress)
+        if enum_tty:
+            with _console_lock:
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.flush()
         graph_edges, failures = [], []
         console_print(color(f"Enumerated {len(all_functions):,} functions from IDB", Colors.CYAN + Colors.BOLD))
     else:

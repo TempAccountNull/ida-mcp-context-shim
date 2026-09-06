@@ -77,9 +77,9 @@ The table below lists every command-line argument accepted by the current export
 | **`--server`** | Port, `host:port`, or full URL | `13337` | Selects the `ida-pro-mcp` endpoint. A port such as `13339` becomes `http://127.0.0.1:13339/mcp`. A host and port such as `192.168.1.10:13337` becomes `http://192.168.1.10:13337/mcp`. A full HTTP or HTTPS URL is accepted. `/mcp` is appended when missing. |
 | **`--function`** | Function name or address | Current IDA cursor | Selects the root by IDA function name or address. Examples: `UpdatePlayerStates`, `sub_7FF6E3BF5C90`, or `0x7FF6E3BF5C90`. Cannot be combined with `--address`. |
 | **`--address`** | Numeric address | Current IDA cursor | Selects the root using an explicit address. The `0x` prefix is optional. Cannot be combined with `--function`. |
-| **`--all-fns`** | Flag | Disabled | Exports every function in the database instead of walking from a root. Ignores `--function`, `--address`, and the cursor. Requires the `list_funcs` tool. Output goes to `all_functions/`. |
+| **`--all-fns`** | Flag | Disabled | Exports every function in the database instead of walking from a root. Ignores `--function`, `--address`, and the cursor. Requires the `list_funcs` tool. Output goes to `<module>_all_functions_aio/` (or `_split` with `--files-separate`). |
 | **`--files-separate`** | Flag | Disabled | Writes each function to its own `asm/<name>.asm` and `cpp/<name>.cpp` instead of combined files. Names use the function name plus address for uniqueness. Combines with `--all-fns`. |
-| **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates `function_<RootFunction>/` (or `all_functions/` with `--all-fns`) inside it, each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
+| **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates `function_<RootFunction>/` (or `<module>_all_functions_aio/` / `<module>_all_functions_split/` with `--all-fns`) inside it, each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
 | **`--page-size`** | Integer from `1` to `50000` | `50000` | Sets the maximum disassembly instructions requested per page. Values outside the supported range are clamped. Smaller values generate more MCP requests. |
 | **`--include-external`** | Flag | Disabled | Accepted and recorded in the manifest. In the current build, it does not yet change traversal filtering. |
 | **`--workers`** | Integer | `0` meaning automatic | Sets concurrent MCP worker threads. Automatic mode uses the CPU count and chooses from 4 through 16 workers. Manual values are clamped to 1 through 32. Each worker owns a separate initialized MCP session. |
@@ -237,7 +237,7 @@ ida_exports/
     └── Manifest_<RootFunction>.json
 ```
 
-With `--all-fns` the directory is `all_functions/`, holding `asm/all_functions_disassembly.asm`, `cpp/all_functions_pseudocode.cpp`, and `Manifest_all_functions.json`.
+With `--all-fns` the directory is `<module>_all_functions_aio/`, holding `asm/all_functions_disassembly.asm`, `cpp/all_functions_pseudocode.cpp`, and `Manifest_all_functions.json`. Adding `--files-separate` names it `<module>_all_functions_split/` instead. `<module>` is the input file name reported by the MCP server.
 
 With `--files-separate` (either mode) each function is written to its own `asm/<name>_<addr>.asm` and `cpp/<name>_<addr>.cpp`.
 
@@ -311,7 +311,7 @@ At completion, the exporter reports:
 | Text wraps at Verbose 6 | Use the automatic 1200 x 1181 layout in classic Command Prompt or widen the terminal manually. |
 | Live panel does not appear when redirected | This is expected; the in-place panel requires an interactive terminal. |
 
-Press `Ctrl+C` to stop the exporter intentionally.
+Press `Ctrl+C` (or `Ctrl+Break`) to stop the exporter immediately; it bails at once rather than waiting for in-flight requests, so output files may be left partial.
 
 # Designed For
 
