@@ -2184,6 +2184,8 @@ def parse_args() -> argparse.Namespace:
                        help="Export only disassembly (.asm); skip pseudocode. Much faster: decompilation is ~90%% of export time.")
     kinds.add_argument("--cpp-only", action="store_true",
                        help="Export only pseudocode (.cpp); skip disassembly.")
+    p.add_argument("--retry-skipped", action="store_true",
+                   help="Re-export only the functions listed as failures in the existing manifest (from a prior run with the same flags). Skips enumeration/discovery, writes per-function asm/cpp files (overwriting failed ones in place), and updates the manifest's failure list.")
     p.add_argument("--output", default="ida_exports", help="Parent output directory")
     p.add_argument("--page-size", type=int, default=50000, help="Instructions per disasm request, max 50000")
     p.add_argument("--include-external", action="store_true", help="Attempt to export external/import functions too")
@@ -2456,6 +2458,30 @@ def get_function_total(
     return 0
 
 
+def load_skipped_functions(manifest_path: Path) -> list[FunctionInfo]:
+    """Read a prior run's manifest and return its failed functions (for --retry-skipped).
+
+    Failures are deduplicated by address (one function can fail at both the disasm
+    and decompile stage). Raises if the manifest is missing so the user is told to
+    run the export first with the same flags.
+    """
+    if not manifest_path.exists():
+        raise McpError(f"--retry-skipped: manifest not found at {manifest_path}. Run the export first with the same flags.")
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    seen: set[int | str] = set()
+    out: list[FunctionInfo] = []
+    for fail in data.get("failures", []):
+        addr = str(fail.get("addr", ""))
+        if not addr:
+            continue
+        key = addr_key(addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(FunctionInfo(addr, str(fail.get("name") or addr), 1, "retry-skipped"))
+    return out
+
+
 def _install_bail_handler() -> None:
     """Ctrl+C / Ctrl+Break -> stop immediately. Worker threads and the executor's
     atexit join would otherwise defer the interrupt until in-flight MCP calls end;
@@ -2555,6 +2581,7 @@ def main() -> int:
 
     want_asm = not args.cpp_only   # disassembly (.asm) output
     want_cpp = not args.asm_only   # pseudocode (.cpp) output
+    write_separate = args.files_separate or args.retry_skipped   # retry writes per-function files (overwrites failed ones in place)
     module = safe_name(get_module_name(control, tools) or "target")
     stem = safe_name(root_name)
     # Group every run for this binary under a <module>/ parent folder.
@@ -2605,7 +2632,15 @@ def main() -> int:
     if args.verbose and sys.stdout.isatty():
         VERBOSE.attach_panel(LiveDebugPanel(args.verbose, max_events={1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 18}[args.verbose]))
     stats.discovery_started = time.monotonic()
-    if args.all_fns:
+    if args.retry_skipped:
+        all_functions = load_skipped_functions(manifest_path)
+        graph_edges, failures = [], []
+        if not all_functions:
+            console_print(color(f"No skipped functions in {manifest_path.name}; nothing to retry.", Colors.GREEN + Colors.BOLD))
+            health.stop()
+            return 0
+        console_print(color(f"Retrying {len(all_functions):,} skipped function(s) from {manifest_path.name}", Colors.CYAN + Colors.BOLD))
+    elif args.all_fns:
         enum_total = get_function_total(clients, health, args.retries, args.retry_delay, stats, tools)
         enum_status = EnumStatusLine(enum_total, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
         if enum_status is None:
@@ -2639,7 +2674,7 @@ def main() -> int:
     export_status = ExportStatusLine(total, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
     if args.verbose:
         vlog(1, "EXPORT", f"Starting export of {total} functions with {workers} workers")
-    use_batch = args.all_fns and "analyze_batch" in tools
+    use_batch = (args.all_fns or args.retry_skipped) and "analyze_batch" in tools
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ida-export") as executor:
         # Work remains fully concurrent. Every worker updates the same in-place
         # status line as it changes stage; final files are still written later in
@@ -2677,7 +2712,7 @@ def main() -> int:
 
     exported: list[dict[str, Any]] = []
     # Preserve deterministic discovery order in output files even though extraction is concurrent.
-    if args.files_separate:
+    if write_separate:
         # One file per function: asm/<stem>.asm and/or cpp/<stem>.cpp.
         used_stems: set[str] = set()
         for info in all_functions:
@@ -2741,39 +2776,51 @@ def main() -> int:
             files_map["main_pseudocode"] = str(main_cpp_path)
             files_map["called_pseudocode"] = str(called_pseudo_path)
 
-    manifest = {
-        "server": control.url,
-        "root": {"addr": root.addr, "name": root.name},
-        "recursive_traversal": "all_reachable_direct_calls_and_cross_function_tail_jumps",
-        "parallel_workers": workers,
-        "request_timeout_seconds": args.timeout,
-        "retries": args.retries,
-        "retry_delay_seconds": args.retry_delay,
-        "health_interval_seconds": args.health_interval,
-        "timing": {
-            "discovery_seconds": round(stats.discovery_finished - stats.discovery_started, 3),
-            "export_seconds": round(stats.export_finished - stats.export_started, 3),
-            "total_seconds": round(stats.export_finished - stats.started, 3),
-        },
-        "retry_statistics": {
-            "retry_attempts": stats.retry_attempts,
-            "operations_recovered_after_retry": stats.retried_successfully,
-        },
-        "health_statistics": {
-            "checks": stats.health_checks,
-            "failed_checks": stats.health_failures,
-            "recoveries": stats.health_recoveries,
-        },
-        "graph_edges": graph_edges,
-        "include_external": args.include_external,
-        "discovered_function_count": len(all_functions),
-        "exported_function_count": len(exported),
-        "queue_exhausted": True,
-        "function_limit_reached": False,
-        "failures": failures,
-        "exported_functions": exported,
-        "files": files_map,
-    }
+    if args.retry_skipped:
+        # Non-destructive update: keep the prior manifest, swap in the still-failing
+        # set (recovered functions drop out so a repeat run converges), record history.
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        still_failing = {addr_key(f["addr"]) for f in failures if f.get("addr")}
+        manifest["failures"] = failures
+        manifest.setdefault("retry_history", []).append({
+            "retried": len(all_functions),
+            "recovered": len(all_functions) - len(still_failing),
+            "still_failing": len(still_failing),
+        })
+    else:
+        manifest = {
+            "server": control.url,
+            "root": {"addr": root.addr, "name": root.name},
+            "recursive_traversal": "all_reachable_direct_calls_and_cross_function_tail_jumps",
+            "parallel_workers": workers,
+            "request_timeout_seconds": args.timeout,
+            "retries": args.retries,
+            "retry_delay_seconds": args.retry_delay,
+            "health_interval_seconds": args.health_interval,
+            "timing": {
+                "discovery_seconds": round(stats.discovery_finished - stats.discovery_started, 3),
+                "export_seconds": round(stats.export_finished - stats.export_started, 3),
+                "total_seconds": round(stats.export_finished - stats.started, 3),
+            },
+            "retry_statistics": {
+                "retry_attempts": stats.retry_attempts,
+                "operations_recovered_after_retry": stats.retried_successfully,
+            },
+            "health_statistics": {
+                "checks": stats.health_checks,
+                "failed_checks": stats.health_failures,
+                "recoveries": stats.health_recoveries,
+            },
+            "graph_edges": graph_edges,
+            "include_external": args.include_external,
+            "discovered_function_count": len(all_functions),
+            "exported_function_count": len(exported),
+            "queue_exhausted": True,
+            "function_limit_reached": False,
+            "failures": failures,
+            "exported_functions": exported,
+            "files": files_map,
+        }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     failed_functions = {addr_key(item.get("addr", "")) for item in failures if item.get("addr")}
@@ -2782,9 +2829,9 @@ def main() -> int:
     output_size = sum(p.stat().st_size for p in out_dir.rglob("*") if p.is_file())
 
     console_print(color("=" * 60, Colors.CYAN))
-    console_print(color("Export Summary", Colors.CYAN + Colors.BOLD))
+    console_print(color("Retry Summary" if args.retry_skipped else "Export Summary", Colors.CYAN + Colors.BOLD))
     console_print(color("=" * 60, Colors.CYAN))
-    console_print(f"Functions discovered : {len(all_functions):,}")
+    console_print(f"Functions {'retried   ' if args.retry_skipped else 'discovered'} : {len(all_functions):,}")
     console_print(f"Function records     : {len(exported):,}")
     console_print(f"Fully successful     : {fully_successful:,}")
     console_print(f"Partial/failed       : {partial_or_failed:,}")
@@ -2802,7 +2849,7 @@ def main() -> int:
     if failures:
         status("WARN", f"{len(failures):,} extraction/discovery failures; see manifest", tone="yellow")
     console_print(color("Created:", Colors.CYAN + Colors.BOLD))
-    if args.files_separate:
+    if write_separate:
         if want_asm:
             console_print(f"  {color(str(asm_dir), Colors.GREEN)}  ({len(exported):,} .asm files)")
         if want_cpp:
