@@ -2056,6 +2056,55 @@ class ExportStatusLine(LiveStatusBase):
             self._render_locked()
         self.close()
 
+
+class EnumStatusLine(LiveStatusBase):
+    """Live 'Scanning Status' line for --all-fns enumeration: Enumerated N/total."""
+
+    def __init__(self, total: int, health: HealthMonitor, stats: RunStats, workers: int, frame_prefix: Callable[[], list[str]] | None = None):
+        self.total = total
+        self.enumerated = 0
+        self._note = ""
+        super().__init__(health, stats, workers, "ida-enumerate", frame_prefix)
+        with _console_lock:
+            self._render_locked()
+
+    def _render_locked(self) -> None:
+        debug_lines = VERBOSE.panel.lines() if VERBOSE.panel is not None else []
+        count = f"{self.enumerated:,}/{self.total:,}" if self.total else f"{self.enumerated:,}"
+        parts = [f"{color('Enumerated:', Colors.GREEN + Colors.BOLD)} {color(count, Colors.GREEN + Colors.BOLD)}  "]
+        if self.total:
+            remaining = max(0, self.total - self.enumerated)
+            parts.append(f"{color('Remaining:', Colors.YELLOW + Colors.BOLD)} {color(f'{remaining:,}', Colors.YELLOW + Colors.BOLD)}  ")
+        parts.append(f"{color('Elapsed:', Colors.WHITE + Colors.BOLD)} {color(format_duration(self.stats.elapsed()), Colors.WHITE + Colors.BOLD)}  ")
+        parts.append(f"{color('Health:', Colors.GREEN + Colors.BOLD)} {self._health_text()}")
+        if self._note:
+            parts.append(f"  {self._note}")
+        lines = [
+            *debug_lines,
+            color("Scanning Status", Colors.CYAN + Colors.BOLD),
+            "".join(parts),
+        ]
+        self._draw_locked(lines)
+
+    def update(self, enumerated: int) -> None:
+        with _console_lock:
+            self.enumerated = enumerated
+            self._note = ""
+            self._render_locked()
+
+    def retry(self, attempt: int, retries: int, delay: float) -> None:
+        with _console_lock:
+            self._note = color(f"Retrying {attempt}/{retries} in {delay:g}s (waiting for IDA)", Colors.YELLOW + Colors.BOLD)
+            self.last_draw = 0.0
+            self._render_locked()
+
+    def finish(self) -> None:
+        with _console_lock:
+            self.last_draw = 0.0
+            self._render_locked()
+        self.close()
+
+
 def make_client(args: argparse.Namespace) -> CurlMcpClient:
     client = CurlMcpClient(args.server, curl=args.curl, timeout=args.timeout)
     client.initialize()
@@ -2385,6 +2434,28 @@ def get_module_name(control: CurlMcpClient, tools: dict) -> str:
     return ""
 
 
+def get_function_total(
+    clients: ThreadClients, health: HealthMonitor, retries: int, retry_delay: float,
+    stats: RunStats, tools: dict,
+) -> int:
+    """Total function count for the enumeration bar; 0 if unavailable. Waits for
+    health and retries like the rest of the pipeline."""
+    if "entity_query" not in tools:
+        return 0
+    try:
+        result = run_with_retry(
+            clients, health,
+            lambda: normalize_tool_item(clients.get().call_tool("entity_query", {"queries": {"kind": "functions", "count": 1}})),
+            retries=retries, retry_delay=retry_delay, stats=stats,
+        )
+        entry = result[0] if isinstance(result, list) and result else result
+        if isinstance(entry, dict) and isinstance(entry.get("total"), int):
+            return entry["total"]
+    except Exception:
+        pass
+    return 0
+
+
 def _install_bail_handler() -> None:
     """Ctrl+C / Ctrl+Break -> stop immediately. Worker threads and the executor's
     atexit join would otherwise defer the interrupt until in-flight MCP calls end;
@@ -2401,36 +2472,39 @@ def _install_bail_handler() -> None:
         signal.signal(signal.SIGBREAK, _bail)
 
 
-def fetch_all_functions(client: CurlMcpClient, page: int = 5000,
-                        progress: Callable[[int], None] | None = None) -> list[FunctionInfo]:
-    """Enumerate every function in the IDB via list_funcs pagination (for --all-fns).
+def fetch_all_functions(
+    clients: ThreadClients, health: HealthMonitor, retries: int, retry_delay: float,
+    stats: RunStats, progress: Callable[[int], None] | None = None,
+    on_retry: Callable[[int, int, float], None] | None = None,
+) -> list[FunctionInfo]:
+    """Enumerate every function in the IDB in ONE list_funcs call (for --all-fns).
 
-    paginate() returns next_offset = offset + count, or None once the end of the
-    list is reached. call_tool transparently follows the MCP download_url when a
-    large page is previewed, so a big page keeps the round-trip count (and
-    wall-clock) low on large binaries. progress(count_so_far) is called after each
-    page. Every function is tagged depth 1 so both asm and pseudocode are exported.
+    count=0 tells ida-pro-mcp's paginate() to return every function at once, and
+    call_tool transparently follows the MCP download_url for the large payload, so
+    this is a single request regardless of binary size (no per-page chunking). The
+    call runs through run_with_retry, so a frozen/crashed/timed-out ida-pro-mcp is
+    waited out and retried exactly like disassembly/decompilation. progress(n) fires
+    once per function (0, 1, 2, 3 ...) as the list is built. Every function is tagged
+    depth 1 so both asm and pseudocode are exported.
     """
+    raw = run_with_retry(
+        clients, health,
+        lambda: normalize_tool_item(clients.get().call_tool("list_funcs", {"queries": {"offset": 0, "count": 0}})),
+        retries=retries, retry_delay=retry_delay, stats=stats, on_retry=on_retry,
+    )
+    entry = raw[0] if isinstance(raw, list) and raw else raw
+    rows = entry.get("data", []) if isinstance(entry, dict) else []
     functions: list[FunctionInfo] = []
     seen: set[int | str] = set()
-    offset = 0
-    while True:
-        result = normalize_tool_item(client.call_tool("list_funcs", {"queries": {"offset": offset, "count": page}}))
-        entry = result[0] if isinstance(result, list) and result else result
-        rows = entry.get("data", []) if isinstance(entry, dict) else []
-        for row in rows:
-            addr = str(row.get("addr", ""))
-            key = addr_key(addr)
-            if not addr or key in seen:
-                continue
-            seen.add(key)
-            functions.append(FunctionInfo(addr, str(row.get("name") or addr), 1, "list_funcs"))
+    for row in rows:
+        addr = str(row.get("addr", ""))
+        key = addr_key(addr)
+        if not addr or key in seen:
+            continue
+        seen.add(key)
+        functions.append(FunctionInfo(addr, str(row.get("name") or addr), 1, "list_funcs"))
         if progress:
-            progress(len(functions))
-        next_offset = entry.get("next_offset") if isinstance(entry, dict) else None
-        if not isinstance(next_offset, int) or next_offset <= offset:
-            break
-        offset = next_offset
+            progress(len(functions))   # one update per function, not per page
     return functions
 
 
@@ -2532,22 +2606,20 @@ def main() -> int:
         VERBOSE.attach_panel(LiveDebugPanel(args.verbose, max_events={1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 18}[args.verbose]))
     stats.discovery_started = time.monotonic()
     if args.all_fns:
-        enum_tty = sys.stdout.isatty()
-        enum_t0 = time.monotonic()
-        def _enum_progress(n: int) -> None:
-            if enum_tty:
-                with _console_lock:
-                    sys.stdout.write(f"\r{color('Scanning Functions:', Colors.CYAN + Colors.BOLD)} enumerated {n:,} functions  ({time.monotonic() - enum_t0:.0f}s)   ")
-                    sys.stdout.flush()
-        if not enum_tty:
+        enum_total = get_function_total(clients, health, args.retries, args.retry_delay, stats, tools)
+        enum_status = EnumStatusLine(enum_total, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
+        if enum_status is None:
             console_print(color("Enumerating entire function list...", Colors.CYAN + Colors.BOLD))
-        all_functions = fetch_all_functions(control, progress=_enum_progress)
-        if enum_tty:
-            with _console_lock:
-                sys.stdout.write("\r\x1b[2K")
-                sys.stdout.flush()
+        all_functions = fetch_all_functions(
+            clients, health, args.retries, args.retry_delay, stats,
+            progress=(lambda n: enum_status.update(n)) if enum_status else None,
+            on_retry=(lambda a, mx, d: enum_status.retry(a, mx, d)) if enum_status else None,
+        )
+        if enum_status:
+            enum_status.finish()
         graph_edges, failures = [], []
-        console_print(color(f"Enumerated {len(all_functions):,} functions from IDB", Colors.CYAN + Colors.BOLD))
+        total_note = f" of {enum_total:,}" if enum_total else ""
+        console_print(color(f"Enumerated {len(all_functions):,}{total_note} functions from IDB", Colors.CYAN + Colors.BOLD))
     else:
         discovery_status = DiscoveryStatusLine(root, health, stats, workers, stage_console.lines) if sys.stdout.isatty() else None
         if not sys.stdout.isatty():
