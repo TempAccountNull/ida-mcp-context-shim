@@ -20,7 +20,7 @@ static ea_t resolve_ea(const char *s)
 void McpCommands::status(const char *op, ea_t ea, const char *name)
 {
   // Elapsed straight from the KUSER shared page (InterruptTime), no QPC/chrono call.
-  double elapsed = double(KUser::get_instance().interrupt_time_100ns() - t_start_100ns) * 1e-7;
+  double elapsed = double(KUser::get_instance().clock.interrupt_time_100ns() - t_start_100ns) * 1e-7;
   double rate = elapsed > 0.001 ? double(processed) / elapsed : 0.0;
   qstring s;
   s.sprnt("\r[hexport] %" FMT_64 "u/%" FMT_64 "u  %-11s %-40s @ 0x%" FMT_64 "x  %6.1fs  %5.1f fn/s   ",
@@ -75,7 +75,7 @@ bool McpCommands::open(const char *file_path, bool run_auto)
     return false;
   is_open = true;
   processed = 0;
-  t_start_100ns = KUser::get_instance().interrupt_time_100ns();   // start the KUSER elapsed timer
+  t_start_100ns = KUser::get_instance().clock.interrupt_time_100ns();   // start the KUSER elapsed timer
   hexrays_ok = init_hexrays_plugin();
   return true;
 }

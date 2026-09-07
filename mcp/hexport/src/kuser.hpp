@@ -203,9 +203,16 @@ static_assert(offsetof(_KUSER_SHARED_DATA, SystemTime) == 0x14, "SystemTime offs
 static_assert(offsetof(_KUSER_SHARED_DATA, QpcFrequency) == 0x300, "QpcFrequency offset");
 static_assert(offsetof(_KUSER_SHARED_DATA, TickCount) == 0x320, "TickCount offset");
 
-// Singleton accessor over the kernel's shared clock page. Construct once (caching the fixed
-// mapping pointer) and reach it with KUser::get_instance(); every read goes straight to the
-// mapped page -- no QueryPerformanceCounter, no syscall, anywhere.
+// Singleton over the kernel's shared clock page. Accessors are split into small nested
+// classes by domain, so you reach one as:
+//
+//     KUser::get_instance().datetime.get_year()
+//     KUser::get_instance().clock.seconds()
+//     KUser::get_instance().os.version_string()
+//
+// That keeps get_instance() itself tiny instead of exposing every field as a flat method.
+// Each group is a stateless handle; every read goes straight to the fixed mapping via shared_data()
+// -- no QueryPerformanceCounter, no syscall, anywhere.
 class KUser
 {
 public:
@@ -218,156 +225,8 @@ public:
     return instance;
   }
 
-  // The mapped read-only _KUSER_SHARED_DATA, for callers that want other fields directly.
-  const _KUSER_SHARED_DATA *data() const
-  {
-    return data_;
-  }
-
-  // --- monotonic clock (the right source for elapsed/duration) ---
-  uint64_t interrupt_time_100ns() const
-  {
-    return read_ksystime(&data_->InterruptTime);
-  }
-
-  double seconds() const   // since boot
-  {
-    return double(interrupt_time_100ns()) * 1e-7;
-  }
-
-  uint64_t uptime_ms() const   // since boot
-  {
-    return interrupt_time_100ns() / 10000;
-  }
-
-  uint64_t interrupt_time_bias() const
-  {
-    return data_->InterruptTimeBias;
-  }
-
-  // --- wall clock (time of day; can jump on NTP/DST -- never use for durations) ---
-  uint64_t system_time_100ns() const   // 100ns since 1601-01-01 (FILETIME epoch)
-  {
-    return read_ksystime(&data_->SystemTime);
-  }
-
-  // Seconds since the Unix epoch: 116444736000000000 100ns-units span 1601-01-01 -> 1970-01-01.
-  double unix_time() const
-  {
-    return double(system_time_100ns() - 116444736000000000ULL) * 1e-7;
-  }
-
-  uint64_t time_zone_bias_100ns() const
-  {
-    return read_ksystime(&data_->TimeZoneBias);
-  }
-
-  uint32_t time_zone_id() const
-  {
-    return data_->TimeZoneId;
-  }
-
-  // --- ticks / QPC fields (we never call QueryPerformanceCounter; these are just the values) ---
-  uint64_t tick_count() const
-  {
-    return data_->TickCountQuad;
-  }
-
-  uint32_t tick_count_multiplier() const
-  {
-    return data_->TickCountMultiplier;
-  }
-
-  int64_t qpc_frequency() const
-  {
-    return data_->QpcFrequency;
-  }
-
-  uint64_t qpc_bias() const
-  {
-    return data_->QpcBias;
-  }
-
-  // --- OS identity ---
-  uint32_t nt_build_number() const
-  {
-    return data_->NtBuildNumber;
-  }
-
-  uint32_t nt_major_version() const
-  {
-    return data_->NtMajorVersion;
-  }
-
-  uint32_t nt_minor_version() const
-  {
-    return data_->NtMinorVersion;
-  }
-
-  _NT_PRODUCT_TYPE nt_product_type() const
-  {
-    return data_->NtProductType;
-  }
-
-  uint16_t native_processor_architecture() const
-  {
-    return data_->NativeProcessorArchitecture;
-  }
-
-  std::string nt_system_root() const
-  {
-    std::string s;
-    for ( int i = 0; i < 260 && data_->NtSystemRoot[i] != 0; ++i )
-      s.push_back(char(data_->NtSystemRoot[i]));   // system root is ASCII (e.g. C:\Windows)
-    return s;
-  }
-
-  // --- security / debug state ---
-  bool kd_debugger_enabled() const   // boot /DEBUG flag
-  {
-    return data_->KdDebuggerEnabled != 0;
-  }
-
-  bool safe_boot_mode() const
-  {
-    return data_->SafeBootMode != 0;
-  }
-
-  uint32_t shared_data_flags() const
-  {
-    return data_->SharedDataFlags;
-  }
-
-  bool dbg_secure_boot_enabled() const
-  {
-    return data_->DbgSecureBootEnabled != 0;
-  }
-
-  // --- hardware / CPU ---
-  uint32_t active_processor_count() const
-  {
-    return data_->ActiveProcessorCount;
-  }
-
-  uint32_t number_of_physical_pages() const
-  {
-    return data_->NumberOfPhysicalPages;
-  }
-
-  uint32_t large_page_minimum() const
-  {
-    return data_->LargePageMinimum;
-  }
-
-  // A PF_* processor-feature flag (e.g. PF_XMMI64_INSTRUCTIONS_AVAILABLE); false if out of range.
-  bool is_processor_feature_present(unsigned feature) const
-  {
-    return feature < 64 && data_->ProcessorFeatures[feature] != 0;
-  }
-
-  // --- calendar breakdown (computed from SystemTime; pure arithmetic, no API, no syscall) ---
-  // Broken-down time. Fill via now_utc() (UTC) or now_local() (wall-local via the TZ bias).
-  struct DateTime
+  // Broken-down calendar time, returned by the DateTime group's now_utc()/now_local().
+  struct Timestamp
   {
     int year;
     unsigned month;        // 1-12
@@ -379,81 +238,323 @@ public:
     unsigned weekday;      // 0=Sunday .. 6=Saturday
   };
 
-  DateTime now_utc() const
+  // ---- monotonic time: get_instance().clock.<method>() ----
+  // The right source for elapsed/duration -- never jumps.
+  struct Clock
   {
-    return to_datetime(system_time_100ns());
-  }
+    uint64_t interrupt_time_100ns() const
+    {
+      return read_ksystime(&shared_data()->InterruptTime);
+    }
 
-  DateTime now_local() const
-  {
-    return to_datetime(system_time_100ns() - time_zone_bias_100ns());
-  }
+    double seconds() const   // since boot
+    {
+      return double(interrupt_time_100ns()) * 1e-7;
+    }
 
-  // Individual UTC components (each recomputes the breakdown; cheap arithmetic).
-  int get_year() const
-  {
-    return now_utc().year;
-  }
+    uint64_t uptime_ms() const   // since boot
+    {
+      return interrupt_time_100ns() / 10000;
+    }
 
-  unsigned get_month() const
-  {
-    return now_utc().month;
-  }
+    uint64_t interrupt_time_bias() const
+    {
+      return shared_data()->InterruptTimeBias;
+    }
 
-  unsigned get_day() const
-  {
-    return now_utc().day;
-  }
+    uint64_t tick_count() const
+    {
+      return shared_data()->TickCountQuad;
+    }
 
-  unsigned get_hour() const
-  {
-    return now_utc().hour;
-  }
+    uint32_t tick_count_multiplier() const
+    {
+      return shared_data()->TickCountMultiplier;
+    }
 
-  unsigned get_minute() const
-  {
-    return now_utc().minute;
-  }
+    int64_t qpc_frequency() const
+    {
+      return shared_data()->QpcFrequency;
+    }
 
-  unsigned get_second() const
-  {
-    return now_utc().second;
-  }
+    uint64_t qpc_bias() const
+    {
+      return shared_data()->QpcBias;
+    }
+  } clock;
 
-  unsigned get_millisecond() const
+  // ---- wall clock + calendar: get_instance().datetime.<method>() ----
+  // Time of day; can jump on NTP/DST -- never use for durations.
+  struct DateTime
   {
-    return now_utc().millisecond;
-  }
+    uint64_t system_time_100ns() const   // 100ns since 1601-01-01 (FILETIME epoch)
+    {
+      return read_ksystime(&shared_data()->SystemTime);
+    }
 
-  unsigned get_weekday() const
-  {
-    return now_utc().weekday;
-  }
+    double unix_time() const   // seconds since 1970-01-01
+    {
+      return double(system_time_100ns() - 116444736000000000ULL) * 1e-7;
+    }
 
-  // ISO-8601 UTC timestamp, e.g. "2026-09-06T04:46:04.593Z".
-  std::string iso8601() const
+    uint64_t time_zone_bias_100ns() const
+    {
+      return read_ksystime(&shared_data()->TimeZoneBias);
+    }
+
+    uint32_t time_zone_id() const
+    {
+      return shared_data()->TimeZoneId;
+    }
+
+    Timestamp now_utc() const
+    {
+      return to_datetime(system_time_100ns());
+    }
+
+    Timestamp now_local() const   // UTC minus the current TZ (+DST) bias
+    {
+      return to_datetime(system_time_100ns() - time_zone_bias_100ns());
+    }
+
+    int get_year() const
+    {
+      return now_utc().year;
+    }
+
+    unsigned get_month() const
+    {
+      return now_utc().month;
+    }
+
+    unsigned get_day() const
+    {
+      return now_utc().day;
+    }
+
+    unsigned get_hour() const
+    {
+      return now_utc().hour;
+    }
+
+    unsigned get_minute() const
+    {
+      return now_utc().minute;
+    }
+
+    unsigned get_second() const
+    {
+      return now_utc().second;
+    }
+
+    unsigned get_millisecond() const
+    {
+      return now_utc().millisecond;
+    }
+
+    unsigned get_weekday() const
+    {
+      return now_utc().weekday;
+    }
+
+    std::string weekday_name() const   // "Monday"
+    {
+      static const char *const names[7] =
+        { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+      unsigned w = now_utc().weekday;
+      return names[w < 7 ? w : 0];
+    }
+
+    std::string month_name() const   // "September"
+    {
+      static const char *const names[12] =
+        { "January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December" };
+      unsigned m = now_utc().month;
+      return names[(m >= 1 && m <= 12) ? m - 1 : 0];
+    }
+
+    std::string to_string() const   // "YYYY-MM-DD HH:MM:SS" (UTC)
+    {
+      Timestamp t = now_utc();
+      std::string s;
+      append_num(s, unsigned(t.year), 4);
+      s.push_back('-');
+      append_num(s, t.month, 2);
+      s.push_back('-');
+      append_num(s, t.day, 2);
+      s.push_back(' ');
+      append_num(s, t.hour, 2);
+      s.push_back(':');
+      append_num(s, t.minute, 2);
+      s.push_back(':');
+      append_num(s, t.second, 2);
+      return s;
+    }
+
+    std::string iso8601() const   // "2026-09-07T04:55:00.242Z" (UTC)
+    {
+      Timestamp t = now_utc();
+      std::string s;
+      append_num(s, unsigned(t.year), 4);
+      s.push_back('-');
+      append_num(s, t.month, 2);
+      s.push_back('-');
+      append_num(s, t.day, 2);
+      s.push_back('T');
+      append_num(s, t.hour, 2);
+      s.push_back(':');
+      append_num(s, t.minute, 2);
+      s.push_back(':');
+      append_num(s, t.second, 2);
+      s.push_back('.');
+      append_num(s, t.millisecond, 3);
+      s.push_back('Z');
+      return s;
+    }
+  } datetime;
+
+  // ---- OS identity: get_instance().os.<method>() ----
+  struct OsInfo
   {
-    DateTime t = now_utc();
-    std::string s;
-    append_num(s, unsigned(t.year), 4);
-    s.push_back('-');
-    append_num(s, t.month, 2);
-    s.push_back('-');
-    append_num(s, t.day, 2);
-    s.push_back('T');
-    append_num(s, t.hour, 2);
-    s.push_back(':');
-    append_num(s, t.minute, 2);
-    s.push_back(':');
-    append_num(s, t.second, 2);
-    s.push_back('.');
-    append_num(s, t.millisecond, 3);
-    s.push_back('Z');
-    return s;
+    uint32_t build_number() const
+    {
+      return shared_data()->NtBuildNumber;
+    }
+
+    uint32_t major_version() const
+    {
+      return shared_data()->NtMajorVersion;
+    }
+
+    uint32_t minor_version() const
+    {
+      return shared_data()->NtMinorVersion;
+    }
+
+    std::string version_string() const   // "10.0.19045"
+    {
+      std::string s;
+      append_num(s, major_version(), 1);
+      s.push_back('.');
+      append_num(s, minor_version(), 1);
+      s.push_back('.');
+      append_num(s, build_number(), 1);
+      return s;
+    }
+
+    _NT_PRODUCT_TYPE product_type() const
+    {
+      return shared_data()->NtProductType;
+    }
+
+    std::string product_type_name() const
+    {
+      switch ( shared_data()->NtProductType )
+      {
+        case NtProductWinNt:    return "Workstation";
+        case NtProductLanManNt: return "Domain Controller";
+        case NtProductServer:   return "Server";
+        default:                return "Unknown";
+      }
+    }
+
+    uint16_t processor_architecture() const
+    {
+      return shared_data()->NativeProcessorArchitecture;
+    }
+
+    std::string processor_architecture_name() const
+    {
+      switch ( shared_data()->NativeProcessorArchitecture )
+      {
+        case 0:  return "x86";
+        case 5:  return "ARM";
+        case 6:  return "IA64";
+        case 9:  return "x64";
+        case 12: return "ARM64";
+        default: return "Unknown";
+      }
+    }
+
+    std::string system_root() const   // "C:\Windows"
+    {
+      std::string s;
+      const _KUSER_SHARED_DATA *p = shared_data();
+      for ( int i = 0; i < 260 && p->NtSystemRoot[i] != 0; ++i )
+        s.push_back(char(p->NtSystemRoot[i]));   // system root is ASCII
+      return s;
+    }
+  } os;
+
+  // ---- hardware / CPU: get_instance().cpu.<method>() ----
+  struct Cpu
+  {
+    uint32_t processor_count() const
+    {
+      return shared_data()->ActiveProcessorCount;
+    }
+
+    uint32_t physical_pages() const
+    {
+      return shared_data()->NumberOfPhysicalPages;
+    }
+
+    uint64_t physical_memory_bytes() const
+    {
+      return uint64_t(shared_data()->NumberOfPhysicalPages) * 4096ULL;
+    }
+
+    uint32_t large_page_minimum() const
+    {
+      return shared_data()->LargePageMinimum;
+    }
+
+    // A PF_* processor-feature flag (e.g. PF_XMMI64_INSTRUCTIONS_AVAILABLE); false if out of range.
+    bool is_feature_present(unsigned feature) const
+    {
+      return feature < 64 && shared_data()->ProcessorFeatures[feature] != 0;
+    }
+  } cpu;
+
+  // ---- security / debug state: get_instance().security.<method>() ----
+  struct Security
+  {
+    bool kd_debugger_enabled() const   // boot /DEBUG flag
+    {
+      return shared_data()->KdDebuggerEnabled != 0;
+    }
+
+    bool safe_boot_mode() const
+    {
+      return shared_data()->SafeBootMode != 0;
+    }
+
+    bool secure_boot_enabled() const
+    {
+      return shared_data()->DbgSecureBootEnabled != 0;
+    }
+
+    uint32_t shared_data_flags() const
+    {
+      return shared_data()->SharedDataFlags;
+    }
+  } security;
+
+  // Raw page, for any field not wrapped by a group above.
+  const _KUSER_SHARED_DATA *data() const
+  {
+    return shared_data();
   }
 
 private:
-  KUser() : data_(reinterpret_cast<const _KUSER_SHARED_DATA *>(uintptr_t(0x7FFE0000))) {}
+  KUser() = default;
+
+  // The kernel maps _KUSER_SHARED_DATA read-only at this fixed user-mode address.
+  static const _KUSER_SHARED_DATA *shared_data()
+  {
+    return reinterpret_cast<const _KUSER_SHARED_DATA *>(uintptr_t(0x7FFE0000));
+  }
 
   // KSYSTEM_TIME is written by the kernel as three 32-bit fields, so re-read until the two
   // High words agree -- that rejects a torn value straddling a kernel update.
@@ -471,7 +572,7 @@ private:
 
   // Civil calendar from a FILETIME (100ns since 1601-01-01 UTC). Pure arithmetic (Howard
   // Hinnant's days<->civil algorithm) -- no FileTimeToSystemTime, no kernel call.
-  static DateTime to_datetime(uint64_t filetime_100ns)
+  static Timestamp to_datetime(uint64_t filetime_100ns)
   {
     const uint64_t sec_1601 = filetime_100ns / 10000000ULL;
     int64_t unix_sec = int64_t(sec_1601) - 11644473600LL;   // 1601-01-01 -> 1970-01-01
@@ -485,7 +586,7 @@ private:
     int y;
     unsigned mo, d;
     civil_from_days(days, y, mo, d);
-    DateTime dt{};
+    Timestamp dt{};
     dt.year = y;
     dt.month = mo;
     dt.day = d;
@@ -531,8 +632,6 @@ private:
     while ( n > 0 )
       s.push_back(buf[--n]);
   }
-
-  const _KUSER_SHARED_DATA *data_;
 };
 
 }  // namespace kuser
