@@ -2,25 +2,55 @@
 // every process at the fixed user-mode address 0x7FFE0000, so reading the time from it is a
 // plain memory load -- no syscall, no QueryPerformanceCounter, no <chrono>.
 //
-// Layout is the x64 Windows 10 22H2 _KUSER_SHARED_DATA and its nested types, reproduced
-// faithfully (https://www.vergiliusproject.com/kernels/x64/windows-10/22h2/_KUSER_SHARED_DATA).
-// Everything lives in namespace `kuser` with self-contained base-type aliases so it needs no
-// Windows headers and cannot collide with the SDK's own _LARGE_INTEGER / _NT_PRODUCT_TYPE /
-// etc. The static_asserts pin sizeof and every offset, so the layout is provably correct.
+// Self-contained: NO #includes. The fixed-width types, the offset checks (__builtin_offsetof),
+// and even a small fixed-capacity String are defined by hand, so this header pulls in nothing
+// and cannot collide with the SDK's own types. Layout is the x64 Windows 10 22H2
+// _KUSER_SHARED_DATA (https://www.vergiliusproject.com/kernels/x64/windows-10/22h2/_KUSER_SHARED_DATA);
+// the static_asserts pin sizeof and every offset, so it is provably correct.
 #pragma once
-#include <cstdint>
-#include <cstddef>
-#include <string>
 
 namespace kuser {
 
-using UCHAR     = uint8_t;
-using USHORT    = uint16_t;
-using WCHAR     = uint16_t;   // 2 bytes, as on Windows
-using ULONG     = uint32_t;
-using LONG      = int32_t;
-using ULONGLONG = uint64_t;
-using LONGLONG  = int64_t;
+// Fixed-width base types (MSVC x64 / LLP64), defined by hand so we need no <cstdint>.
+using UCHAR     = unsigned char;        // 1
+using USHORT    = unsigned short;       // 2
+using WCHAR     = unsigned short;       // 2
+using ULONG     = unsigned int;         // 4
+using LONG      = int;                  // 4
+using ULONGLONG = unsigned long long;   // 8
+using LONGLONG  = long long;            // 8
+
+// Minimal fixed-capacity string, so string-returning accessors need no <string>. Big enough
+// for a Windows path; construct from a literal or build one up with push()/append().
+class String
+{
+public:
+  String() {}
+  String(const char *s) { append(s); }
+
+  void push(char c)
+  {
+    if ( len_ + 1 < CAP )
+    {
+      buf_[len_++] = c;
+      buf_[len_] = 0;
+    }
+  }
+
+  void append(const char *s)
+  {
+    while ( s != nullptr && *s != 0 )
+      push(*s++);
+  }
+
+  const char *c_str() const { return buf_; }
+  unsigned size() const { return len_; }
+
+private:
+  static const unsigned CAP = 288;   // fits NtSystemRoot (<=260 chars) and every timestamp
+  char buf_[CAP] = { 0 };
+  unsigned len_ = 0;
+};
 
 struct _KSYSTEM_TIME
 {
@@ -198,21 +228,26 @@ struct _KUSER_SHARED_DATA
 
 static_assert(sizeof(_KSYSTEM_TIME) == 0x0C, "KSYSTEM_TIME size");
 static_assert(sizeof(_KUSER_SHARED_DATA) == 0x720, "KUSER_SHARED_DATA size");
-static_assert(offsetof(_KUSER_SHARED_DATA, InterruptTime) == 0x08, "InterruptTime offset");
-static_assert(offsetof(_KUSER_SHARED_DATA, SystemTime) == 0x14, "SystemTime offset");
-static_assert(offsetof(_KUSER_SHARED_DATA, QpcFrequency) == 0x300, "QpcFrequency offset");
-static_assert(offsetof(_KUSER_SHARED_DATA, TickCount) == 0x320, "TickCount offset");
+static_assert(__builtin_offsetof(_KUSER_SHARED_DATA, InterruptTime) == 0x08, "InterruptTime offset");
+static_assert(__builtin_offsetof(_KUSER_SHARED_DATA, SystemTime) == 0x14, "SystemTime offset");
+static_assert(__builtin_offsetof(_KUSER_SHARED_DATA, QpcFrequency) == 0x300, "QpcFrequency offset");
+static_assert(__builtin_offsetof(_KUSER_SHARED_DATA, TickCount) == 0x320, "TickCount offset");
 
-// Singleton over the kernel's shared clock page. Accessors are split into small nested
-// classes by domain, so you reach one as:
+// The kernel maps _KUSER_SHARED_DATA read-only at this fixed user-mode address. Resolve the
+// pointer ONCE here (inline global, one definition across TUs) instead of re-casting on every
+// access; all accessors read through KUSD.
+inline const _KUSER_SHARED_DATA *const KUSD =
+    reinterpret_cast<const _KUSER_SHARED_DATA *>(0x7FFE0000ull);
+
+// Singleton over the shared page. Accessors are split into small nested classes by domain, so
+// you reach one as:
 //
 //     KUser::get_instance().datetime.get_year()
 //     KUser::get_instance().clock.seconds()
 //     KUser::get_instance().os.version_string()
 //
-// That keeps get_instance() itself tiny instead of exposing every field as a flat method.
-// Each group is a stateless handle; every read goes straight to the fixed mapping via shared_data()
-// -- no QueryPerformanceCounter, no syscall, anywhere.
+// That keeps get_instance() itself tiny instead of exposing every field as a flat method. Each
+// group is a stateless handle; every read goes straight through KUSD -- no QPC, no syscall.
 class KUser
 {
 public:
@@ -242,9 +277,14 @@ public:
   // The right source for elapsed/duration -- never jumps.
   struct Clock
   {
-    uint64_t interrupt_time_100ns() const
+    ULONGLONG interrupt_time_100ns() const
     {
-      return read_ksystime(&shared_data()->InterruptTime);
+      return read_ksystime(&KUSD->InterruptTime);
+    }
+
+    ULONGLONG interrupt_time_ns() const   // nanoseconds since boot
+    {
+      return interrupt_time_100ns() * 100;
     }
 
     double seconds() const   // since boot
@@ -252,34 +292,54 @@ public:
       return double(interrupt_time_100ns()) * 1e-7;
     }
 
-    uint64_t uptime_ms() const   // since boot
+    ULONGLONG uptime_ms() const   // since boot
     {
       return interrupt_time_100ns() / 10000;
     }
 
-    uint64_t interrupt_time_bias() const
+    String uptime_string() const   // "5d 07h 08m 16s"
     {
-      return shared_data()->InterruptTimeBias;
+      ULONGLONG s = interrupt_time_100ns() / 10000000ull;
+      String out;
+      append_num(out, unsigned(s / 86400), 1);
+      out.append("d ");
+      append_num(out, unsigned((s % 86400) / 3600), 2);
+      out.append("h ");
+      append_num(out, unsigned((s % 3600) / 60), 2);
+      out.append("m ");
+      append_num(out, unsigned(s % 60), 2);
+      out.push('s');
+      return out;
     }
 
-    uint64_t tick_count() const
+    ULONGLONG interrupt_time_bias() const
     {
-      return shared_data()->TickCountQuad;
+      return KUSD->InterruptTimeBias;
     }
 
-    uint32_t tick_count_multiplier() const
+    ULONGLONG tick_count() const
     {
-      return shared_data()->TickCountMultiplier;
+      return KUSD->TickCountQuad;
     }
 
-    int64_t qpc_frequency() const
+    ULONG tick_count_multiplier() const
     {
-      return shared_data()->QpcFrequency;
+      return KUSD->TickCountMultiplier;
     }
 
-    uint64_t qpc_bias() const
+    LONGLONG qpc_frequency() const
     {
-      return shared_data()->QpcBias;
+      return KUSD->QpcFrequency;
+    }
+
+    ULONGLONG qpc_bias() const
+    {
+      return KUSD->QpcBias;
+    }
+
+    bool qpc_bypass_enabled() const
+    {
+      return KUSD->QpcBypassEnabled != 0;
     }
   } clock;
 
@@ -287,24 +347,29 @@ public:
   // Time of day; can jump on NTP/DST -- never use for durations.
   struct DateTime
   {
-    uint64_t system_time_100ns() const   // 100ns since 1601-01-01 (FILETIME epoch)
+    ULONGLONG system_time_100ns() const   // 100ns since 1601-01-01 (FILETIME epoch)
     {
-      return read_ksystime(&shared_data()->SystemTime);
+      return read_ksystime(&KUSD->SystemTime);
     }
 
     double unix_time() const   // seconds since 1970-01-01
     {
-      return double(system_time_100ns() - 116444736000000000ULL) * 1e-7;
+      return double(system_time_100ns() - 116444736000000000ull) * 1e-7;
     }
 
-    uint64_t time_zone_bias_100ns() const
+    ULONGLONG unix_time_ms() const   // milliseconds since 1970-01-01
     {
-      return read_ksystime(&shared_data()->TimeZoneBias);
+      return (system_time_100ns() - 116444736000000000ull) / 10000;
     }
 
-    uint32_t time_zone_id() const
+    ULONGLONG time_zone_bias_100ns() const
     {
-      return shared_data()->TimeZoneId;
+      return read_ksystime(&KUSD->TimeZoneBias);
+    }
+
+    ULONG time_zone_id() const
+    {
+      return KUSD->TimeZoneId;
     }
 
     Timestamp now_utc() const
@@ -357,7 +422,18 @@ public:
       return now_utc().weekday;
     }
 
-    std::string weekday_name() const   // "Monday"
+    unsigned day_of_year() const   // 1-366
+    {
+      Timestamp t = now_utc();
+      static const unsigned cum[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+      unsigned doy = cum[(t.month >= 1 && t.month <= 12) ? t.month - 1 : 0] + t.day;
+      bool leap = (t.year % 4 == 0 && t.year % 100 != 0) || (t.year % 400 == 0);
+      if ( leap && t.month > 2 )
+        doy += 1;
+      return doy;
+    }
+
+    String weekday_name() const   // "Monday"
     {
       static const char *const names[7] =
         { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
@@ -365,7 +441,7 @@ public:
       return names[w < 7 ? w : 0];
     }
 
-    std::string month_name() const   // "September"
+    String month_name() const   // "September"
     {
       static const char *const names[12] =
         { "January", "February", "March", "April", "May", "June",
@@ -374,42 +450,34 @@ public:
       return names[(m >= 1 && m <= 12) ? m - 1 : 0];
     }
 
-    std::string to_string() const   // "YYYY-MM-DD HH:MM:SS" (UTC)
+    String to_string() const         // "YYYY-MM-DD HH:MM:SS" (UTC)
     {
-      Timestamp t = now_utc();
-      std::string s;
-      append_num(s, unsigned(t.year), 4);
-      s.push_back('-');
-      append_num(s, t.month, 2);
-      s.push_back('-');
-      append_num(s, t.day, 2);
-      s.push_back(' ');
-      append_num(s, t.hour, 2);
-      s.push_back(':');
-      append_num(s, t.minute, 2);
-      s.push_back(':');
-      append_num(s, t.second, 2);
-      return s;
+      return ymdhms(now_utc());
     }
 
-    std::string iso8601() const   // "2026-09-07T04:55:00.242Z" (UTC)
+    String to_string_local() const   // "YYYY-MM-DD HH:MM:SS" (wall-local)
+    {
+      return ymdhms(now_local());
+    }
+
+    String iso8601() const   // "2026-09-07T04:55:00.242Z" (UTC)
     {
       Timestamp t = now_utc();
-      std::string s;
+      String s;
       append_num(s, unsigned(t.year), 4);
-      s.push_back('-');
+      s.push('-');
       append_num(s, t.month, 2);
-      s.push_back('-');
+      s.push('-');
       append_num(s, t.day, 2);
-      s.push_back('T');
+      s.push('T');
       append_num(s, t.hour, 2);
-      s.push_back(':');
+      s.push(':');
       append_num(s, t.minute, 2);
-      s.push_back(':');
+      s.push(':');
       append_num(s, t.second, 2);
-      s.push_back('.');
+      s.push('.');
       append_num(s, t.millisecond, 3);
-      s.push_back('Z');
+      s.push('Z');
       return s;
     }
   } datetime;
@@ -417,40 +485,40 @@ public:
   // ---- OS identity: get_instance().os.<method>() ----
   struct OsInfo
   {
-    uint32_t build_number() const
+    ULONG build_number() const
     {
-      return shared_data()->NtBuildNumber;
+      return KUSD->NtBuildNumber;
     }
 
-    uint32_t major_version() const
+    ULONG major_version() const
     {
-      return shared_data()->NtMajorVersion;
+      return KUSD->NtMajorVersion;
     }
 
-    uint32_t minor_version() const
+    ULONG minor_version() const
     {
-      return shared_data()->NtMinorVersion;
+      return KUSD->NtMinorVersion;
     }
 
-    std::string version_string() const   // "10.0.19045"
+    String version_string() const   // "10.0.19045"
     {
-      std::string s;
+      String s;
       append_num(s, major_version(), 1);
-      s.push_back('.');
+      s.push('.');
       append_num(s, minor_version(), 1);
-      s.push_back('.');
+      s.push('.');
       append_num(s, build_number(), 1);
       return s;
     }
 
     _NT_PRODUCT_TYPE product_type() const
     {
-      return shared_data()->NtProductType;
+      return KUSD->NtProductType;
     }
 
-    std::string product_type_name() const
+    String product_type_name() const
     {
-      switch ( shared_data()->NtProductType )
+      switch ( KUSD->NtProductType )
       {
         case NtProductWinNt:    return "Workstation";
         case NtProductLanManNt: return "Domain Controller";
@@ -459,14 +527,19 @@ public:
       }
     }
 
-    uint16_t processor_architecture() const
+    bool is_server() const
     {
-      return shared_data()->NativeProcessorArchitecture;
+      return KUSD->NtProductType != NtProductWinNt;
     }
 
-    std::string processor_architecture_name() const
+    USHORT processor_architecture() const
     {
-      switch ( shared_data()->NativeProcessorArchitecture )
+      return KUSD->NativeProcessorArchitecture;
+    }
+
+    String processor_architecture_name() const
+    {
+      switch ( KUSD->NativeProcessorArchitecture )
       {
         case 0:  return "x86";
         case 5:  return "ARM";
@@ -477,12 +550,21 @@ public:
       }
     }
 
-    std::string system_root() const   // "C:\Windows"
+    ULONG boot_id() const
     {
-      std::string s;
-      const _KUSER_SHARED_DATA *p = shared_data();
-      for ( int i = 0; i < 260 && p->NtSystemRoot[i] != 0; ++i )
-        s.push_back(char(p->NtSystemRoot[i]));   // system root is ASCII
+      return KUSD->BootId;
+    }
+
+    ULONG suite_mask() const
+    {
+      return KUSD->SuiteMask;
+    }
+
+    String system_root() const   // "C:\Windows"
+    {
+      String s;
+      for ( int i = 0; i < 260 && KUSD->NtSystemRoot[i] != 0; ++i )
+        s.push(char(KUSD->NtSystemRoot[i]));   // system root is ASCII
       return s;
     }
   } os;
@@ -490,31 +572,50 @@ public:
   // ---- hardware / CPU: get_instance().cpu.<method>() ----
   struct Cpu
   {
-    uint32_t processor_count() const
+    ULONG processor_count() const
     {
-      return shared_data()->ActiveProcessorCount;
+      return KUSD->ActiveProcessorCount;
     }
 
-    uint32_t physical_pages() const
+    unsigned active_group_count() const
     {
-      return shared_data()->NumberOfPhysicalPages;
+      return KUSD->ActiveGroupCount;
     }
 
-    uint64_t physical_memory_bytes() const
+    USHORT unparked_processor_count() const
     {
-      return uint64_t(shared_data()->NumberOfPhysicalPages) * 4096ULL;
+      return KUSD->UnparkedProcessorCount;
     }
 
-    uint32_t large_page_minimum() const
+    USHORT cycles_per_yield() const
     {
-      return shared_data()->LargePageMinimum;
+      return KUSD->CyclesPerYield;
+    }
+
+    ULONG physical_pages() const
+    {
+      return KUSD->NumberOfPhysicalPages;
+    }
+
+    ULONGLONG physical_memory_bytes() const
+    {
+      return ULONGLONG(KUSD->NumberOfPhysicalPages) * 4096ull;
+    }
+
+    ULONG large_page_minimum() const
+    {
+      return KUSD->LargePageMinimum;
     }
 
     // A PF_* processor-feature flag (e.g. PF_XMMI64_INSTRUCTIONS_AVAILABLE); false if out of range.
     bool is_feature_present(unsigned feature) const
     {
-      return feature < 64 && shared_data()->ProcessorFeatures[feature] != 0;
+      return feature < 64 && KUSD->ProcessorFeatures[feature] != 0;
     }
+
+    bool has_sse2() const { return is_feature_present(10); }   // PF_XMMI64_INSTRUCTIONS_AVAILABLE
+    bool has_sse3() const { return is_feature_present(13); }   // PF_SSE3_INSTRUCTIONS_AVAILABLE
+    bool has_nx()   const { return is_feature_present(12); }   // PF_NX_ENABLED (DEP)
   } cpu;
 
   // ---- security / debug state: get_instance().security.<method>() ----
@@ -522,43 +623,62 @@ public:
   {
     bool kd_debugger_enabled() const   // boot /DEBUG flag
     {
-      return shared_data()->KdDebuggerEnabled != 0;
+      return KUSD->KdDebuggerEnabled != 0;
     }
 
     bool safe_boot_mode() const
     {
-      return shared_data()->SafeBootMode != 0;
+      return KUSD->SafeBootMode != 0;
     }
 
     bool secure_boot_enabled() const
     {
-      return shared_data()->DbgSecureBootEnabled != 0;
+      return KUSD->DbgSecureBootEnabled != 0;
     }
 
-    uint32_t shared_data_flags() const
+    bool dbg_elevation_enabled() const
     {
-      return shared_data()->SharedDataFlags;
+      return KUSD->DbgElevationEnabled != 0;
+    }
+
+    bool dbg_virt_enabled() const
+    {
+      return KUSD->DbgVirtEnabled != 0;
+    }
+
+    unsigned nx_support_policy() const    // 0=AlwaysOff 1=AlwaysOn 2=OptIn 3=OptOut
+    {
+      return KUSD->NXSupportPolicy;
+    }
+
+    unsigned seh_validation_policy() const
+    {
+      return KUSD->SEHValidationPolicy;
+    }
+
+    ULONG shared_data_flags() const
+    {
+      return KUSD->SharedDataFlags;
+    }
+
+    ULONG cookie() const   // SharedUserData cookie (pointer-encoding seed)
+    {
+      return KUSD->Cookie;
     }
   } security;
 
   // Raw page, for any field not wrapped by a group above.
   const _KUSER_SHARED_DATA *data() const
   {
-    return shared_data();
+    return KUSD;
   }
 
 private:
   KUser() = default;
 
-  // The kernel maps _KUSER_SHARED_DATA read-only at this fixed user-mode address.
-  static const _KUSER_SHARED_DATA *shared_data()
-  {
-    return reinterpret_cast<const _KUSER_SHARED_DATA *>(uintptr_t(0x7FFE0000));
-  }
-
   // KSYSTEM_TIME is written by the kernel as three 32-bit fields, so re-read until the two
   // High words agree -- that rejects a torn value straddling a kernel update.
-  static uint64_t read_ksystime(const volatile _KSYSTEM_TIME *time_ptr)
+  static ULONGLONG read_ksystime(const volatile _KSYSTEM_TIME *time_ptr)
   {
     for ( ;; )
     {
@@ -566,18 +686,18 @@ private:
       ULONG low  = time_ptr->LowPart;
       LONG high2 = time_ptr->High2Time;
       if ( high1 == high2 )
-        return (uint64_t(ULONG(high1)) << 32) | low;
+        return (ULONGLONG(ULONG(high1)) << 32) | low;
     }
   }
 
   // Civil calendar from a FILETIME (100ns since 1601-01-01 UTC). Pure arithmetic (Howard
   // Hinnant's days<->civil algorithm) -- no FileTimeToSystemTime, no kernel call.
-  static Timestamp to_datetime(uint64_t filetime_100ns)
+  static Timestamp to_datetime(ULONGLONG filetime_100ns)
   {
-    const uint64_t sec_1601 = filetime_100ns / 10000000ULL;
-    int64_t unix_sec = int64_t(sec_1601) - 11644473600LL;   // 1601-01-01 -> 1970-01-01
-    int64_t days = unix_sec / 86400;
-    int64_t sod = unix_sec % 86400;
+    const ULONGLONG sec_1601 = filetime_100ns / 10000000ull;
+    LONGLONG unix_sec = LONGLONG(sec_1601) - 11644473600ll;   // 1601-01-01 -> 1970-01-01
+    LONGLONG days = unix_sec / 86400;
+    LONGLONG sod = unix_sec % 86400;
     if ( sod < 0 )   // floor toward -infinity (guards pre-1970 inputs)
     {
       sod += 86400;
@@ -586,15 +706,15 @@ private:
     int y;
     unsigned mo, d;
     civil_from_days(days, y, mo, d);
-    Timestamp dt{};
+    Timestamp dt = {};
     dt.year = y;
     dt.month = mo;
     dt.day = d;
     dt.hour = unsigned(sod / 3600);
     dt.minute = unsigned((sod % 3600) / 60);
     dt.second = unsigned(sod % 60);
-    dt.millisecond = unsigned((filetime_100ns / 10000ULL) % 1000ULL);
-    int64_t wd = (days % 7 + 4) % 7;   // 1970-01-01 was a Thursday (=4)
+    dt.millisecond = unsigned((filetime_100ns / 10000ull) % 1000ull);
+    LONGLONG wd = (days % 7 + 4) % 7;   // 1970-01-01 was a Thursday (=4)
     if ( wd < 0 )
       wd += 7;
     dt.weekday = unsigned(wd);
@@ -602,13 +722,13 @@ private:
   }
 
   // days since 1970-01-01 -> civil (year, month [1,12], day [1,31]).
-  static void civil_from_days(int64_t z, int &y, unsigned &m, unsigned &d)
+  static void civil_from_days(LONGLONG z, int &y, unsigned &m, unsigned &d)
   {
     z += 719468;   // shift the epoch to 0000-03-01
-    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const LONGLONG era = (z >= 0 ? z : z - 146096) / 146097;
     const unsigned doe = unsigned(z - era * 146097);                             // [0, 146096]
     const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;  // [0, 399]
-    const int64_t yr = int64_t(yoe) + era * 400;
+    const LONGLONG yr = LONGLONG(yoe) + era * 400;
     const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                // [0, 365]
     const unsigned mp = (5 * doy + 2) / 153;                                     // [0, 11]
     d = doy - (153 * mp + 2) / 5 + 1;                                            // [1, 31]
@@ -616,9 +736,26 @@ private:
     y = int(yr) + (m <= 2);
   }
 
-  // Append `value` to `s` as decimal digits, zero-padded to at least `width`. Hand-rolled
-  // because the IDA SDK poisons snprintf; keeps this header self-contained.
-  static void append_num(std::string &s, unsigned value, int width)
+  // "YYYY-MM-DD HH:MM:SS" from a broken-down time.
+  static String ymdhms(const Timestamp &t)
+  {
+    String s;
+    append_num(s, unsigned(t.year), 4);
+    s.push('-');
+    append_num(s, t.month, 2);
+    s.push('-');
+    append_num(s, t.day, 2);
+    s.push(' ');
+    append_num(s, t.hour, 2);
+    s.push(':');
+    append_num(s, t.minute, 2);
+    s.push(':');
+    append_num(s, t.second, 2);
+    return s;
+  }
+
+  // Append `value` to `s` as decimal digits, zero-padded to at least `width`.
+  static void append_num(String &s, unsigned value, int width)
   {
     char buf[16];
     int n = 0;
@@ -628,9 +765,9 @@ private:
       value /= 10;
     } while ( value != 0 );
     for ( int i = n; i < width; ++i )
-      s.push_back('0');
+      s.push('0');
     while ( n > 0 )
-      s.push_back(buf[--n]);
+      s.push(buf[--n]);
   }
 };
 
