@@ -102,6 +102,37 @@ if (Test-Path $IdbCopy) {
   ok ((tv $R3[40]).module -eq "hexx64.dll") "module 'hexx64 - Copy.dll' -> 'hexx64.dll' (got '$((tv $R3[40]).module)')"
 } else { "  [SKIP] no ' - Copy' test idb present" }
 
+"=== Phase 4: HTTP transport (M4) ==="
+function http_inst($base) {
+  $errf = "$env:TEMP\hexport_http_$base.err"
+  $p = Start-Process -FilePath $Exe -ArgumentList @("--http","--port","$base","--open",$Idb) -PassThru -RedirectStandardError $errf -RedirectStandardOutput "$errf.out" -WindowStyle Hidden
+  $port = $null
+  for ($i=0; $i -lt 120; $i++) { Start-Sleep -Milliseconds 100
+    if (Test-Path $errf) { $m = Select-String -Path $errf -Pattern 'listening on http://127\.0\.0\.1:(\d+)/mcp' | Select-Object -First 1; if ($m) { $port = [int]$m.Matches[0].Groups[1].Value; break } } }
+  [pscustomobject]@{ proc=$p; port=$port }
+}
+function http_post($port,$obj) {
+  $f = "$env:TEMP\hexport_http_req.json"; [IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 8 -Compress))
+  $raw = & curl.exe -s --max-time 20 -X POST -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" --data-binary "@$f" "http://127.0.0.1:$port/mcp"
+  if ($raw) { $raw | ConvertFrom-Json } else { $null }
+}
+$H1 = http_inst 13500   # base away from any live ida-pro-mcp on 13337-13339
+$H2 = http_inst 13500   # second instance must auto-bump off H1's port
+try {
+  ok ($null -ne $H1.port) "http instance A bound a port ($($H1.port))"
+  $init = http_post $H1.port @{ jsonrpc="2.0"; id=1; method="initialize"; params=@{ protocolVersion="2024-11-05"; capabilities=@{}; clientInfo=@{ name="t"; version="1" } } }
+  ok ($init.result.serverInfo.name -eq "hexport") "http initialize -> serverInfo.name=hexport"
+  $hh = (http_post $H1.port @{ jsonrpc="2.0"; id=2; method="tools/call"; params=@{ name="server_health"; arguments=@{} } }).result.structuredContent.result
+  ok ($hh.ready -eq $true -and $hh.functions -gt 0) "http server_health ready, functions=$($hh.functions)"
+  $dc = (http_post $H1.port @{ jsonrpc="2.0"; id=3; method="tools/call"; params=@{ name="decompile"; arguments=@{ addr="0x140001000" } } }).result.structuredContent.result
+  ok ($dc.code -match "MessageBoxW") "http decompile returns full pseudocode"
+  $nt = http_post $H1.port @{ jsonrpc="2.0"; method="notifications/initialized" }
+  ok ($null -eq $nt) "http notification -> no JSON-RPC response (202)"
+  ok ($null -ne $H2.port -and $H2.port -ne $H1.port) "http instance B auto-bumped to a different port ($($H2.port))"
+} finally {
+  foreach ($x in @($H1,$H2)) { if ($x -and $x.proc -and -not $x.proc.HasExited) { Stop-Process -Id $x.proc.Id -Force -ea 0 } }
+}
+
 ""
 "================ RESULT: $script:pass passed, $script:fail failed ================"
 if ($script:fail -gt 0) { exit 1 }

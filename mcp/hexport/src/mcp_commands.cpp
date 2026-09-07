@@ -239,7 +239,7 @@ void McpCommands::list_funcs(const jvalue_t *queries, jvalue_t *out)
 }
 
 //-------------------------------------------------------------------------
-int64 McpCommands::build_disasm(ea_t addr, int64 max_instructions, int64 offset, jarr_t *lines, bool *more)
+int64 McpCommands::build_disasm(ea_t addr, int64 max_instructions, int64 offset, jarr_t *lines, bool *more, bool as_text)
 {
   *more = false;
   func_t *pfn = get_func(addr);
@@ -260,32 +260,43 @@ int64 McpCommands::build_disasm(ea_t addr, int64 max_instructions, int64 offset,
       *more = true;
       break;
     }
-    jobj_t *e = new jobj_t;
-    qstring tmp;
-    tmp.sprnt("%" FMT_64 "x", uint64(ea));
-    e->put("addr", tmp);
     qstring dl;
     generate_disasm_line(&dl, ea, GENDSM_REMOVE_TAGS);
-    e->put("instruction", dl);
-    qstring nm;
-    if ( get_ea_name(&nm, ea, 0) > 0 && !nm.empty() )
-      e->put("label", nm);
-    qstring c;
-    jarr_t *cs = nullptr;
-    if ( get_cmt(&c, ea, false) > 0 && !c.empty() )
+    if ( as_text )
     {
-      cs = new jarr_t;
-      cs->values.push_back().set_str(c.c_str());
+      // "<hexaddr>  <disasm>" -- ida-pro-mcp's analyze_batch shape; the exporter
+      // joins these with "\n". generate_disasm_line already appends IDA's comments.
+      qstring s;
+      s.sprnt("%" FMT_64 "x  %s", uint64(ea), dl.c_str());
+      lines->values.push_back().set_str(s.c_str());
     }
-    if ( get_cmt(&c, ea, true) > 0 && !c.empty() )
+    else
     {
-      if ( cs == nullptr )
+      jobj_t *e = new jobj_t;
+      qstring tmp;
+      tmp.sprnt("%" FMT_64 "x", uint64(ea));
+      e->put("addr", tmp);
+      e->put("instruction", dl);
+      qstring nm;
+      if ( get_ea_name(&nm, ea, 0) > 0 && !nm.empty() )
+        e->put("label", nm);
+      qstring c;
+      jarr_t *cs = nullptr;
+      if ( get_cmt(&c, ea, false) > 0 && !c.empty() )
+      {
         cs = new jarr_t;
-      cs->values.push_back().set_str(c.c_str());
+        cs->values.push_back().set_str(c.c_str());
+      }
+      if ( get_cmt(&c, ea, true) > 0 && !c.empty() )
+      {
+        if ( cs == nullptr )
+          cs = new jarr_t;
+        cs->values.push_back().set_str(c.c_str());
+      }
+      if ( cs != nullptr )
+        e->put("comments", cs);
+      lines->values.push_back().set_obj(e);
     }
-    if ( cs != nullptr )
-      e->put("comments", cs);
-    lines->values.push_back().set_obj(e);
     emitted++;
     idx++;
   }
@@ -318,7 +329,7 @@ void McpCommands::disasm(const jobj_t *args, jvalue_t *out)
 
   jarr_t *lines = new jarr_t;
   bool more = false;
-  int64 n = build_disasm(pfn->start_ea, max_ins, offset, lines, &more);
+  int64 n = build_disasm(pfn->start_ea, max_ins, offset, lines, &more, /*as_text=*/false);
 
   jobj_t *asmo = new jobj_t;
   asmo->put("lines", lines);
@@ -423,7 +434,7 @@ void McpCommands::analyze_batch(const jvalue_t *queries, jvalue_t *out)
         max_ins = 50000;
       jarr_t *lines = new jarr_t;
       bool more = false;
-      int64 n = build_disasm(pfn->start_ea, max_ins, 0, lines, &more);
+      int64 n = build_disasm(pfn->start_ea, max_ins, 0, lines, &more, /*as_text=*/true);
       jobj_t *d = new jobj_t;
       d->put("lines", lines);
       d->put("instruction_count", n);

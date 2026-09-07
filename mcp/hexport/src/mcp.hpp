@@ -1,4 +1,4 @@
-// Mcp - the MCP/JSON-RPC server. M2: stdio transport + protocol core. HTTP lands in M4.
+// Mcp - the MCP/JSON-RPC server: protocol core + transports (stdio and HTTP POST /mcp).
 #pragma once
 #include "pch.h"
 #include "mcp_commands.hpp"
@@ -10,10 +10,17 @@ public:
   // at any time via the open_database/close_database MCP tools.
   bool startup_open(const char *path, bool run_auto) { return cmds.open(path, run_auto); }
   void startup_close() { cmds.close(); }
-  int run_stdio();   // read newline-delimited JSON-RPC from stdin, reply on stdout
+  int run_stdio();          // read newline-delimited JSON-RPC from stdin, reply on stdout
+  int run_http(int port);   // serve JSON-RPC over HTTP POST /mcp; auto-scans up from port
 
 private:
   McpCommands cmds;
+  // When set, write_response appends the serialized reply here instead of stdout, so the
+  // HTTP transport can capture a request's reply. null => stdio (write to fd 1).
+  qstring *capture = nullptr;
+
+  qstring dispatch_line(const char *json);   // run one request, return its captured reply
+  void handle_http_client(SOCKET c);
 
   void handle_request(const jobj_t &req);
   void call_tool(const jobj_t &params, jvalue_t *result_out, bool *is_error, qstring *errmsg);

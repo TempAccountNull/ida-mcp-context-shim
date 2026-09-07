@@ -15,6 +15,12 @@
 #include <functional>
 #include <iostream>
 
+// Winsock2 for the M4 HTTP transport. It MUST precede any <windows.h> (pulled in by the
+// SDK headers below): including it first sets the _WINSOCKAPI_ guard so windows.h skips the
+// legacy winsock.h, avoiding the winsock1/winsock2 redefinition clash.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include <pro.h>
 #include <ida.hpp>
 #include <idp.hpp>

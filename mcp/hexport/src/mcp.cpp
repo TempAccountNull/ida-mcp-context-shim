@@ -5,6 +5,8 @@
 #include "strhash.hpp"
 #include <iostream>
 
+#pragma comment(lib, "ws2_32.lib")   // M4 HTTP transport (Winsock)
+
 // The one canonical tool list. tools/list is generated from it; the dispatch switch
 // below routes each name to its command (per-tool argument shapes differ, so the bodies
 // stay explicit). Add a tool in exactly these two spots.
@@ -32,7 +34,10 @@ void Mcp::write_response(jobj_t &resp)
   resp.put("jsonrpc", "2.0");
   qstring line = jdump(resp);
   line.append("\n");
-  write_out(line);   // fd 1 (JSON-RPC protocol); _write is unbuffered, no flush needed
+  if ( capture != nullptr )
+    capture->append(line);            // HTTP transport: buffer the reply for one request
+  else
+    write_out(line);   // fd 1 (JSON-RPC protocol); _write is unbuffered, no flush needed
 }
 
 void Mcp::reply_result(const jvalue_t *id, jvalue_t &result)
@@ -211,4 +216,133 @@ int Mcp::run_stdio()
     handle_request(req.obj());
   }
   return 0;
+}
+
+//-------------------------------------------------------------------------
+// HTTP transport (M4). One request per connection, JSON-RPC in the body, JSON reply out.
+// Single-threaded by necessity: idalib requires every call on the thread that inited it.
+//-------------------------------------------------------------------------
+qstring Mcp::dispatch_line(const char *json)
+{
+  qstring captured;
+  capture = &captured;
+  jvalue_t req;
+  if ( jparse(json, &req) && req.type() == JT_OBJ )
+    handle_request(req.obj());
+  capture = nullptr;
+  return captured;   // empty for a notification (no id) or unparseable input
+}
+
+static void send_all(SOCKET c, const char *p, size_t n)
+{
+  while ( n > 0 )
+  {
+    int w = send(c, p, int(n > 0x40000 ? 0x40000 : n), 0);
+    if ( w <= 0 )
+      return;
+    p += w;
+    n -= size_t(w);
+  }
+}
+
+void Mcp::handle_http_client(SOCKET c)
+{
+  std::string buf;
+  char tmp[8192];
+  size_t hdr_end;
+  while ( (hdr_end = buf.find("\r\n\r\n")) == std::string::npos )
+  {
+    int r = recv(c, tmp, sizeof(tmp), 0);
+    if ( r <= 0 )
+      return;
+    buf.append(tmp, size_t(r));
+    if ( buf.size() > (16u << 20) )   // 16 MB header guard
+      return;
+  }
+  std::string head = buf.substr(0, hdr_end);
+
+  size_t clen = 0;   // case-insensitive Content-Length
+  for ( size_t i = 0; i + 15 <= head.size(); ++i )
+  {
+    if ( (head[i] | 0x20) == 'c' && _strnicmp(head.c_str() + i, "content-length:", 15) == 0 )
+    {
+      clen = size_t(strtoull(head.c_str() + i + 15, nullptr, 10));
+      break;
+    }
+  }
+  size_t body_start = hdr_end + 4;
+  while ( buf.size() - body_start < clen )
+  {
+    int r = recv(c, tmp, sizeof(tmp), 0);
+    if ( r <= 0 )
+      break;
+    buf.append(tmp, size_t(r));
+  }
+
+  bool is_post = head.compare(0, 5, "POST ") == 0;
+  qstring reply = is_post ? dispatch_line(buf.substr(body_start, clen).c_str()) : qstring();
+
+  qstring hdr;
+  if ( is_post && !reply.empty() )
+    hdr.sprnt("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+              "Content-Length: %u\r\nConnection: close\r\n\r\n", unsigned(reply.length()));
+  else if ( is_post )
+    hdr = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  else
+    hdr = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  send_all(c, hdr.c_str(), hdr.length());
+  if ( is_post && !reply.empty() )
+    send_all(c, reply.c_str(), reply.length());
+}
+
+int Mcp::run_http(int port)
+{
+  WSADATA wsa;
+  if ( WSAStartup(MAKEWORD(2, 2), &wsa) != 0 )
+  {
+    write_err(qstring("hexport: WSAStartup failed\n"));
+    return 1;
+  }
+  SOCKET listener = INVALID_SOCKET;
+  int bound = 0;
+  for ( int p = port; p < port + 64; ++p )   // auto-scan up from the requested port
+  {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if ( s == INVALID_SOCKET )
+      continue;
+    BOOL excl = TRUE;   // borrowed from re-mcp: EXCLUSIVEADDRUSE makes the scan race-free
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&excl, sizeof(excl));
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // 127.0.0.1 only
+    addr.sin_port = htons(u_short(p));
+    if ( bind(s, (sockaddr *)&addr, sizeof(addr)) == 0 && listen(s, SOMAXCONN) == 0 )
+    {
+      listener = s;
+      bound = p;
+      break;
+    }
+    closesocket(s);
+  }
+  if ( listener == INVALID_SOCKET )
+  {
+    qstring m;
+    m.sprnt("hexport: no free port in [%d, %d)\n", port, port + 64);
+    write_err(m);
+    WSACleanup();
+    return 1;
+  }
+  qstring m;
+  m.sprnt("hexport: HTTP MCP listening on http://127.0.0.1:%d/mcp\n", bound);
+  write_err(m);
+
+  for ( ;; )   // headless server: runs until the process is killed (Ctrl+C)
+  {
+    SOCKET c = accept(listener, nullptr, nullptr);
+    if ( c == INVALID_SOCKET )
+      continue;
+    handle_http_client(c);
+    closesocket(c);
+  }
 }

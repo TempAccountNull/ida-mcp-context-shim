@@ -37,8 +37,13 @@ timeouts, and no per-call HTTP/`curl` overhead.
       methods, CLI flags) is a `switch` on a constexpr hash; the tool list is one
       `HEXPORT_TOOLS(X)` macro. **Live per-function status on stderr** while analyzing
       (`[hexport] 1/60  decompile  wWinMain @ 0x140001000`).
-- [ ] **M4 — transports + wiring.** `--http` (per-instance ports 13337, 13338, …)
-      alongside `--stdio`, plus `start_mcp.cmd`; then point the exporter's `--server` at it.
+- [x] **M4 — transports + wiring.** `--http` (Winsock, loopback-only, `SO_EXCLUSIVEADDRUSE`)
+      alongside `--stdio`, auto-scanning up from `--port` (default 13337 → 13338 → 13339, the
+      ida-pro-mcp convention), plus `start_mcp.cmd`. Validated end-to-end: the real exporter
+      (`ida_mcp_export.py --server 13337 --all-fns`) drives hexport over HTTP and writes the
+      full `asm/` + `cpp/` export unchanged. Measured per-call overhead: **0.70 ms** (http) /
+      **0.031 ms** (stdio) vs ida-pro-mcp's **2.83 ms** — and the decompile itself is ~3 ms/fn,
+      so transport is never the bottleneck.
 
 ## Prerequisites
 
@@ -72,15 +77,44 @@ build.cmd
    - `x64_win_64_s\pro.lib` → `x64_win_64\`
    - `x86_win_32_s\{compress.lib, dumb.obj, int128.lib, pro.lib, unicode.lib}` → `x64_win_32\`
 
-## Run (M1)
+## Run
+
+`hexport.exe` needs IDA's runtime (`ida.dll`/`idalib.dll`) on `PATH`.
+
+### HTTP (drives the exporter)
+
+```cmd
+start_mcp.cmd "D:\path\to\your.i64"
+```
+
+`start_mcp.cmd <db> [start_port]` launches an HTTP instance and serves MCP at
+`http://127.0.0.1:<port>/mcp`. The port auto-scans up from `start_port` (default 13337), so
+launching it again for a second database binds 13338, a third 13339, and so on. Point the
+exporter at it:
+
+```cmd
+python ida_mcp_export.py --server 13337 --all-fns --output out
+```
+
+`start_mcp.cmd` puts IDA on `PATH` for you: it honors `%IDADIR%` if set, otherwise falls back
+to the default install only when `idalib.dll` isn't already resolvable. To run the exe
+directly: `hexport.exe --http [--port N] --open <db>`.
+
+### stdio
 
 ```cmd
 set PATH=C:\Program Files\IDA Professional 9.4;%PATH%
-build\hexport.exe "D:\path\to\your.i64"
+build\hexport.exe --stdio --open "D:\path\to\your.i64"
 ```
 
-M1 is validated: it opens the `.i64` headlessly via idalib and prints the function count
-and the first few functions (e.g. `functions: 60` on a test database). idalib's own
-console logging (and any GUI-only plugins that fail to load headlessly) is cosmetic; it
-gets silenced in M2 so the stdio transport stays clean. M2–M4 build the MCP server on
-this foundation.
+Reads newline-delimited JSON-RPC on stdin, replies on stdout. The database is optional at
+startup (open/close later via the `open_database`/`close_database` tools, or `--open`/`--close`).
+
+## Test
+
+```cmd
+pwsh -File test_hexport.ps1
+```
+
+38 checks across four phases: read tools + edge cases, DB lifecycle, module-name
+normalization, and the HTTP transport (handshake, decompile, notification, port auto-bump).
