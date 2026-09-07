@@ -29,11 +29,16 @@ timeouts, and no per-call HTTP/`curl` overhead.
       `McpCommands` (tools) using the SDK's own JSON (`parsejson`, no external lib).
       Validated: clean `serverInfo.name="hexport"`, `server_health` (module normalized
       `hexx64 - Copy.dll` -> `hexx64.dll`), and `list_funcs` in the exporter's shape.
-- [ ] **M3 — remaining tools.** `entity_query` (function total), `disasm` (**full**,
-      paged), `decompile` (**full** pseudocode), `analyze_batch`, `lookup_funcs`,
-      `force_recompile` — same result shapes the exporter parses. No truncation.
-- [ ] **M4 — transports.** `--http` (per-instance ports 13337, 13338, …) and `--stdio`,
-      plus `start_mcp.cmd`. The Python exporter then just points `--server` at it.
+- [x] **M3 — full toolset + DB lifecycle.** `disasm` (full, paged, labels+comments),
+      `decompile` (full Hex-Rays pseudocode), `analyze_batch`, `list_funcs`,
+      `entity_query`, `lookup_funcs`, `force_recompile`, and `open_database` /
+      `close_database` / `list_databases` (open/close at any time, or `--open`/`--close`).
+      Validated: real pseudocode + disasm, `truncated:false`. String dispatch (tools,
+      methods, CLI flags) is a `switch` on a constexpr hash; the tool list is one
+      `HEXPORT_TOOLS(X)` macro. **Live per-function status on stderr** while analyzing
+      (`[hexport] 1/60  decompile  wWinMain @ 0x140001000`).
+- [ ] **M4 — transports + wiring.** `--http` (per-instance ports 13337, 13338, …)
+      alongside `--stdio`, plus `start_mcp.cmd`; then point the exporter's `--server` at it.
 
 ## Prerequisites
 

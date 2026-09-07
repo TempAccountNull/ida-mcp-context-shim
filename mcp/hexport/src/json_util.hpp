@@ -16,6 +16,12 @@ inline int64 jint(const jobj_t &o, const char *k, int64 dflt = 0)
   return v != nullptr ? v->num() : dflt;
 }
 
+inline bool jbool(const jobj_t &o, const char *k, bool dflt = false)
+{
+  const jvalue_t *v = o.get_value(k, JT_BOOL);
+  return v != nullptr ? v->vbool() : dflt;
+}
+
 inline const jobj_t *jsub(const jobj_t &o, const char *k)
 {
   const jvalue_t *v = o.get_value(k, JT_OBJ);

@@ -6,6 +6,10 @@
 class Mcp
 {
 public:
+  // Open a database at startup (for --open / positional path). Tools can also open/close
+  // at any time via the open_database/close_database MCP tools.
+  bool startup_open(const char *path, bool run_auto) { return cmds.open(path, run_auto); }
+  void startup_close() { cmds.close(); }
   int run_stdio();   // read newline-delimited JSON-RPC from stdin, reply on stdout
 
 private:

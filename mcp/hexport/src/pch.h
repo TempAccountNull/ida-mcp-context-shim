@@ -2,15 +2,22 @@
 // translation unit (mcp, mcp_commands, main) builds fast. Add new SDK headers here.
 #pragma once
 
+// STL first, before the SDK headers below. The IDA SDK poisons the C stdio symbols
+// (fgetc/fputc/...), and the MSVC STL uses them internally, so any STL header pulled in
+// AFTER the SDK fails to compile. Include everything we need here, up front.
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <regex>
 #include <functional>
+#include <iostream>
 
 #include <pro.h>
 #include <ida.hpp>
+#include <idp.hpp>
 #include <idalib.hpp>
 #include <funcs.hpp>
 #include <name.hpp>
@@ -19,4 +26,5 @@
 #include <bytes.hpp>
 #include <segment.hpp>
 #include <lines.hpp>
+#include <hexrays.hpp>
 #include <parsejson.hpp>
