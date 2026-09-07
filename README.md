@@ -82,6 +82,7 @@ The table below lists every command-line argument accepted by the current export
 | **`--asm-only`** | Flag | Disabled | Export only disassembly (`.asm`); skip pseudocode. Much faster — decompilation is ~90% of export time. Mutually exclusive with `--cpp-only`. |
 | **`--cpp-only`** | Flag | Disabled | Export only pseudocode (`.cpp`); skip disassembly. Mutually exclusive with `--asm-only`. |
 | **`--retry-skipped`** | Flag | Disabled | Re-export only the functions listed as failures in the existing manifest, instead of the whole database. Run it with the **same** mode flags as the original run so it finds the right manifest. Skips enumeration/discovery, writes per-function `asm/<name>.asm` and `cpp/<name>.cpp` (overwriting failed ones in place for `--files-separate` runs, added alongside the combined files otherwise), and rewrites the manifest's failure list (recovered functions drop out, so repeat runs converge). |
+| **`--no-cache-flush`** | Flag | Disabled | Disable releasing IDA's Hex-Rays decompiler cache after each batch. By default the exporter calls `force_recompile` on each batch's functions once their pseudocode is captured, because Hex-Rays caches every function it decompiles and never evicts it — on a whole-database export that grows IDA's memory until it thrashes and calls start hitting the 120 s sync timeout. Flushing only runs when decompiling and when the `force_recompile` tool is available. |
 | **`--output`** | Directory path | `ida_exports` | Sets the parent output directory. The exporter creates a `<module>/` folder (named after the binary) inside it, containing one run subfolder — `function_<RootFunction>/`, or `all_functions_aio/` / `all_functions_split/` with `--all-fns` — each holding `asm/` and `cpp/` subfolders. Relative paths are resolved from the current working directory. |
 | **`--page-size`** | Integer from `1` to `50000` | `50000` | Sets the maximum disassembly instructions requested per page. Values outside the supported range are clamped. Smaller values generate more MCP requests. |
 | **`--include-external`** | Flag | Disabled | Accepted and recorded in the manifest. In the current build, it does not yet change traversal filtering. |
@@ -102,7 +103,7 @@ The table below lists every command-line argument accepted by the current export
 ## Complete Syntax
 
 ```cmd
-run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--files-separate] [--asm-only | --cpp-only] [--retry-skipped] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
+run_export.cmd [--server <endpoint>] [--function <name-or-address> | --address <address>] [--all-fns] [--files-separate] [--asm-only | --cpp-only] [--retry-skipped] [--output <directory>] [--page-size <count>] [--include-external] [--workers <count>] [--timeout <seconds>] [--function-timeout <seconds>] [--retries <count>] [--retry-delay <seconds>] [--health-interval <seconds>] [--health-timeout <seconds>] [--no-cache-flush] [--curl <path>] [--list-tools] [--verbose [0-6]] [--no-console-resize]
 ```
 
 `--function` and `--address` are mutually exclusive. Supplying both fails during argument parsing before MCP is contacted.
@@ -308,6 +309,7 @@ At completion, the exporter reports:
 | Connection refused | Confirm `ida-pro-mcp` is running on the selected host and port. |
 | Required MCP tool missing | Run `--list-tools` and verify `lookup_funcs`, `disasm`, and `decompile`. |
 | IDA becomes unstable with many workers | Reduce the count, for example `--workers 8` or `--workers 4`. |
+| IDA gets progressively slower on a huge export and calls time out (`Tool timed out after 120.00s`) | Hex-Rays caches every decompiled function and never evicts it; the exporter flushes that cache per batch by default (`force_recompile`), which is the fix. If it was disabled, drop `--no-cache-flush`. Health-wait then resumes automatically once IDA recovers. |
 | A worker appears frozen | Use `--verbose 4` to inspect page, instruction, and target-resolution progress. |
 | One function repeatedly times out | Increase `--function-timeout`, reduce `--page-size`, or inspect the function manually. |
 | Individual MCP requests time out | Increase `--timeout`; keep it finite so retries can activate. |

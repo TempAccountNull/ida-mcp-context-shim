@@ -1834,6 +1834,7 @@ class LiveStatusBase:
                     "Waiting": Colors.MAGENTA,
                     "Retrying": Colors.YELLOW,
                     "Preparing": Colors.YELLOW,
+                    "Exporting": Colors.GREEN,
                     "Disassembling": Colors.BLUE,
                     "Decompiling": Colors.MAGENTA,
                     "Writing": Colors.CYAN,
@@ -2196,6 +2197,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retry-delay", type=float, default=5.0, help="Base retry delay in seconds (default: 5)")
     p.add_argument("--health-interval", type=int, default=120, help="MCP health-check interval in seconds (default: 120)")
     p.add_argument("--health-timeout", type=int, default=20, help="Timeout for each health check in seconds (default: 20)")
+    p.add_argument("--no-cache-flush", action="store_true",
+                   help="Disable releasing ida-pro-mcp's Hex-Rays decompiler cache after each batch. Flushing (force_recompile on just the batch's functions) prevents IDA memory bloat and progressive slowdown/timeouts on huge exports; only runs when decompiling and when the force_recompile tool is available.")
     p.add_argument("--curl", default="curl.exe" if os.name == "nt" else "curl", help="curl executable")
     p.add_argument("--list-tools", action="store_true", help="Print enabled MCP tools and exit")
     p.add_argument(
@@ -2350,7 +2353,7 @@ def export_one(
 def export_batch(
     clients: ThreadClients, health: HealthMonitor, infos: list[FunctionInfo], page_size: int,
     retries: int, retry_delay: float, stats: RunStats, progress: ExportStatusLine | None = None,
-    want_asm: bool = True, want_cpp: bool = True,
+    want_asm: bool = True, want_cpp: bool = True, flush_cache: bool = False,
 ) -> list[tuple[FunctionInfo, str, str, list[dict[str, str]]]]:
     """Export a chunk of functions in one analyze_batch call (asm and/or pseudocode).
 
@@ -2419,6 +2422,16 @@ def export_batch(
         out.append((info, asm, pseudo, failures))
         if progress:
             progress.notify("Completed", info)
+    # Release the Hex-Rays cfunc cache for the functions we just decompiled. IDA's
+    # decompiler caches every function and the MCP read path never evicts it, so a
+    # whole-database export balloons IDA memory until it thrashes and calls hit the
+    # 120s sync timeout. Targeted (this batch only) keeps it cheap and the response
+    # small -- a full-database force_recompile would itself be slow enough to time out.
+    if flush_cache:
+        try:
+            clients.get().call_tool("force_recompile", {"items": [{"addr": info.addr} for info in infos]})
+        except Exception as exc:
+            vlog(2, "CACHE", f"cfunc cache flush failed: {type(exc).__name__}: {exc}")
     return out
 
 
@@ -2675,6 +2688,7 @@ def main() -> int:
     if args.verbose:
         vlog(1, "EXPORT", f"Starting export of {total} functions with {workers} workers")
     use_batch = (args.all_fns or args.retry_skipped) and "analyze_batch" in tools
+    flush_cache = want_cpp and not args.no_cache_flush and "force_recompile" in tools
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ida-export") as executor:
         # Work remains fully concurrent. Every worker updates the same in-place
         # status line as it changes stage; final files are still written later in
@@ -2686,7 +2700,7 @@ def main() -> int:
             chunk = 150
             batches = [all_functions[i:i + chunk] for i in range(0, len(all_functions), chunk)]
             for future in [
-                executor.submit(export_batch, clients, health, b, args.page_size, args.retries, args.retry_delay, stats, export_status, want_asm, want_cpp)
+                executor.submit(export_batch, clients, health, b, args.page_size, args.retries, args.retry_delay, stats, export_status, want_asm, want_cpp, flush_cache)
                 for b in batches
             ]:
                 for info, asm, pseudo, local_failures in future.result():
