@@ -30,6 +30,7 @@ private:
   bool is_open = false;
   bool hexrays_ok = false;
   uint64 processed = 0;            // functions handled so far (for the live status line)
+  uint64 t_start_100ns = 0;        // KUSER InterruptTime at open, for the live elapsed/rate readout
 
   void status(const char *op, ea_t ea, const char *name);
   // as_text=false -> structured {addr,instruction,label,comments} lines (disasm tool);

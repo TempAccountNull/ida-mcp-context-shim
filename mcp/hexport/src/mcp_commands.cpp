@@ -2,6 +2,7 @@
 #include "mcp_commands.hpp"
 #include "json_util.hpp"
 #include "raw_io.hpp"
+#include "kuser.hpp"
 
 //-------------------------------------------------------------------------
 static ea_t resolve_ea(const char *s)
@@ -18,10 +19,14 @@ static ea_t resolve_ea(const char *s)
 //-------------------------------------------------------------------------
 void McpCommands::status(const char *op, ea_t ea, const char *name)
 {
+  // Elapsed straight from the KUSER shared page (InterruptTime), no QPC/chrono call.
+  double elapsed = double(KUser::get_instance().interrupt_time_100ns() - t_start_100ns) * 1e-7;
+  double rate = elapsed > 0.001 ? double(processed) / elapsed : 0.0;
   qstring s;
-  s.sprnt("\r[hexport] %" FMT_64 "u/%" FMT_64 "u  %-11s %-44s @ 0x%" FMT_64 "x      ",
+  s.sprnt("\r[hexport] %" FMT_64 "u/%" FMT_64 "u  %-11s %-40s @ 0x%" FMT_64 "x  %6.1fs  %5.1f fn/s   ",
           uint64(processed), uint64(get_func_qty()),
-          op, (name != nullptr && *name != '\0') ? name : "?", uint64(ea));
+          op, (name != nullptr && *name != '\0') ? name : "?", uint64(ea),
+          elapsed, rate);
   write_err(s);
 }
 
@@ -70,6 +75,7 @@ bool McpCommands::open(const char *file_path, bool run_auto)
     return false;
   is_open = true;
   processed = 0;
+  t_start_100ns = KUser::get_instance().interrupt_time_100ns();   // start the KUSER elapsed timer
   hexrays_ok = init_hexrays_plugin();
   return true;
 }

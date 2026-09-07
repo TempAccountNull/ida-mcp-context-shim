@@ -443,25 +443,14 @@ def fetch_decompile(client: CurlMcpClient, addr: str) -> str:
     return code
 
 
-def fetch_callees(client: CurlMcpClient, addr: str) -> list[dict[str, Any]]:
-    result = normalize_tool_item(client.call_tool("callees", {"addrs": addr, "limit": 500}))
-    if isinstance(result, list) and result:
-        return list(result[0].get("callees") or [])
-    if isinstance(result, dict):
-        return list(result.get("callees") or [])
-    return []
-
-
-
-
 def fetch_direct_code_edges(client: CurlMcpClient, addr: str, page_size: int, function_timeout: int = 300) -> list[dict[str, str]]:
     """Return direct CALL and cross-function JMP targets in instruction order.
 
-    The normal ``callees`` tool does not include tail transfers implemented as
-    ``jmp other_function``. This walks the real disassembly and resolves each
-    direct target to its containing canonical IDA function. Register/memory
-    indirect transfers are intentionally skipped because they have no concrete
-    static destination.
+    A callee list built only from ``call`` targets would miss tail transfers
+    implemented as ``jmp other_function``. This walks the real disassembly and
+    resolves each direct target to its containing canonical IDA function.
+    Register/memory indirect transfers are intentionally skipped because they
+    have no concrete static destination.
     """
     started = time.monotonic()
     deadline = started + function_timeout if function_timeout > 0 else None
