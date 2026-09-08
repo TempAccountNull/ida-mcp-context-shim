@@ -3,7 +3,6 @@
 #include "json_util.hpp"
 #include "raw_io.hpp"
 #include "strhash.hpp"
-#include <iostream>
 
 #pragma comment(lib, "ws2_32.lib")   // M4 HTTP transport (Winsock)
 
@@ -205,8 +204,8 @@ void Mcp::handle_request(const jobj_t &req)
 
 int Mcp::run_stdio()
 {
-  std::string line;
-  while ( std::getline(std::cin, line) )
+  kstl::string line;
+  while ( read_line(&line) )
   {
     if ( line.empty() )
       continue;
@@ -247,39 +246,39 @@ static void send_all(SOCKET c, const char *p, size_t n)
 
 void Mcp::handle_http_client(SOCKET c)
 {
-  std::string buf;
+  kstl::string buf;
   char tmp[8192];
-  size_t hdr_end;
-  while ( (hdr_end = buf.find("\r\n\r\n")) == std::string::npos )
+  unsigned hdr_end;
+  while ( (hdr_end = buf.find("\r\n\r\n")) == kstl::string::npos )
   {
     int r = recv(c, tmp, sizeof(tmp), 0);
     if ( r <= 0 )
       return;
-    buf.append(tmp, size_t(r));
+    buf.append(tmp, unsigned(r));
     if ( buf.size() > (16u << 20) )   // 16 MB header guard
       return;
   }
-  std::string head = buf.substr(0, hdr_end);
+  kstl::string head = buf.substr(0, hdr_end);
 
-  size_t clen = 0;   // case-insensitive Content-Length
-  for ( size_t i = 0; i + 15 <= head.size(); ++i )
+  unsigned clen = 0;   // case-insensitive Content-Length
+  for ( unsigned i = 0; i + 15 <= head.size(); ++i )
   {
     if ( (head[i] | 0x20) == 'c' && _strnicmp(head.c_str() + i, "content-length:", 15) == 0 )
     {
-      clen = size_t(strtoull(head.c_str() + i + 15, nullptr, 10));
+      clen = unsigned(strtoull(head.c_str() + i + 15, nullptr, 10));
       break;
     }
   }
-  size_t body_start = hdr_end + 4;
+  unsigned body_start = hdr_end + 4;
   while ( buf.size() - body_start < clen )
   {
     int r = recv(c, tmp, sizeof(tmp), 0);
     if ( r <= 0 )
       break;
-    buf.append(tmp, size_t(r));
+    buf.append(tmp, unsigned(r));
   }
 
-  bool is_post = head.compare(0, 5, "POST ") == 0;
+  bool is_post = head.starts_with("POST ");
   qstring reply = is_post ? dispatch_line(buf.substr(body_start, clen).c_str()) : qstring();
 
   qstring hdr;

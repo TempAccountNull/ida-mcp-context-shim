@@ -75,10 +75,40 @@ public:
   const T *begin() const noexcept { return _first; }
   const T *end() const noexcept   { return _last; }
 
+  const T *cbegin() const noexcept { return _first; }
+  const T *cend() const noexcept   { return _last; }
+
   T &operator[](unsigned i) noexcept             { return _first[i]; }
   const T &operator[](unsigned i) const noexcept { return _first[i]; }
   T &front() noexcept                            { return *_first; }
   T &back() noexcept                             { return _last[-1]; }
+  const T &front() const noexcept                { return *_first; }
+  const T &back() const noexcept                 { return _last[-1]; }
+
+  // Checked accessor. Returns nullptr for an out-of-range index rather than throwing or trapping:
+  // there are no exceptions here, and this is the same shape the rest of the library already uses
+  // for "not there" -- hash_map::find returns nullptr, string::find returns npos.
+  T *at(unsigned i) noexcept             { return i < size() ? _first + i : nullptr; }
+  const T *at(unsigned i) const noexcept { return i < size() ? _first + i : nullptr; }
+
+  void swap(vector &o) noexcept
+  {
+    T *f = _first, *l = _last, *e = _end;
+    _first = o._first; _last = o._last; _end = o._end;
+    o._first = f; o._last = l; o._end = e;
+  }
+
+  void shrink_to_fit()
+  {
+    if ( capacity() == size() )
+      return;
+    if ( empty() )
+    {
+      _free();
+      return;
+    }
+    _reallocate(size());
+  }
 
   void clear() noexcept
   {
@@ -211,6 +241,18 @@ public:
     ++_last;
   }
 
+  bool operator==(const vector &o) const
+  {
+    if ( size() != o.size() )
+      return false;
+    for ( unsigned i = 0, n = size(); i < n; ++i )
+      if ( !(_first[i] == o._first[i]) )
+        return false;
+    return true;
+  }
+
+  bool operator!=(const vector &o) const { return !(*this == o); }
+
 private:
   static void _destroy(T *b, T *e) noexcept
   {
@@ -228,8 +270,13 @@ private:
     unsigned old_cap = capacity();
     unsigned geo = old_cap + old_cap / 2;                 // 1.5x geometric growth
     unsigned new_cap = geo < min_cap ? min_cap : geo;     // ...at least what's needed
-    if ( new_cap == 0 )
-      new_cap = 1;
+    _reallocate(new_cap == 0 ? 1 : new_cap);
+  }
+
+  // Move every element into a block of exactly new_cap and free the old one. Split out of _grow_to
+  // so shrink_to_fit can reuse it; new_cap must be >= size().
+  void _reallocate(unsigned new_cap)
+  {
     T *nb = static_cast<T *>(::operator new(static_cast<unsigned long long>(new_cap) * sizeof(T)));
     unsigned n = size();
     if constexpr ( __is_trivially_copyable(T) )

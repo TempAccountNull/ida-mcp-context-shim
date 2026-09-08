@@ -1,48 +1,12 @@
-// kstl algorithms -- our own, from scratch (microsoft/STL is reference only). No STL, no
-// #includes. The centerpiece is sort(): introsort (quicksort + heapsort fallback + insertion
-// sort for small runs), so it is guaranteed O(n log n) worst case -- never the O(n^2) a plain
-// quicksort can hit on an adversarial big IDB. Operates on raw pointers, which is exactly what
-// kstl::vector's begin()/end() return: kstl::sort(v.begin(), v.end()).
+// kstl algorithms -- our own, from scratch. No STL, no #includes; microsoft/STL in ref/ is read
+// for ideas, never included. Operates on raw pointers, which is what kstl::vector's begin()/end()
+// return: kstl::sort(v.begin(), v.end()).
 //
-// sort() is a pdqsort-style two-way quicksort: a Tukey-ninther pivot sampled at n/8 and chosen by
-// selection, a partition costing ONE comparison per element, duplicates handled by partition_left,
-// a bounded insertion sort for ranges the partition reports as already ordered, and a single
-// monotonic-run check at the entry point.
-//
-// SIX schemes were built and measured against each other and std::sort over 14 input shapes, and
-// the two finalists were then measured again inside the real library over all 23 benchmark rows.
-// Full tables in doc/sort-benchmarks.md. Geometric mean speedup vs std::sort, 14 shapes:
-//
-//      variant                                                     geomean   shapes below 1.0x
-//      Lomuto two-way + middle pivot          (the original)         0.44x   6 of 8
-//      pdq-D  clustered sampling, selecting                          1.22x   4
-//      Bentley-McIlroy three-way + spread ninther                    1.24x   2
-//      pdq-C  spread sampling, mutating sort3                        1.36x   2
-//      pdq-B  spread sampling, selecting                             1.48x   1
-//      pdq-A  pdqsort as published: clustered, mutating sort3        1.60x   3
-//   >> this   pdq-B + the entry scan below                           1.88x   0
-//
-// Three results from that grid are worth keeping:
-//
-//   Sampling and selection are NOT independent. Clustered+mutating (pdq-A) sorts a reversed array
-//   in 10.5x, but clustered+selecting (pdq-D) manages 0.66x and spread+mutating (pdq-C) 1.29x --
-//   so neither property alone explains it. Meanwhile clustering costs organ-pipe data 0.76x against
-//   1.45x, because pdqsort's nine samples sit at the ends and the middle and organ-pipe data hides
-//   its peak exactly in the middle. Spread sampling at n/8 is what fixes that.
-//
-//   pdqsort as published was measured and NOT adopted. Its geometric-mean lead over spread sampling
-//   came entirely from the one reversed-array row: drop that row and it scores 1.35x against 1.47x,
-//   and it is behind on 8 of the other 13 shapes. The entry scan buys that row far more cheaply.
-//
-//   The entry scan is why every shape now wins. It walks in whichever direction the first pair
-//   points and stops at the first pair that breaks the pattern, so random input pays two
-//   comparisons. Descending end to end means reverse and return; never descending means the range
-//   is already sorted and there is nothing to do at all. That second case is what an ALL-EQUAL
-//   array is, and it is the reason that shape went from 0.75x -- the one thing every quicksort
-//   variant here lost to std::sort -- to 1.50x. Do not over-read it, though: it recognises a run
-//   spanning the WHOLE range and nothing weaker, so a mostly-sorted array still takes the ordinary
-//   path (which is why the nearly-sorted and sorted-plus-random-tail rows barely moved: 1.24x and
-//   1.45x, so the scan it wastes on them costs nothing measurable).
+// sort() is a pdqsort-style introsort: ninther pivot sampled at n/8, a two-way partition costing
+// one comparison per element, partition_left for duplicates, a bounded insertion sort for ranges
+// that come back already ordered, and a monotonic-run check at the entry. Heapsort backstop keeps
+// the worst case O(n log n). Six variants were built and measured to arrive at this; the tables and
+// the rejected ones are in doc/sort-benchmarks.md rather than here.
 #pragma once
 
 namespace kstl {
@@ -142,10 +106,8 @@ inline void heap_sort(T *first, T *last, C comp)
   }
 }
 
-// Point at the median of three WITHOUT moving anything. A median-of-three pivot is what keeps
-// sorted, reverse-sorted and organ-pipe inputs from being worst cases -- a fixed choice (first,
-// last, or middle) is a worst case for SOME common shape, and real data is full of common shapes.
-// Selecting rather than swapping leaves the caller's array untouched until the single pivot swap.
+// Median of three, selected rather than swapped into place: the array is untouched until the one
+// pivot swap. A fixed pivot (first, last or middle) is a worst case for some common shape.
 template <class T, class C>
 inline T *median3(T *a, T *b, T *c, C comp)
 {
@@ -154,19 +116,11 @@ inline T *median3(T *a, T *b, T *c, C comp)
   return comp(*c, *b) ? b : (comp(*c, *a) ? c : a);
 }
 
-// ---- partitioning -------------------------------------------------------------------------
-//
-// Two-way, one comparison per element, with duplicates handled separately (partition_left below).
-// The three-way Bentley-McIlroy partition this replaced asked TWO comparisons per element -- is it
-// <= the pivot, and is it also >= it -- and for distinct data the second never fires but is always
-// paid. That cost showed up worst where a comparison is expensive: sorting 100k heap-allocated
-// strings ran at 0.97x of std::sort with three-way and 1.25x with two-way.
-//
-// The scan loops carry NO bounds test. They are safe because the pivot is a median: at least one
-// element in (first, last) is >= it, which stops the rightward scan, and once the rightward scan
-// has moved past first+1 there is an element < the pivot to stop the leftward scan (the case where
-// it has not is guarded explicitly). That is verified rather than assumed -- the bake-off harness
-// sorts 6000 random arrays of every shape inside guard words and checks the guards are untouched.
+// SAFETY, for everything below: the scan loops carry no bounds test. They terminate because the
+// pivot is a median -- at least one element in (first, last) is >= it, stopping the rightward scan,
+// and once that scan has passed first+1 there is an element < the pivot to stop the leftward one.
+// The single case where that does not hold is guarded explicitly. sortcmp.cpp checks this rather
+// than trusting it: 6000 random arrays per shape sorted inside guard words, guards verified intact.
 
 // Put the chosen pivot at *first. Nine samples spread at n/8 for a range over 16, three otherwise.
 template <class T, class C>
@@ -176,20 +130,13 @@ inline void choose_pivot(T *first, T *last, C comp)
   T *pm = first + n / 2;
   if ( n > 16 )
   {
-    // Tukey's ninther. Median-of-three looks only at the ends and the middle, which structured
-    // input defeats -- an organ-pipe array has its largest values in the middle, so three-point
-    // sampling picks near the maximum every time.
+    // Tukey's ninther. Three-point sampling looks only at the ends and the middle, which structured
+    // input defeats -- organ-pipe data hides its peak in the middle. Samples are SPREAD at n/8
+    // rather than clustered as pdqsort does; clustering costs organ pipe 0.76x against 1.45x.
     //
-    // The threshold is 16 and NOT the 40 of Bentley and McIlroy's paper, which is a measured
-    // difference rather than a preference. Comparisons in units of n log n, 300k unsigned:
-    //           threshold:      16     32     40     64    128
-    //      reverse-sorted:    1.70   1.70   2.29   2.29   3.25   (33% heapsorted at 128)
-    //          organ pipe:    1.53   1.55   1.57   1.60   1.67
-    //              random:    1.56   1.56   1.55   1.56   1.56
-    // The cliff between 32 and 40 is the whole story: sub-ranges of roughly 40-128 elements coming
-    // out of a partitioned reversed array defeat a three-point median completely and split
-    // (n-2, 1, 1). That is the textbook quicksort worst case, and it burns one unit of the depth
-    // budget per element until introsort gives up and heapsorts a third of the array.
+    // The threshold is 16, not the 40 of Bentley and McIlroy's paper. Above ~32 the sub-ranges that
+    // come out of partitioning a reversed array start splitting (n-2, 1, 1) and burn the depth
+    // budget: at 128 a third of that input ends up in the heapsort backstop. Sweep in the doc.
     long long s = n / 8;
     T *lo = median3(first, first + s, first + 2 * s, comp);
     T *mi = median3(pm - s, pm, pm + s, comp);
@@ -203,9 +150,8 @@ inline void choose_pivot(T *first, T *last, C comp)
   swap(*first, *pm);
 }
 
-// Partition around the pivot at *first. Returns where the pivot ended up, and sets *already when
-// nothing had to cross it -- the signature of data that was already in order, which the caller
-// exploits with partial_insertion_sort.
+// Two-way partition around the pivot at *first. Returns where the pivot landed; sets *already when
+// nothing had to cross it, which is the signature of data that was already in order.
 template <class T, class C>
 inline T *partition_right(T *first, T *last, C comp, bool *already)
 {
@@ -244,11 +190,9 @@ inline T *partition_right(T *first, T *last, C comp, bool *already)
   return pivot_pos;
 }
 
-// Partition putting everything EQUAL to the pivot on the left. Only valid when the pivot is known
-// to equal the parent's pivot, which is exactly when every element equal to it is inside this
-// range. This is what keeps duplicate-heavy input linear without taxing distinct data: an array of
-// one repeated value is finished by one of these, instead of splitting (0, n-1) forever the way a
-// plain two-way partition does.
+// Partition putting everything EQUAL to the pivot on the left. Only valid when the pivot equals the
+// parent's pivot, which is exactly when every element equal to it is inside this range. This is how
+// duplicates stay linear without a second comparison per element taxing distinct data.
 template <class T, class C>
 inline T *partition_left(T *first, T *last, C comp)
 {
@@ -286,14 +230,10 @@ inline T *partition_left(T *first, T *last, C comp)
   return pivot_pos;
 }
 
-// Insertion sort that gives up. Runs at most LIMIT element moves in total and reports whether it
-// finished; a caller that gets false must sort the range properly, and the partial work it did is
-// still a valid permutation, so nothing is lost.
-//
-// This is what makes already-ordered input linear. A partition that moved nothing across the pivot
-// says the range was ALREADY partitioned, and for ordered data this then finishes in one scan with
-// zero moves -- sorted input went from 0.82x of std::sort to 14.3x. Random data essentially never
-// reports "already partitioned", so it never pays for this.
+// Insertion sort that gives up after LIMIT element moves and says whether it finished. A caller
+// that gets false must sort the range properly; the partial work is still a valid permutation.
+// Called only when a partition reports the range was already partitioned, which random data
+// essentially never does, so random input never pays for it.
 template <class T, class C>
 inline bool partial_insertion_sort(T *first, T *last, C comp)
 {
@@ -331,8 +271,8 @@ inline int ilog2(long n)
   return k;
 }
 
-// leftmost says whether *(first-1) exists and holds the parent's pivot. Only a non-leftmost range
-// can use the equal-pivot shortcut, because only then is there a predecessor to compare against.
+// leftmost says whether *(first-1) exists and holds the parent's pivot -- only then is the
+// equal-pivot shortcut below available.
 template <class T, class C>
 inline void introsort(T *first, T *last, int depth, C comp, bool leftmost)
 {
@@ -347,9 +287,8 @@ inline void introsort(T *first, T *last, int depth, C comp, bool leftmost)
     long long n = last - first;
     choose_pivot(first, last, comp);
 
-    // *(first-1) is the parent's pivot and is <= everything here. If it is ALSO not less than our
-    // pivot the two are equal, so every element equal to it lies in this range: peel them all off
-    // to the left in one pass and continue with only what is strictly greater.
+    // *(first-1) is the parent's pivot and is <= everything here. If it is also not less than ours
+    // the two are equal, so every element equal to it lies in this range: peel them off in one pass.
     if ( !leftmost && !comp(*(first - 1), *first) )
     {
       first = partition_left(first, last, comp) + 1;
@@ -368,7 +307,7 @@ inline void introsort(T *first, T *last, int depth, C comp, bool leftmost)
       && partial_insertion_sort(pivot_pos + 1, last, comp) )
       return;                             // the range was already ordered; nothing left to do
 
-    // Recurse into the SMALLER side and loop on the larger, so the live stack stays O(log n).
+    // Recurse the smaller side, loop on the larger: live stack stays O(log n).
     if ( lsize < rsize )
     {
       introsort(first, pivot_pos, depth, comp, leftmost);
@@ -391,10 +330,11 @@ inline void sort(T *first, T *last, C comp)
 {
   if ( last - first > 1 )
   {
-    // One entry scan, in whichever direction the first pair points. A range that is descending end
-    // to end is sorted by reversing it; a range that never descends is already sorted and needs
-    // nothing at all -- and that second case is what an all-equal array is. Both scans stop at the
-    // first pair that breaks the pattern, so random input pays two comparisons for the pair.
+    // One scan, in whichever direction the first pair points. Descending end to end means reverse
+    // and return; never descending means already sorted, return. The second case is what an
+    // all-equal array is -- the one shape every partition scheme here lost to std::sort. Both stop
+    // at the first pair that breaks the pattern, so anything else pays two comparisons.
+    // It recognises a run spanning the WHOLE range and nothing weaker.
     T *p = first + 1;
     if ( comp(*p, *(p - 1)) )
     {

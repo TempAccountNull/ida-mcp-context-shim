@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "name_clean.hpp"
 #include "mcp_commands.hpp"
 #include "json_util.hpp"
 #include "raw_io.hpp"
@@ -37,28 +38,7 @@ qstring McpCommands::module_name() const
   if ( get_root_filename(buf, sizeof(buf)) <= 0 )
     return qstring("target");
 
-  std::string s(buf);
-  size_t slash = s.find_last_of("\\/");
-  if ( slash != std::string::npos )
-    s = s.substr(slash + 1);
-
-  std::string stem = s, ext;
-  size_t dot = s.find_last_of('.');
-  if ( dot != std::string::npos && dot != 0 )
-  {
-    stem = s.substr(0, dot);
-    ext = s.substr(dot);
-  }
-
-  stem = std::regex_replace(stem, std::regex(R"(\s*-\s*copy(\s*\(\d+\))?\s*$)", std::regex::icase), "");
-  stem = std::regex_replace(stem, std::regex(R"(\s*\(\d+\)\s*$)"), "");
-  while ( !stem.empty() && stem.back() == ' ' )
-    stem.pop_back();
-  if ( stem.empty() )
-    stem = "target";
-
-  std::string res = stem + ext;
-  return qstring(res.c_str());
+  return qstring(hexport::clean_module_name(buf).c_str());
 }
 
 //-------------------------------------------------------------------------

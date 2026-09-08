@@ -3,50 +3,20 @@
 // vector.hpp, for the tagged placement-new (place_t) used to build entries in raw storage, so K and
 // V may be any type.
 //
-// Five things make it fast, and every one of them was picked by measurement (see the notes at
-// the bottom for what LOST):
+// The design in one paragraph: a key's hash is multiplied by 2^64/phi and the top bits index an
+// array of entries holding key and value together, alongside a dense array of one state byte per
+// slot carrying a 7-bit fingerprint of the key. The home slot is addressed by the hash alone, so
+// its entry load issues in PARALLEL with its state load -- that is the property everything else is
+// arranged around. Misses and collisions fall into a triangular group probe, sixteen state bytes
+// per SSE compare, and the fingerprint means an occupied-but-wrong slot touches the entry array
+// with probability 1/128. Fill is 7/8, and a table filled by tombstones rebuilds at the same
+// capacity rather than doubling, so erase/insert churn cannot grow the map.
 //
-//   1. Fibonacci bucketing. Multiply the key's 64-bit hash by 2^64/phi and keep the top bits.
-//      Mixes far better than masking a raw hash, so probe chains stay short. The FIRST probed slot
-//      needs nothing but the hash, so its entry load issues in PARALLEL with its state load -- the
-//      single most important property here, and the one a pure group scan gives up (a slot found
-//      through a loaded control byte serialises its entry load behind that load).
-//
-//   2. Key and value stored together in one entry array. A hit touches one entry cache line
-//      rather than two separate key/value streams, and an insert writes one stream, not two.
-//
-//   3. A 7-bit fingerprint of the key packed into the state byte. A probe compares the
-//      fingerprint before the key, so an occupied-but-wrong slot touches the entry array with
-//      probability 1/128 instead of certainty. That is what makes long probe chains cheap: the
-//      whole walk stays inside one cache line of the dense state array (64 slots per line).
-//
-//   4. A 7/8 fill, the same as phmap. Anything lower spends a whole extra doubling at the sizes
-//      where the two disagree (N=100k and N=200k), and that 2x memory -- not probe length -- was
-//      what lost those rows outright. See _max_fill. A full table is rebuilt at the same capacity
-//      when tombstones rather than live entries filled it, so insert/erase churn does not grow the
-//      map: 2M erase+insert pairs over a constant 50k live set held capacity at 65536, where
-//      doubling unconditionally took it to 524288 and never gave it back.
-//
-//   5. Triangular group probing, sixteen slots per SSE compare -- the same probe sequence phmap
-//      uses, and the reason neither of us suffers the primary clustering that a linear walk builds
-//      up at a 7/8 fill. Lookup, insert and rehash all share it (see the note on _set_state); they
-//      have to, or a key would sit where no lookup probes. The lookup still opens with a direct,
-//      hash-addressed probe of the home slot, which keeps property 1 for the common hit and answers
-//      the common miss with one byte load.
-//
-// Measured against phmap::flat_hash_map (parallel-hashmap) and std::unordered_map over 170 rows
-// (5 sizes x 8 key distributions x 8 workloads, median of 11 interleaved runs, paired sign test).
-// Quoted from two back-to-back runs of this exact binary, because one run cannot tell a real loss
-// from run-to-run drift -- the paired test only protects the kstl-vs-phmap comparison INSIDE a run:
-//      146 win / 10 tie / 14 loss  and  146 win / 9 tie / 15 loss  vs phmap, geomean 1.38x / 1.36x
-//      166 of 170 vs std::unordered_map
-// Nine rows lose to phmap in every run. They are named at the bottom with their cause, and none is
-// a probing problem any more: what is left is one mispredicting branch on a 144 KB table, streaming
-// 16 MB of 64-byte values, and hashing 40-byte string keys. Another six straddle the +/-3% band and
-// change sign between runs; those are named too, so nobody chases one. Do not read a single run's
-// tally as a ranking -- rerunning the same binary moves it by a row or two.
+// 146 win / 10 tie / 14 loss vs phmap (geomean 1.38x), 166 of 170 vs std::unordered_map.
+// Measurements, rejected designs and the remaining losses: doc/hash-map-benchmarks.md.
 #pragma once
 #include "vector.hpp"
+#include "pair.hpp"    // kstl::pair, for what an iterator dereferences to
 #include "hash.hpp"     // kstl::hash<K> (identity for integers, hash_bytes for the rest)
 #include "intrin/x64.hpp"    // _mm_prefetch, _BitScanForward/64 -- header-free, generated from the toolset
 #include "intrin/sse2.hpp"   // __m128i and the SSE2 group scan; only these two families, not the umbrella
@@ -91,8 +61,89 @@ public:
 
   ~hash_map() { _clear_and_free(); }
 
-  unsigned size() const noexcept { return _size; }
-  bool empty() const noexcept    { return _size == 0; }
+  unsigned size() const noexcept         { return _size; }
+  bool empty() const noexcept            { return _size == 0; }
+  unsigned bucket_count() const noexcept { return _cap; }
+  float load_factor() const noexcept     { return _cap == 0 ? 0.0f : static_cast<float>(_size) / static_cast<float>(_cap); }
+  unsigned count(const K &key) const noexcept { return contains(key) ? 1u : 0u; }
+
+  // Forward iterator over the occupied slots. for_each is still the fast way to walk the whole map
+  // -- it reads the state array eight bytes at a time and prefetches ahead -- but an iterator is
+  // what range-for and generic code need, so both exist.
+  class iterator
+  {
+  public:
+    iterator() noexcept : _m(nullptr), _i(0) {}
+    iterator(hash_map *m, unsigned i) noexcept : _m(m), _i(i) { _skip(); }
+
+    pair<const K &, V &> operator*() const noexcept
+    {
+      return pair<const K &, V &>(_m->_ent[_i].key, _m->_ent[_i].val);
+    }
+    const K &key() const noexcept { return _m->_ent[_i].key; }
+    V &value() const noexcept     { return _m->_ent[_i].val; }
+
+    iterator &operator++() noexcept { ++_i; _skip(); return *this; }
+    bool operator==(const iterator &o) const noexcept { return _i == o._i; }
+    bool operator!=(const iterator &o) const noexcept { return _i != o._i; }
+
+  private:
+    // Hoist the map's fields out of the loop. Written as _m->_cap / _m->_state[_i] this reloads
+    // the map pointer, the capacity and the state pointer on every step -- three dependent loads
+    // per slot skipped, on a walk whose whole job is skipping.
+    void _skip() noexcept
+    {
+      const unsigned cap = _m->_cap;
+      const unsigned char *st = _m->_state;
+      unsigned i = _i;
+      while ( i < cap && st[i] < FULL_MIN )
+        ++i;
+      _i = i;
+    }
+    hash_map *_m;
+    unsigned _i;
+  };
+
+  class const_iterator
+  {
+  public:
+    const_iterator() noexcept : _m(nullptr), _i(0) {}
+    const_iterator(const hash_map *m, unsigned i) noexcept : _m(m), _i(i) { _skip(); }
+
+    pair<const K &, const V &> operator*() const noexcept
+    {
+      return pair<const K &, const V &>(_m->_ent[_i].key, _m->_ent[_i].val);
+    }
+    const K &key() const noexcept   { return _m->_ent[_i].key; }
+    const V &value() const noexcept { return _m->_ent[_i].val; }
+
+    const_iterator &operator++() noexcept { ++_i; _skip(); return *this; }
+    bool operator==(const const_iterator &o) const noexcept { return _i == o._i; }
+    bool operator!=(const const_iterator &o) const noexcept { return _i != o._i; }
+
+  private:
+    // Hoist the map's fields out of the loop. Written as _m->_cap / _m->_state[_i] this reloads
+    // the map pointer, the capacity and the state pointer on every step -- three dependent loads
+    // per slot skipped, on a walk whose whole job is skipping.
+    void _skip() noexcept
+    {
+      const unsigned cap = _m->_cap;
+      const unsigned char *st = _m->_state;
+      unsigned i = _i;
+      while ( i < cap && st[i] < FULL_MIN )
+        ++i;
+      _i = i;
+    }
+    const hash_map *_m;
+    unsigned _i;
+  };
+
+  iterator begin() noexcept             { return iterator(this, 0); }
+  iterator end() noexcept               { return iterator(this, _cap); }
+  const_iterator begin() const noexcept { return const_iterator(this, 0); }
+  const_iterator end() const noexcept   { return const_iterator(this, _cap); }
+  const_iterator cbegin() const noexcept { return const_iterator(this, 0); }
+  const_iterator cend() const noexcept   { return const_iterator(this, _cap); }
 
   // Pre-size for at least n entries so a bulk insert never rehashes.
   void reserve(unsigned n)
@@ -129,21 +180,86 @@ public:
   V &operator[](const K &key)
   {
     unsigned i;
-    if ( _emplace_slot(key, i) )
-      ::new (static_cast<void *>(&_ent[i].val), place_t{}) V();
-    return _ent[i].val;
+    const bool created = this->_emplace_slot(key, i);
+    entry_t *e = this->_ent + i;      // bound after _emplace_slot: it can rehash and move _ent
+    if ( created )
+      ::new (static_cast<void *>(&e->val), place_t{}) V();
+    return e->val;
   }
 
   bool insert(const K &key, const V &val)
   {
     unsigned i;
-    bool created = _emplace_slot(key, i);
+    const bool created = this->_emplace_slot(key, i);
+    entry_t *e = this->_ent + i;      // bound after _emplace_slot: it can rehash and move _ent
     if ( created )
-      ::new (static_cast<void *>(&_ent[i].val), place_t{}) V(val);
+      ::new (static_cast<void *>(&e->val), place_t{}) V(val);
     else
-      _ent[i].val = val;
+      e->val = val;
     return created;
   }
+
+  bool insert(const K &key, V &&val)
+  {
+    unsigned i;
+    const bool created = this->_emplace_slot(key, i);
+    entry_t *e = this->_ent + i;      // bound after _emplace_slot: it can rehash and move _ent
+    if ( created )
+      ::new (static_cast<void *>(&e->val), place_t{}) V(static_cast<V &&>(val));
+    else
+      e->val = static_cast<V &&>(val);
+    return created;
+  }
+
+  // Overwrites an existing value; returns true when the key was new. Same thing insert() does, but
+  // named the way the STL names it, so generic code reads the same.
+  bool insert_or_assign(const K &key, const V &val) { return insert(key, val); }
+
+  // Leaves an existing value alone. Returns true when the key was new.
+  bool try_emplace(const K &key, const V &val)
+  {
+    unsigned i;
+    if ( !this->_emplace_slot(key, i) )
+      return false;
+    ::new (static_cast<void *>(&this->_ent[i].val), place_t{}) V(val);
+    return true;
+  }
+
+  // Construct the value in place from whatever V's constructor takes -- no temporary V is built.
+  template <class... A>
+  bool emplace(const K &key, A &&...a)
+  {
+    unsigned i;
+    if ( !this->_emplace_slot(key, i) )
+      return false;
+    ::new (static_cast<void *>(&this->_ent[i].val), place_t{}) V(static_cast<A &&>(a)...);
+    return true;
+  }
+
+  void swap(hash_map &o) noexcept
+  {
+    unsigned char *s = _state; entry_t *e = _ent;
+    unsigned c = _cap, z = _size, t = _tombs, sh = _shift;
+    _state = o._state; _ent = o._ent; _cap = o._cap; _size = o._size; _tombs = o._tombs; _shift = o._shift;
+    o._state = s; o._ent = e; o._cap = c; o._size = z; o._tombs = t; o._shift = sh;
+  }
+
+  // Order-independent, as it must be: two maps holding the same pairs can have completely different
+  // slot layouts, since layout depends on insertion order and on the capacity each grew through.
+  bool operator==(const hash_map &o) const
+  {
+    if ( _size != o._size )
+      return false;
+    for ( const_iterator it = begin(); it != end(); ++it )
+    {
+      const V *v = o.find(it.key());
+      if ( v == nullptr || !(*v == it.value()) )
+        return false;
+    }
+    return true;
+  }
+
+  bool operator!=(const hash_map &o) const { return !(*this == o); }
 
   bool erase(const K &key) noexcept
   {
@@ -189,8 +305,20 @@ public:
   template <class F>
   void for_each(F f)
   {
+    // Bound once, not re-read per slot. f is an arbitrary callable, so without these locals the
+    // compiler has to reload _state, _ent and _cap after EVERY call to it -- it cannot know that f
+    // does not touch the map. That is three dependent loads per live entry on the hottest walk in
+    // the class. The flip side is the contract: f must not insert into or erase from the map, which
+    // could rehash and free the array out from under this walk. Same rule as invalidating an
+    // iterator; use the erase-collect-then-apply pattern if you need to mutate.
+    const unsigned char *st = this->_state;
+    entry_t *ent = this->_ent;
+    const unsigned cap = this->_cap;
+    if ( ent == nullptr )
+      return;
+
     unsigned i = 0;
-    for ( ; i + 8 <= _cap; i += 8 )
+    for ( ; i + 8 <= cap; i += 8 )
     {
       // Pull the entry line for a slot some way ahead. Iteration is the one place where prefetching
       // is unambiguously right -- unlike find(), which must not touch an entry it may never read,
@@ -205,21 +333,21 @@ public:
       // stream itself and there is no latency left for a hint to hide, and the hardware prefetcher
       // already has a purely sequential walk figured out. The gain landed instead on the small and
       // mid-size maps, where several entries share a line -- 10k iterate went 2.4-2.8x to 4.5-4.9x.
-      if ( i + PF_SLOTS < _cap )
-        _pf(&_ent[i + PF_SLOTS]);
-      unsigned long long occupied = *reinterpret_cast<const unsigned long long *>(_state + i) & MSBS;
+      if ( i + PF_SLOTS < cap )
+        _pf(ent + i + PF_SLOTS);
+      unsigned long long occupied = *reinterpret_cast<const unsigned long long *>(st + i) & MSBS;
       while ( occupied != 0 )
       {
         unsigned long idx;
         _BitScanForward64(&idx, occupied);
-        unsigned j = i + (static_cast<unsigned>(idx) >> 3);
-        f(_ent[j].key, _ent[j].val);
+        entry_t *e = ent + i + (static_cast<unsigned>(idx) >> 3);
+        f(e->key, e->val);
         occupied &= occupied - 1;                    // clear the slot we just visited
       }
     }
-    for ( ; i < _cap; ++i )                          // tail: fewer than 8 slots left
-      if ( _state[i] >= FULL_MIN )
-        f(_ent[i].key, _ent[i].val);
+    for ( ; i < cap; ++i )                           // tail: fewer than 8 slots left
+      if ( st[i] >= FULL_MIN )
+        f(ent[i].key, ent[i].val);
   }
 
   template <class F>
@@ -664,83 +792,8 @@ private:
   unsigned _shift;         // 64 - log2(cap), for Fibonacci bucketing
 };
 
-// ---------------------------------------------------------------------------------------------
-// Rejected by measurement, so nobody re-tries them:
-//
-//  * Separate _keys and _vals arrays (the original layout). Three streams per hit; replacing them
-//    with one entry array was worth 1.34x-1.56x at 4M.
-//  * State byte packed into the key array (struct{state,key}[]). The dense state array holds 64
-//    slots per cache line, so a probe walk stays in one line; packing drops that to 8 and it lost
-//    at 100k and 1M, winning only 4M hits.
-//  * SWAR group scanning: fingerprints matched 8-at-a-time in a general-purpose register instead of
-//    with SSE. Slower at every size (10k random lookups 0.36/0.30/0.31x against 0.48/0.35/0.37x for
-//    the design of the day), and it carries borrow/masking hazards SSE does not.
-//  * Prefetching the entry inside find(). See the note in find().
-//  * Dropping the home-slot probe and letting the group scan handle everything (a pure Swiss-table
-//    lookup). It WON every all-miss row -- 100k clustered 0.70x -> 1.36x, 100k random 0.85x -> 1.19x
-//    -- and broke 50%-miss everywhere at the same time: sequential 1.43x -> 0.63x, spread
-//    1.37x -> 0.76x, clustered 1.29x -> 0.73x. The giveaway was that 50%-miss cost more per op
-//    (5.4 ns) than either pure component (hit 2.5 ns, miss 1.5 ns), i.e. the alternating pattern was
-//    mispredicting, which the home probe's early returns avoid. This is why the home probe survived
-//    the move to group probing: it is measurably redundant work on an occupied-home miss and still
-//    the right trade.
-//  * Gating BOTH home-probe tests on table size, not just the empty one. Fixes 10k random misses
-//    the same way the split gate does, but the hit test is what wins every ordered all-hit row and
-//    losing it costs far more: 10k clustered all-hit 1.42x -> 0.97x, sequential 1.08x -> 0.94x, and
-//    141 win / 12 tie / 17 loss at 1.33x against 144 / 13 / 13 at 1.35x with only 2 significant
-//    losses. The lesson is that the two tests have opposite branch behaviour and must be treated
-//    separately: `s0 == fp` predicts (false ~127/128 on a miss, correlated on ordered keys),
-//    `s0 == EMPTY` does not (a 39/61 coin flip at a 0.61 fill).
-//  * A LINEAR probe sequence (what this was until the group-probing rewrite). It is the reason
-//    2/3 fill was needed: at 7/8 a random-key miss walked ~9 slots with a max chain of 125, and the
-//    whole random-key column paid for it. Held together it scored 148 win / 7 tie / 15 loss at
-//    1.36x; triangular scores 153 / 5 / 12 with the entire random-key-miss and 64-byte-miss loss
-//    classes gone. The switch also deleted a whole regime split -- a cache-resident group scan, a
-//    big-table scalar walk, a SIMD miss shortcut and the _small flag choosing between them -- so
-//    lookup, insert and rehash now share one sequence and the class is ~50 lines shorter.
-//    The prediction that group probing must cost the big-table hit rows turned out to be WRONG,
-//    and worth understanding: it costs them only if you also give up the hash-addressed first
-//    probe. Anchoring the first group at the home slot keeps that, and 4M went 13 win / 2 loss to
-//    15 win / 1 loss across the rewrite.
-//
-// HOW MUCH A ROW IS ALLOWED TO MOVE. Rerunning the SAME binary moves a row's speedup by 0.03x at
-// the median and up to 0.14x at the 90th percentile -- wider than the 3% verdict band. So a single
-// run's tally is worth about +/-2 rows, and a row is only "losing" if it loses in every run. The
-// figures below are the worst and best across four runs, not one run's number.
-//
-// Still losing to phmap, with the reason, so nobody hunts them blind. Nine rows of 170; sequential
-// and addresses keys lose nothing that reproduces:
-//   - 10k random all-hit 0.67-0.75x, 10k random 50%-miss 0.82-0.88x, 100k random 50%-miss
-//     0.81-0.86x. All the SAME cost: the `s0 == fp` test in the home probe is a ~70/30 coin flip
-//     when the keys are random and the lookup is a hit, and on an L2-resident table one mispredict
-//     is most of the lookup. A 50%-miss stream mispredicts it by construction. It cannot simply be
-//     removed -- deleting the home probe takes 10k random to ~0.81x/1.21x but costs every ordered
-//     all-hit row far more (see the rejected entry above). These rows are 0.03-1.4 ms end to end,
-//     2.1-7.0 ns/op.
-//     The all-MISS row at 10k random used to be the worst of that group at 0.71x and is now 1.41x,
-//     reproduced across three runs at 11/11 paired, because that one was the `s0 == EMPTY` coin
-//     flip and that test could be gated on size.
-//   - 200k 64-byte iterate, spread 0.83-0.86x and random 0.81-0.95x, and 1M clustered iterate
-//     0.87-0.94x: bound by streaming the value array, not by probing. The for_each prefetch was
-//     aimed at exactly these and did not move them; the note there says why.
-//   - strkeys len=40 insert 0.81-0.89x: bound by hashing 40-byte keys, not by probing. Two-lane
-//     hashing was tried for this row specifically and measured worse; see hash.hpp.
-//   - 4M spread mixed 0.85-0.94x and 1M clustered unreserved insert 0.91-0.94x. An earlier version
-//     of this note claimed both "have landed on the winning side in other runs" -- four runs say
-//     neither ever did, so that claim was wrong and is withdrawn. They are narrow but real.
-//
-// Straddling the band, sign changes between runs. Listed so nobody optimises for one run's noise:
-// 1M clustered reserved insert 0.87-1.06x, 100k random64 all-hit 0.94-1.41x, 100k addresses
-// all-miss 0.94-1.02x, 100k random64 50%-miss 0.90-0.98x, 10k spread mixed 0.87-1.01x, 100k random
-// all-hit 0.88-0.99x.
-//
-// Losing to std::unordered_map on four rows, stable across every run, and all one artifact rather
-// than a probing problem: the benchmark reserves for N inserts, but the clustered and len=12 key
-// generators emit only ~63k and ~2.6k DISTINCT keys, so the table sits at load 0.01-0.03. Insert
-// then scatters over an 18 MB array and iterate scans 2M state bytes to reach 63k entries, while a
-// node map touches only what it allocated. phmap loses the same rows to std by the same margin (we
-// are 0.91-0.94x of phmap there), so this is inherent to open addressing at a 16x over-reserve and
-// is not worth contorting the map for. Honouring reserve() exactly is the point of reserve().
-// ---------------------------------------------------------------------------------------------
+// Everything that was measured and rejected, the rows that still lose and why, and how much a
+// row is allowed to move between runs: doc/hash-map-benchmarks.md. Kept out of here so the
+// class stays readable -- the comments below are only what a reader needs at the code.
 
 }  // namespace kstl

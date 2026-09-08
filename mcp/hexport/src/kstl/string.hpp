@@ -201,6 +201,10 @@ public:
       delete[] _store.ptr;
   }
 
+  // data() is NOT free: it tests _cap to pick the inline buffer or the heap block. Worse, writing a
+  // char through the returned pointer can alias the string object itself, so the compiler is
+  // obliged to redo that test after any store. Cache it in a local before any loop -- never call it
+  // per iteration.
   const char *c_str() const noexcept { return _large_mode() ? _store.ptr : _store.buf; }
   char *data() noexcept              { return _large_mode() ? _store.ptr : _store.buf; }
   const char *data() const noexcept  { return _large_mode() ? _store.ptr : _store.buf; }
@@ -212,6 +216,19 @@ public:
   char &operator[](unsigned i) noexcept      { return data()[i]; }
   char front() const noexcept                { return data()[0]; }
   char back() const noexcept                 { return data()[_size - 1]; }
+  char &front() noexcept                     { return data()[0]; }
+  char &back() noexcept                      { return data()[_size - 1]; }
+
+  char *begin() noexcept              { return data(); }
+  char *end() noexcept                { return data() + _size; }
+  const char *begin() const noexcept  { return data(); }
+  const char *end() const noexcept    { return data() + _size; }
+  const char *cbegin() const noexcept { return data(); }
+  const char *cend() const noexcept   { return data() + _size; }
+
+  // Checked accessor: nullptr for an out-of-range index, matching vector::at and hash_map::find.
+  char *at(unsigned i) noexcept             { return i < _size ? data() + i : nullptr; }
+  const char *at(unsigned i) const noexcept { return i < _size ? data() + i : nullptr; }
 
   void clear() noexcept { _size = 0; data()[0] = 0; }
   void reserve(unsigned min_cap) { if ( min_cap > _cap ) _grow_to(min_cap); }
@@ -359,6 +376,26 @@ public:
   bool operator<=(const string &o) const noexcept { return compare(o) <= 0; }
   bool operator>=(const string &o) const noexcept { return compare(o) >= 0; }
 
+  // Same three-way compare against a C string. A null pointer is treated as the empty string, the
+  // way strlen_ already treats it -- an invalid argument gives a defined answer, not a fault.
+  int compare(const char *s) const noexcept
+  {
+    unsigned m = detail::strlen_(s);
+    unsigned n = _size < m ? _size : m;
+    const char *a = data();
+    for ( unsigned i = 0; i < n; ++i )
+      if ( a[i] != s[i] )
+        return static_cast<unsigned char>(a[i]) < static_cast<unsigned char>(s[i]) ? -1 : 1;
+    if ( _size != m )
+      return _size < m ? -1 : 1;
+    return 0;
+  }
+
+  bool operator<(const char *s) const noexcept  { return compare(s) < 0; }
+  bool operator>(const char *s) const noexcept  { return compare(s) > 0; }
+  bool operator<=(const char *s) const noexcept { return compare(s) <= 0; }
+  bool operator>=(const char *s) const noexcept { return compare(s) >= 0; }
+
   static const unsigned npos = 0xFFFFFFFFu;
 
   unsigned find(char c, unsigned from = 0) const noexcept
@@ -373,6 +410,90 @@ public:
   unsigned find(const char *sub, unsigned from = 0) const noexcept
   {
     return detail::find_sub(data(), _size, sub, detail::strlen_(sub), from);
+  }
+
+  bool contains(const char *sub) const noexcept { return find(sub) != npos; }
+  bool contains(char c) const noexcept          { return find(c) != npos; }
+
+  unsigned rfind(char c) const noexcept
+  {
+    const char *d = data();
+    for ( unsigned i = _size; i-- > 0; )
+      if ( d[i] == c )
+        return i;
+    return npos;
+  }
+
+  unsigned rfind(const char *sub) const noexcept
+  {
+    unsigned m = detail::strlen_(sub);
+    if ( m == 0 )
+      return _size;
+    if ( m > _size )
+      return npos;
+    const char *d = data();
+    for ( unsigned i = _size - m + 1; i-- > 0; )
+    {
+      unsigned j = 0;
+      while ( j < m && d[i + j] == sub[j] )
+        ++j;
+      if ( j == m )
+        return i;
+    }
+    return npos;
+  }
+
+  unsigned find_first_of(const char *set, unsigned from = 0) const noexcept
+  {
+    const char *d = data();
+    for ( unsigned i = from; i < _size; ++i )
+      for ( const char *p = set; *p != 0; ++p )
+        if ( d[i] == *p )
+          return i;
+    return npos;
+  }
+
+  unsigned find_last_of(const char *set) const noexcept
+  {
+    const char *d = data();
+    for ( unsigned i = _size; i-- > 0; )
+      for ( const char *p = set; *p != 0; ++p )
+        if ( d[i] == *p )
+          return i;
+    return npos;
+  }
+
+  // Drop count characters at pos. Both are clamped rather than rejected, the way substr clamps.
+  void erase(unsigned pos, unsigned count = npos)
+  {
+    if ( pos >= _size )
+      return;
+    unsigned rem = _size - pos;
+    unsigned n = count < rem ? count : rem;
+    if ( n == 0 )
+      return;
+    char *d = data();
+    for ( unsigned i = pos; i + n < _size; ++i )
+      d[i] = d[i + n];
+    _size -= n;
+    d[_size] = 0;
+  }
+
+  void resize(unsigned n, char fill = 0)
+  {
+    if ( n < _size )
+    {
+      char *d = this->data();          // bound once; shrinking cannot reallocate
+      _size = n;
+      d[n] = 0;
+      return;
+    }
+    this->reserve(n);
+    char *d = this->data();            // bound after reserve(): it can move the buffer
+    for ( unsigned i = _size; i < n; ++i )
+      d[i] = fill;
+    _size = n;
+    d[n] = 0;
   }
 
   string substr(unsigned pos, unsigned len = npos) const
