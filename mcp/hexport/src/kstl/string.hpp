@@ -8,19 +8,99 @@
 // benchmark proves it matters: out-of-lining the ctor/move/dtor made vector<string> ~50%
 // slower until they were inlined.
 #pragma once
-#include "hash.hpp"   // detail::hash_bytes, for string_hash at the bottom
+#include "hash.hpp"          // detail::hash_bytes, for string_hash at the bottom
+#include "intrin/sse2.hpp"   // the 16-byte substring scan in detail::find_sub
 
 namespace kstl {
 
 namespace detail {
+// Eight bytes per step instead of one. Every string(const char *), operator=(const char *) and
+// append(const char *) runs this first, so a byte loop taxes the whole class: constructing from a
+// 96-character C string measured 0.66x against std::string purely here.
+//
+// The SWAR test (v - 0x01..01) & ~v & 0x80..80 has a bit set in the low byte of any zero byte, and
+// only there. The alignment prologue is not optional: reading eight bytes at once past the
+// terminator is only safe if the read cannot cross into an unmapped page, and an ALIGNED 8-byte
+// read never straddles a page boundary. An unaligned one can, so the loop must start aligned.
 inline unsigned strlen_(const char *s) noexcept
 {
-  unsigned n = 0;
-  if ( s != nullptr )
-    while ( s[n] != 0 )
-      ++n;
-  return n;
+  if ( s == nullptr )
+    return 0;
+  const char *p = s;
+  while ( (reinterpret_cast<unsigned long long>(p) & 7) != 0 )   // reach an 8-byte boundary
+  {
+    if ( *p == 0 )
+      return static_cast<unsigned>(p - s);
+    ++p;
+  }
+  for ( ;; )
+  {
+    unsigned long long v = *reinterpret_cast<const unsigned long long *>(p);
+    unsigned long long z = (v - 0x0101010101010101ull) & ~v & 0x8080808080808080ull;
+    if ( z != 0 )
+    {
+      unsigned long idx;
+      _BitScanForward64(&idx, z);            // lowest set bit -> the first zero byte
+      return static_cast<unsigned>(p - s) + static_cast<unsigned>(idx >> 3);
+    }
+    p += 8;
+  }
 }
+// Substring search, sixteen candidate positions per step. Shared by string::find and
+// string_view::find so the two cannot drift apart.
+//
+// The trick is to test the needle's FIRST and LAST byte against sixteen offsets at once and AND the
+// two masks: a position survives only if both ends match, which rejects essentially every wrong
+// position without touching the middle. Testing both ends rather than just the first is what keeps
+// a haystack that repeats the needle's first character from degenerating.
+//
+// A scalar version of exactly this was written first and measured no better than the plain nested
+// loop it replaced -- 0.18x against std::string::find either way. That is worth remembering: the
+// nested loop's cost was never the inner comparison, it was touching 4000 bytes one at a time, and
+// no amount of early rejection fixes a scalar scan. Only doing sixteen at once does.
+inline unsigned find_sub(const char *hay, unsigned n, const char *ned, unsigned m, unsigned from) noexcept
+{
+  const unsigned NPOS = 0xFFFFFFFFu;
+  if ( m == 0 )
+    return from <= n ? from : NPOS;
+  if ( m > n || from > n - m )
+    return NPOS;
+  unsigned last = n - m;                       // last index a match can start at
+  __m128i v0 = _mm_set1_epi8(ned[0]);
+  __m128i vn = _mm_set1_epi8(ned[m - 1]);
+  unsigned i = from;
+  for ( ; i + 16 <= last + 1; i += 16 )
+  {
+    // Both loads stay inside the string: i+15 <= last = n-m, so i+m-1+15 <= n-1.
+    __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hay + i));
+    __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hay + i + m - 1));
+    unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(
+        _mm_and_si128(_mm_cmpeq_epi8(a, v0), _mm_cmpeq_epi8(b, vn))));
+    for ( ; mask != 0; mask &= mask - 1 )
+    {
+      unsigned long bit;
+      _BitScanForward(&bit, mask);
+      unsigned p = i + static_cast<unsigned>(bit);
+      unsigned j = 1;
+      while ( j + 1 < m && hay[p + j] == ned[j] )
+        ++j;
+      if ( j + 1 >= m )
+        return p;
+    }
+  }
+  for ( ; i <= last; ++i )                     // tail: fewer than 16 positions left
+  {
+    if ( hay[i] != ned[0] || hay[i + m - 1] != ned[m - 1] )
+      continue;
+    unsigned j = 1;
+    while ( j + 1 < m && hay[i + j] == ned[j] )
+      ++j;
+    if ( j + 1 >= m )
+      return i;
+  }
+  return NPOS;
+}
+
 // Copy n bytes. MSVC rewrites this runtime-length loop into a call to the CRT memcpy, which is
 // the right tool for a block of any real size. (Tried and rejected: a ladder of fixed-width
 // moves for n < 16 to dodge that call. It won nothing on any benchmark and made this function
@@ -232,8 +312,56 @@ public:
     return s[i] == 0;   // s must end exactly where we do
   }
 
+  // kstl::string is trivially relocatable: nothing points into the object -- the SSO buffer is
+  // inline data and the heap pointer is not self-referential -- so two strings can be exchanged by
+  // swapping their raw bytes. The generic three-move swap in algorithm.hpp runs operator=(string&&)
+  // twice, and each of those re-tests the small/large mode and may call delete[]. Sorting moves
+  // strings constantly, so this is on the hot path of every sort, insertion sort and vecswap.
+  friend void swap(string &a, string &b) noexcept
+  {
+    struct raw_t { unsigned long long w[3]; };            // exactly sizeof(string); see the assert
+    raw_t t = *reinterpret_cast<raw_t *>(&a);
+    *reinterpret_cast<raw_t *>(&a) = *reinterpret_cast<raw_t *>(&b);
+    *reinterpret_cast<raw_t *>(&b) = t;
+  }
+
   bool operator!=(const string &o) const noexcept { return !(*this == o); }
   bool operator!=(const char *s) const noexcept   { return !(*this == s); }
+
+  // Lexicographic three-way compare, eight bytes at a time, for sorting and ordered containers.
+  // The byte swap is what makes a 64-bit compare agree with a byte loop: on a little-endian machine
+  // the FIRST character of the string sits in the LOW byte of the word, so comparing the words as
+  // integers would order by the last character first. Swapping puts them in comparison order. It
+  // costs one BSWAP on the single word where the strings actually differ, not one per word.
+  //
+  // This existed nowhere before, so sorting strings meant hand-writing a byte-loop comparator at
+  // the call site -- which is exactly what the benchmark did, and why sorting 100k strings measured
+  // 0.38x against std::sort no matter which partition scheme was underneath it.
+  int compare(const string &o) const noexcept
+  {
+    unsigned n = _size < o._size ? _size : o._size;
+    const char *a = data();
+    const char *b = o.data();
+    unsigned i = 0;
+    for ( ; i + 8 <= n; i += 8 )
+    {
+      unsigned long long x = *reinterpret_cast<const unsigned long long *>(a + i);
+      unsigned long long y = *reinterpret_cast<const unsigned long long *>(b + i);
+      if ( x != y )
+        return _byteswap_uint64(x) < _byteswap_uint64(y) ? -1 : 1;
+    }
+    for ( ; i < n; ++i )
+      if ( a[i] != b[i] )
+        return static_cast<unsigned char>(a[i]) < static_cast<unsigned char>(b[i]) ? -1 : 1;
+    if ( _size != o._size )
+      return _size < o._size ? -1 : 1;   // a prefix sorts before the longer string
+    return 0;
+  }
+
+  bool operator<(const string &o) const noexcept  { return compare(o) < 0; }
+  bool operator>(const string &o) const noexcept  { return compare(o) > 0; }
+  bool operator<=(const string &o) const noexcept { return compare(o) <= 0; }
+  bool operator>=(const string &o) const noexcept { return compare(o) >= 0; }
 
   static const unsigned npos = 0xFFFFFFFFu;
 
@@ -248,21 +376,7 @@ public:
 
   unsigned find(const char *sub, unsigned from = 0) const noexcept
   {
-    unsigned m = detail::strlen_(sub);
-    if ( m == 0 )
-      return from <= _size ? from : npos;
-    if ( m > _size )
-      return npos;
-    const char *d = data();
-    for ( unsigned i = from; i + m <= _size; ++i )
-    {
-      unsigned j = 0;
-      while ( j < m && d[i + j] == sub[j] )
-        ++j;
-      if ( j == m )
-        return i;
-    }
-    return npos;
+    return detail::find_sub(data(), _size, sub, detail::strlen_(sub), from);
   }
 
   string substr(unsigned pos, unsigned len = npos) const
@@ -315,6 +429,8 @@ private:
   unsigned _size;   // length, excludes the '\0'
   unsigned _cap;    // capacity, excludes the '\0'; _cap <= SSO_CAPACITY means small (inline) mode
 };
+
+static_assert(sizeof(string) == 24, "string::swap exchanges exactly three 8-byte words");
 
 inline string operator+(const string &a, const string &b)
 {

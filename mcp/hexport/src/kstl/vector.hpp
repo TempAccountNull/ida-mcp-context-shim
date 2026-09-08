@@ -10,6 +10,10 @@
 // vector holds any type (kstl::string, qstring, ...).
 #pragma once
 
+// The one CRT entry point this header needs, declared here so it needs no <string.h>. Same idiom
+// print.hpp uses for _write. Only the trivially-copyable shift path calls it.
+extern "C" void *memmove(void *, const void *, unsigned long long);
+
 namespace kstl {
 struct place_t {};   // tag that makes our placement-new unambiguous vs the standard one
 }
@@ -186,6 +190,16 @@ public:
     if ( n == 0 )
     {
       ::new (static_cast<void *>(_last), place_t{}) T(v);
+    }
+    else if constexpr ( __is_trivially_copyable(T) )
+    {
+      // One bulk move for the shift. The element-at-a-time backward loop below is correct for any
+      // T, but MSVC will not turn a BACKWARD loop into a vector move the way it does a forward one,
+      // so inserting at the front measured 0.20x against std::vector, which uses memmove. Overlap
+      // is the whole point here (source and destination differ by one element), so memmove and not
+      // memcpy. Declared ourselves rather than via <string.h>, exactly as print.hpp declares _write.
+      memmove(_first + pos + 1, _first + pos, static_cast<unsigned long long>(n - pos) * sizeof(T));
+      _first[pos] = v;
     }
     else
     {

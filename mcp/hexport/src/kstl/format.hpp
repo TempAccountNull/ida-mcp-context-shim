@@ -91,7 +91,7 @@ inline void append_hex(string &s, unsigned long long v, unsigned min_digits = 0)
 
 // Fixed-point double. Good for display values (durations, rates); not a full float printer
 // (no inf/huge-magnitude handling beyond u64 range -- callers here stay well inside it).
-inline void append_static_cast<double>(string &s, double d, unsigned precision = 6)
+inline void append_double(string &s, double d, unsigned precision = 6)
 {
   if ( d != d )   // NaN
   {
@@ -145,11 +145,11 @@ inline void append_arg(string &s, long v)               { append_int(s, v); }
 inline void append_arg(string &s, unsigned long v)      { append_uint(s, v); }
 inline void append_arg(string &s, long long v)          { append_int(s, v); }
 inline void append_arg(string &s, unsigned long long v) { append_uint(s, v); }
-inline void append_arg(string &s, double v)             { append_static_cast<double>(s, v, 6); }
+inline void append_arg(string &s, double v)             { append_double(s, v, 6); }
 inline void append_arg(string &s, const void *p)        { s.append("0x"); append_hex(s, reinterpret_cast<unsigned long long>(p)); }
 inline void append_arg(string &s, Hex h)                { append_hex(s, h.v, h.width); }
 inline void append_arg(string &s, Pad p)                { append_uint_padded(s, p.v, p.width); }
-inline void append_arg(string &s, Fixed f)              { append_static_cast<double>(s, f.v, f.prec); }
+inline void append_arg(string &s, Fixed f)              { append_double(s, f.v, f.prec); }
 
 // ---- concatenating format(): append each argument in turn ----
 

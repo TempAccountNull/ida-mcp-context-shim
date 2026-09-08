@@ -56,19 +56,7 @@ public:
 
   unsigned find(string_view sub, unsigned from = 0) const noexcept
   {
-    if ( sub._n == 0 )
-      return from <= _n ? from : npos;
-    if ( sub._n > _n )
-      return npos;
-    for ( unsigned i = from; i + sub._n <= _n; ++i )
-    {
-      unsigned j = 0;
-      while ( j < sub._n && _d[i + j] == sub._d[j] )
-        ++j;
-      if ( j == sub._n )
-        return i;
-    }
-    return npos;
+    return detail::find_sub(_d, _n, sub._d, sub._n, from);   // shared with string::find
   }
 
   bool operator==(string_view o) const noexcept

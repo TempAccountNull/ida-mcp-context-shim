@@ -30,6 +30,12 @@ inline unsigned long long hash_bytes(const char *p, unsigned n) noexcept
   const unsigned long long S0 = 0x9E3779B97F4A7C15ull;
   const unsigned long long S1 = 0xC2B2AE3D27D4EB4Full;
   unsigned long long h = S0 ^ (static_cast<unsigned long long>(n) * S1);
+  // One accumulator, eight bytes per multiply. Splitting this into two independent lanes over 16
+  // bytes was tried and measured WORSE on the row it was aimed at -- strkeys len=40 insert 0.87x ->
+  // 0.81x -- because the arithmetic does not work out: 40 bytes is only five multiplies, so two
+  // lanes take the dependency chain from about six deep to five, and the extra fold costs more than
+  // that saves. It would only pay for keys long enough to amortise the fold, which is not the size
+  // that shows up here. (Hash QUALITY was fine either way: avalanche stayed in [0.488, 0.511].)
   while ( n >= 8 )
   {
     h = hash_mix(h ^ *reinterpret_cast<const unsigned long long *>(p), S1);

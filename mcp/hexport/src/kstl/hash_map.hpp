@@ -35,13 +35,16 @@
 //      the common miss with one byte load.
 //
 // Measured against phmap::flat_hash_map (parallel-hashmap) and std::unordered_map over 170 rows
-// (5 sizes x 8 key distributions x 8 workloads, median of 11 interleaved runs, paired sign test):
-//      149 win / 10 tie / 11 loss vs phmap, geometric mean 1.35x
-//      170 of 170 vs std::unordered_map
-// Every remaining loss is named in the notes at the bottom, with its cause. None of them is a
-// probing problem any more: what is left is one mispredicting branch on a 144 KB table, streaming
-// 16 MB of 64-byte values, and hashing 40-byte string keys. Several sit within their own run-to-run
-// spread and change sign between runs; the notes say which.
+// (5 sizes x 8 key distributions x 8 workloads, median of 11 interleaved runs, paired sign test).
+// Quoted from two back-to-back runs of this exact binary, because one run cannot tell a real loss
+// from run-to-run drift -- the paired test only protects the kstl-vs-phmap comparison INSIDE a run:
+//      146 win / 10 tie / 14 loss  and  146 win / 9 tie / 15 loss  vs phmap, geomean 1.38x / 1.36x
+//      166 of 170 vs std::unordered_map
+// Nine rows lose to phmap in every run. They are named at the bottom with their cause, and none is
+// a probing problem any more: what is left is one mispredicting branch on a 144 KB table, streaming
+// 16 MB of 64-byte values, and hashing 40-byte string keys. Another six straddle the +/-3% band and
+// change sign between runs; those are named too, so nobody chases one. Do not read a single run's
+// tally as a ranking -- rerunning the same binary moves it by a row or two.
 #pragma once
 #include "vector.hpp"
 #include "hash.hpp"     // kstl::hash<K> (identity for integers, hash_bytes for the rest)
@@ -189,6 +192,21 @@ public:
     unsigned i = 0;
     for ( ; i + 8 <= _cap; i += 8 )
     {
+      // Pull the entry line for a slot some way ahead. Iteration is the one place where prefetching
+      // is unambiguously right -- unlike find(), which must not touch an entry it may never read,
+      // this walk is going to read every live entry in order, so the line is never wasted. The
+      // distance is in bytes, not slots, so it stays a few lines ahead whatever the entry size.
+      //
+      // Worth 1.60x -> 1.82x/1.88x on the iterate geomean across all 22 rows (two runs), the largest
+      // single move measured here, and the only change all session whose effect clearly exceeds the
+      // noise: adding it moved the median iterate row by 0.17x where rerunning the SAME binary moves
+      // one by 0.04x. It did NOT fix the row it was aimed at, 200k with 64-byte values (0.83x ->
+      // 0.86x): with one entry per cache line and only 200k of them, that row is bound by the memory
+      // stream itself and there is no latency left for a hint to hide, and the hardware prefetcher
+      // already has a purely sequential walk figured out. The gain landed instead on the small and
+      // mid-size maps, where several entries share a line -- 10k iterate went 2.4-2.8x to 4.5-4.9x.
+      if ( i + PF_SLOTS < _cap )
+        _pf(&_ent[i + PF_SLOTS]);
       unsigned long long occupied = *reinterpret_cast<const unsigned long long *>(_state + i) & MSBS;
       while ( occupied != 0 )
       {
@@ -330,6 +348,12 @@ private:
   // off for the 100k tables, which do not need it off: that cost ~12 rows their win (they fell to
   // ties) and 0.02 of the geometric mean.
   enum : unsigned { HOME_PROBE_MIN_CAP = static_cast<unsigned>((512ull << 10) / sizeof(entry_t)) };
+
+  // How far ahead for_each prefetches, in slots: about 256 bytes of entries, never less than one
+  // group so the hint always leads the eight slots being processed. Expressed in bytes rather than
+  // slots so it stays a fixed distance in cache lines whatever the entry size -- 4 lines ahead for a
+  // 64-byte value, 4 lines ahead for an 8-byte one.
+  enum : unsigned { PF_SLOTS = (256u / sizeof(entry_t)) > 8u ? static_cast<unsigned>(256u / sizeof(entry_t)) : 8u };
 
   // How full a table is allowed to get before it grows: seven eighths, the same as phmap
   // (phmap.h: "We use 7/8th as maximum load factor", capacity - capacity/8).
@@ -679,25 +703,44 @@ private:
 //    probe. Anchoring the first group at the home slot keeps that, and 4M went 13 win / 2 loss to
 //    15 win / 1 loss across the rewrite.
 //
-// Still losing to phmap, with the reason, so nobody hunts them blind. Eleven rows of 170;
-// sequential and addresses keys lose nothing at all:
-//   - 10k random all-hit 0.68x, and the 50%-miss rows (10k random 0.88x, 100k random 0.83x, 10k
-//     spread 0.97x, 100k random64 0.95x). All the SAME cost: the `s0 == fp` test in the home probe
-//     is a ~70/30 coin flip when the keys are random and the lookup is a hit, and on an L2-resident
-//     table one mispredict is most of the lookup. A 50%-miss stream mispredicts it by construction.
-//     It cannot simply be removed -- deleting the home probe takes 10k random to ~0.81x/1.21x but
-//     costs every ordered all-hit row far more (see the rejected entry above). These rows are
-//     0.03-1.4 ms end to end, 2.1-7.0 ns/op.
+// HOW MUCH A ROW IS ALLOWED TO MOVE. Rerunning the SAME binary moves a row's speedup by 0.03x at
+// the median and up to 0.14x at the 90th percentile -- wider than the 3% verdict band. So a single
+// run's tally is worth about +/-2 rows, and a row is only "losing" if it loses in every run. The
+// figures below are the worst and best across four runs, not one run's number.
+//
+// Still losing to phmap, with the reason, so nobody hunts them blind. Nine rows of 170; sequential
+// and addresses keys lose nothing that reproduces:
+//   - 10k random all-hit 0.67-0.75x, 10k random 50%-miss 0.82-0.88x, 100k random 50%-miss
+//     0.81-0.86x. All the SAME cost: the `s0 == fp` test in the home probe is a ~70/30 coin flip
+//     when the keys are random and the lookup is a hit, and on an L2-resident table one mispredict
+//     is most of the lookup. A 50%-miss stream mispredicts it by construction. It cannot simply be
+//     removed -- deleting the home probe takes 10k random to ~0.81x/1.21x but costs every ordered
+//     all-hit row far more (see the rejected entry above). These rows are 0.03-1.4 ms end to end,
+//     2.1-7.0 ns/op.
 //     The all-MISS row at 10k random used to be the worst of that group at 0.71x and is now 1.41x,
 //     reproduced across three runs at 11/11 paired, because that one was the `s0 == EMPTY` coin
 //     flip and that test could be gated on size.
-//   - 200k 64-byte iterate 0.83x/0.87x and 1M clustered iterate 0.93x: bound by streaming the value
-//     array, not by probing. for_each already scans state 8 bytes at a time; the cost is the entry
-//     traffic itself.
-//   - strkeys len=40 insert 0.87x: bound by hashing 40-byte keys, not by probing.
-//   - 4M spread mixed 0.85x and 1M clustered unreserved insert 0.92x: both sit within their own
-//     run-to-run spread (cv up to 22%) and have landed on the winning side in other runs.
-//     Re-measure before believing either.
+//   - 200k 64-byte iterate, spread 0.83-0.86x and random 0.81-0.95x, and 1M clustered iterate
+//     0.87-0.94x: bound by streaming the value array, not by probing. The for_each prefetch was
+//     aimed at exactly these and did not move them; the note there says why.
+//   - strkeys len=40 insert 0.81-0.89x: bound by hashing 40-byte keys, not by probing. Two-lane
+//     hashing was tried for this row specifically and measured worse; see hash.hpp.
+//   - 4M spread mixed 0.85-0.94x and 1M clustered unreserved insert 0.91-0.94x. An earlier version
+//     of this note claimed both "have landed on the winning side in other runs" -- four runs say
+//     neither ever did, so that claim was wrong and is withdrawn. They are narrow but real.
+//
+// Straddling the band, sign changes between runs. Listed so nobody optimises for one run's noise:
+// 1M clustered reserved insert 0.87-1.06x, 100k random64 all-hit 0.94-1.41x, 100k addresses
+// all-miss 0.94-1.02x, 100k random64 50%-miss 0.90-0.98x, 10k spread mixed 0.87-1.01x, 100k random
+// all-hit 0.88-0.99x.
+//
+// Losing to std::unordered_map on four rows, stable across every run, and all one artifact rather
+// than a probing problem: the benchmark reserves for N inserts, but the clustered and len=12 key
+// generators emit only ~63k and ~2.6k DISTINCT keys, so the table sits at load 0.01-0.03. Insert
+// then scatters over an 18 MB array and iterate scans 2M state bytes to reach 63k entries, while a
+// node map touches only what it allocated. phmap loses the same rows to std by the same margin (we
+// are 0.91-0.94x of phmap there), so this is inherent to open addressing at a 16x over-reserve and
+// is not worth contorting the map for. Honouring reserve() exactly is the point of reserve().
 // ---------------------------------------------------------------------------------------------
 
 }  // namespace kstl
