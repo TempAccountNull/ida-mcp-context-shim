@@ -4,34 +4,45 @@
 // quicksort can hit on an adversarial big IDB. Operates on raw pointers, which is exactly what
 // kstl::vector's begin()/end() return: kstl::sort(v.begin(), v.end()).
 //
-// sort() is a pdqsort-style two-way quicksort: a Tukey-ninther pivot sampled at n/8, a partition
-// that costs ONE comparison per element, duplicates handled by partition_left, and a bounded
-// insertion sort that finishes ranges the partition reports as already ordered.
+// sort() is a pdqsort-style two-way quicksort: a Tukey-ninther pivot sampled at n/8 and chosen by
+// selection, a partition costing ONE comparison per element, duplicates handled by partition_left,
+// a bounded insertion sort for ranges the partition reports as already ordered, and a single
+// monotonic-run check at the entry point.
 //
-// Four schemes were written and measured against each other and std::sort over 14 input shapes
-// (300k unsigned, median of 11 runs; see doc/sort-benchmarks.md for the full table):
+// SIX schemes were built and measured against each other and std::sort over 14 input shapes, and
+// the two finalists were then measured again inside the real library over all 23 benchmark rows.
+// Full tables in doc/sort-benchmarks.md. Geometric mean speedup vs std::sort, 14 shapes:
 //
-//      variant                                             geomean   rows below 1.0x
-//      Lomuto two-way + middle pivot   (original)            0.44x   6 of 8
-//      Bentley-McIlroy three-way + spread ninther            1.24x   all-equal, reverse-sorted
-//      pdqsort as published (clustered sampling, sort3)      1.61x   organ pipe, 2 runs, all-equal
-//   >> two-way + SPREAD ninther by selection (this one)      1.51x   all-equal only
+//      variant                                                     geomean   shapes below 1.0x
+//      Lomuto two-way + middle pivot          (the original)         0.44x   6 of 8
+//      pdq-D  clustered sampling, selecting                          1.22x   4
+//      Bentley-McIlroy three-way + spread ninther                    1.24x   2
+//      pdq-C  spread sampling, mutating sort3                        1.36x   2
+//      pdq-B  spread sampling, selecting                             1.48x   1
+//      pdq-A  pdqsort as published: clustered, mutating sort3        1.60x   3
+//   >> this   pdq-B + the entry scan below                           1.88x   0
 //
-// pdqsort as published has the better geometric mean and was NOT chosen: its nine pivot samples are
-// clustered at the ends and the middle, which organ-pipe data defeats exactly the way three-point
-// sampling does (0.76x, and 0.84x on two sorted runs appended). Spreading the samples at n/8 costs
-// a little on random input and turns those two into 1.47x and 1.52x. Beating std on every shape was
-// worth more than the geometric mean.
+// Three results from that grid are worth keeping:
 //
-// Against std::sort now, per shape: sorted 5.7x, organ pipe 1.44x, reverse-sorted 1.42x, sawtooth
-// 1.21x, 3 distinct 1.26x, random 1.15x, 100 distinct 1.14x, strings 1.01x, all-equal 0.88x.
+//   Sampling and selection are NOT independent. Clustered+mutating (pdq-A) sorts a reversed array
+//   in 10.5x, but clustered+selecting (pdq-D) manages 0.66x and spread+mutating (pdq-C) 1.29x --
+//   so neither property alone explains it. Meanwhile clustering costs organ-pipe data 0.76x against
+//   1.45x, because pdqsort's nine samples sit at the ends and the middle and organ-pipe data hides
+//   its peak exactly in the middle. Spread sampling at n/8 is what fixes that.
 //
-// all-equal is the one shape std still wins, and it is structural rather than an oversight: MSVC's
-// std::sort finishes an all-equal array in a single three-way partition, while this needs two
-// passes (one partition_right that finds nothing below the pivot, then one partition_left that
-// peels the equals). Buying it back means paying a second comparison per element on every other
-// shape -- which is exactly what the Bentley-McIlroy variant above did, and it cost 1.24x against
-// 1.51x overall. 34 microseconds on 300k elements was not worth that.
+//   pdqsort as published was measured and NOT adopted. Its geometric-mean lead over spread sampling
+//   came entirely from the one reversed-array row: drop that row and it scores 1.35x against 1.47x,
+//   and it is behind on 8 of the other 13 shapes. The entry scan buys that row far more cheaply.
+//
+//   The entry scan is why every shape now wins. It walks in whichever direction the first pair
+//   points and stops at the first pair that breaks the pattern, so random input pays two
+//   comparisons. Descending end to end means reverse and return; never descending means the range
+//   is already sorted and there is nothing to do at all. That second case is what an ALL-EQUAL
+//   array is, and it is the reason that shape went from 0.75x -- the one thing every quicksort
+//   variant here lost to std::sort -- to 1.50x. Do not over-read it, though: it recognises a run
+//   spanning the WHOLE range and nothing weaker, so a mostly-sorted array still takes the ordinary
+//   path (which is why the nearly-sorted and sorted-plus-random-tail rows barely moved: 1.24x and
+//   1.45x, so the scan it wastes on them costs nothing measurable).
 #pragma once
 
 namespace kstl {
@@ -167,9 +178,18 @@ inline void choose_pivot(T *first, T *last, C comp)
   {
     // Tukey's ninther. Median-of-three looks only at the ends and the middle, which structured
     // input defeats -- an organ-pipe array has its largest values in the middle, so three-point
-    // sampling picks near the maximum every time. Spreading the nine samples at n/8 rather than
-    // clustering them (as pdqsort itself does) is worth 1.47x against 0.76x on that shape, and
-    // 1.52x against 0.84x on two sorted runs appended. Both measured, not assumed.
+    // sampling picks near the maximum every time.
+    //
+    // The threshold is 16 and NOT the 40 of Bentley and McIlroy's paper, which is a measured
+    // difference rather than a preference. Comparisons in units of n log n, 300k unsigned:
+    //           threshold:      16     32     40     64    128
+    //      reverse-sorted:    1.70   1.70   2.29   2.29   3.25   (33% heapsorted at 128)
+    //          organ pipe:    1.53   1.55   1.57   1.60   1.67
+    //              random:    1.56   1.56   1.55   1.56   1.56
+    // The cliff between 32 and 40 is the whole story: sub-ranges of roughly 40-128 elements coming
+    // out of a partitioned reversed array defeat a three-point median completely and split
+    // (n-2, 1, 1). That is the textbook quicksort worst case, and it burns one unit of the depth
+    // budget per element until introsort gives up and heapsorts a third of the array.
     long long s = n / 8;
     T *lo = median3(first, first + s, first + 2 * s, comp);
     T *mi = median3(pm - s, pm, pm + s, comp);
@@ -371,6 +391,28 @@ inline void sort(T *first, T *last, C comp)
 {
   if ( last - first > 1 )
   {
+    // One entry scan, in whichever direction the first pair points. A range that is descending end
+    // to end is sorted by reversing it; a range that never descends is already sorted and needs
+    // nothing at all -- and that second case is what an all-equal array is. Both scans stop at the
+    // first pair that breaks the pattern, so random input pays two comparisons for the pair.
+    T *p = first + 1;
+    if ( comp(*p, *(p - 1)) )
+    {
+      while ( p != last && comp(*p, *(p - 1)) )
+        ++p;
+      if ( p == last )
+      {
+        reverse(first, last);
+        return;
+      }
+    }
+    else
+    {
+      while ( p != last && !comp(*p, *(p - 1)) )
+        ++p;
+      if ( p == last )
+        return;                          // already non-decreasing, which includes all-equal
+    }
     detail::introsort(first, last, 2 * detail::ilog2(long(last - first)), comp, true);
   }
 }

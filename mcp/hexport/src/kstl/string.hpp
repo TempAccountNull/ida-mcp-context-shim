@@ -121,17 +121,9 @@ public:
 
   string() noexcept : _size(0), _cap(SSO_CAPACITY) { _store.buf[0] = 0; }
 
-  string(const char *s) : _size(0), _cap(SSO_CAPACITY)
-  {
-    _store.buf[0] = 0;
-    append(s, detail::strlen_(s));
-  }
+  string(const char *s) : _size(0), _cap(SSO_CAPACITY) { _init(s, detail::strlen_(s)); }
 
-  string(const char *s, unsigned n) : _size(0), _cap(SSO_CAPACITY)
-  {
-    _store.buf[0] = 0;
-    append(s, n);
-  }
+  string(const char *s, unsigned n) : _size(0), _cap(SSO_CAPACITY) { _init(s, n); }
 
   string(const string &o) : _size(o._size), _cap(o._cap)
   {
@@ -233,12 +225,16 @@ public:
   {
     unsigned sz = _size;
     unsigned cap = _cap;
-    if ( sz == cap )             // buffer full (holds _cap chars + '\0'); the grow is the cold call
+    if ( sz != cap )                      // fast path, with nothing after it to fall through to
     {
-      _grow_to(sz + 1);
-      cap = _cap;
+      char *d = cap > SSO_CAPACITY ? _store.ptr : _store.buf;
+      d[sz] = c;
+      d[sz + 1] = 0;
+      _size = sz + 1;
+      return;
     }
-    char *d = cap > SSO_CAPACITY ? _store.ptr : _store.buf;
+    _grow_to(sz + 1);            // cold: buffer full (holds _cap chars + '\0')
+    char *d = _store.ptr;        // a grown string is always in large mode, so no mode test here
     d[sz] = c;
     d[sz + 1] = 0;
     _size = sz + 1;
@@ -413,6 +409,28 @@ private:
   // Cold path (allocates), out-of-line in string.cpp. noinline is load-bearing: under /GL /LTCG
   // the compiler will otherwise inline this -- new, delete and their EH state -- into whatever
   // tight push_back/append loop called it.
+  // Construct straight into a block of exactly the right size. Routing a construction through
+  // append() means routing it through _grow_to, which is __declspec(noinline) on purpose -- it must
+  // not be inlined into push_back loops -- so building a string from a C string paid an out-of-line
+  // call and a doubling calculation for a length that was already known here.
+  void _init(const char *s, unsigned n)
+  {
+    if ( n <= SSO_CAPACITY )
+    {
+      detail::memcpy_(_store.buf, s, n);
+      _store.buf[n] = 0;
+    }
+    else
+    {
+      char *nb = new char[n + 1];
+      detail::memcpy_(nb, s, n);
+      nb[n] = 0;
+      _store.ptr = nb;
+      _cap = n;
+    }
+    _size = n;
+  }
+
   __declspec(noinline) void _grow_to(unsigned min_cap);
 
   // 16 bytes: inline buffer OR pointer to a heap block, never both.
