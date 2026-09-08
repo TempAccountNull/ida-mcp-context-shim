@@ -111,3 +111,28 @@ node map touches only what it allocated. phmap loses the same rows to std by the
 are 0.91-0.94x of phmap there), so this is inherent to open addressing at a 16x over-reserve and
 is not worth contorting the map for. Honouring reserve() exactly is the point of reserve().
 ---------------------------------------------------------------------------------------------
+
+## Caching members in locals: measured, and one place it LOSES
+
+The obvious optimisation in `for_each` is to hoist `_state`, `_ent` and `_cap` into locals before
+the loop. The reasoning is sound -- `f` is an arbitrary callable, so the compiler cannot know it
+does not touch the map and must reload all three after every call. It was tried and it is **slower**:
+
+| variant | iterate | insert | mixed | erase |
+|---|---|---|---|---|
+| members read through `this` (**shipped**) | **1.79x** | 1.23x | 1.06x | 1.62x |
+| `_state`/`_ent`/`_cap` hoisted into locals | 1.48x | 1.23x | 1.02x | 1.61x |
+
+Keeping three extra values live across an opaque call costs more in register pressure than
+rematerialising them from `this`, which is live anyway. Do not re-apply it without re-running the
+22 iterate rows.
+
+The same change on the insert path -- binding `entry_t *e = this->_ent + i` once after
+`_emplace_slot` in `operator[]`, `insert`, `try_emplace` and `emplace` -- is free (insert 1.23x
+either way) and is kept, because there it removes a repeated index computation rather than
+lengthening a live range across a call.
+
+Where caching is unambiguously right is a loop with no call in it: `string::rfind(char)` was calling
+`data()` per iteration, and `data()` is a branch on the SSO flag that the compiler must redo after
+any store through the returned pointer.
+

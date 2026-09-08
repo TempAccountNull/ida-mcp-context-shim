@@ -42,7 +42,7 @@ public:
 
   hash_map &operator=(const hash_map &o)
   {
-    if ( this != &o ) { _clear_and_free(); reserve(o._size); _reinsert_from(o); }
+    if ( this != &o ) { this->_clear_and_free(); this->reserve(o._size); this->_reinsert_from(o); }
     return *this;
   }
 
@@ -50,7 +50,7 @@ public:
   {
     if ( this != &o )
     {
-      _clear_and_free();
+      this->_clear_and_free();
       _state = o._state; _ent = o._ent;
       _cap = o._cap; _size = o._size; _tombs = o._tombs; _shift = o._shift;
       o._state = nullptr; o._ent = nullptr;
@@ -149,17 +149,17 @@ public:
   void reserve(unsigned n)
   {
     unsigned need = MIN_CAP;
-    while ( n > _max_fill(need) )
+    while ( n > this->_max_fill(need) )
       need <<= 1;
     if ( need > _cap )
-      _rehash(need);
+      this->_rehash(need);
   }
 
   V *find(const K &key) noexcept
   {
     if ( _cap == 0 )
       return nullptr;
-    return _locate(key, H{}(key) * FIB);
+    return this->_locate(key, H{}(key) * FIB);
   }
 
   const V *find(const K &key) const noexcept { return const_cast<hash_map *>(this)->find(key); }
@@ -265,7 +265,7 @@ public:
   {
     if ( _cap == 0 )
       return false;
-    V *v = _locate(key, H{}(key) * FIB);
+    V *v = this->_locate(key, H{}(key) * FIB);
     if ( v == nullptr )
       return false;
     // Slot index from the value pointer: step back to the entry, then offset from the array.
@@ -273,7 +273,7 @@ public:
     unsigned i = static_cast<unsigned>(e - _ent);
     _ent[i].key.~K();
     _ent[i].val.~V();
-    _set_state(i, TOMB);
+    this->_set_state(i, TOMB);
     --_size;
     ++_tombs;
     return true;
@@ -305,20 +305,14 @@ public:
   template <class F>
   void for_each(F f)
   {
-    // Bound once, not re-read per slot. f is an arbitrary callable, so without these locals the
-    // compiler has to reload _state, _ent and _cap after EVERY call to it -- it cannot know that f
-    // does not touch the map. That is three dependent loads per live entry on the hottest walk in
-    // the class. The flip side is the contract: f must not insert into or erase from the map, which
-    // could rehash and free the array out from under this walk. Same rule as invalidating an
-    // iterator; use the erase-collect-then-apply pattern if you need to mutate.
-    const unsigned char *st = this->_state;
-    entry_t *ent = this->_ent;
-    const unsigned cap = this->_cap;
-    if ( ent == nullptr )
-      return;
-
+    // Reads _state/_ent/_cap through `this` rather than hoisting them into locals first. Hoisting
+    // them looks obviously right -- f is opaque, so the compiler must otherwise reload all three
+    // after every call to it -- and it was tried and measured SLOWER: iterate geomean 1.74x -> 1.48x
+    // over the 22 iterate rows. Keeping three extra values live across an opaque call costs more
+    // register pressure than rematerialising them from `this`, which is live anyway. Do not
+    // "optimise" this back without re-running the iterate rows.
     unsigned i = 0;
-    for ( ; i + 8 <= cap; i += 8 )
+    for ( ; i + 8 <= _cap; i += 8 )
     {
       // Pull the entry line for a slot some way ahead. Iteration is the one place where prefetching
       // is unambiguously right -- unlike find(), which must not touch an entry it may never read,
@@ -333,21 +327,21 @@ public:
       // stream itself and there is no latency left for a hint to hide, and the hardware prefetcher
       // already has a purely sequential walk figured out. The gain landed instead on the small and
       // mid-size maps, where several entries share a line -- 10k iterate went 2.4-2.8x to 4.5-4.9x.
-      if ( i + PF_SLOTS < cap )
-        _pf(ent + i + PF_SLOTS);
-      unsigned long long occupied = *reinterpret_cast<const unsigned long long *>(st + i) & MSBS;
+      if ( i + PF_SLOTS < _cap )
+        _pf(&_ent[i + PF_SLOTS]);
+      unsigned long long occupied = *reinterpret_cast<const unsigned long long *>(_state + i) & MSBS;
       while ( occupied != 0 )
       {
         unsigned long idx;
         _BitScanForward64(&idx, occupied);
-        entry_t *e = ent + i + (static_cast<unsigned>(idx) >> 3);
-        f(e->key, e->val);
+        unsigned j = i + (static_cast<unsigned>(idx) >> 3);
+        f(_ent[j].key, _ent[j].val);
         occupied &= occupied - 1;                    // clear the slot we just visited
       }
     }
-    for ( ; i < cap; ++i )                           // tail: fewer than 8 slots left
-      if ( st[i] >= FULL_MIN )
-        f(ent[i].key, ent[i].val);
+    for ( ; i < _cap; ++i )                          // tail: fewer than 8 slots left
+      if ( _state[i] >= FULL_MIN )
+        f(_ent[i].key, _ent[i].val);
   }
 
   template <class F>
@@ -628,7 +622,7 @@ private:
 
   bool _emplace_slot(const K &key, unsigned &idx)
   {
-    if ( _size + _tombs + 1 > _max_fill(_cap) )
+    if ( _size + _tombs + 1 > this->_max_fill(_cap) )
     {
       // A full table is not necessarily a table that needs to GROW. Tombstones count toward the fill
       // (they have to -- a probe runs through them), so an insert/erase churn drives the table to
@@ -639,7 +633,7 @@ private:
       // below max_fill so a table that really is full still grows; the rebuild cannot re-trigger
       // because it clears _tombs and leaves _size + 1 under the limit.)
       unsigned grown = (_cap == 0) ? MIN_CAP : _cap * 2;
-      _rehash(_cap != 0 && _size + 1 <= _purge_limit(_cap) ? _cap : grown);
+      this->_rehash(_cap != 0 && _size + 1 <= this->_purge_limit(_cap) ? _cap : grown);
     }
     unsigned long long m = H{}(key) * FIB;
     unsigned home = static_cast<unsigned>(m >> _shift);
@@ -691,7 +685,7 @@ private:
         if ( _state[pos] == TOMB )
           --_tombs;
         ::new (static_cast<void *>(&_ent[pos].key), place_t{}) K(key);
-        _set_state(pos, fp);
+        this->_set_state(pos, fp);
         ++_size;
         idx = pos;
         return true;
@@ -757,7 +751,7 @@ private:
     {
       if ( _state[i] < FULL_MIN )
         continue;
-      _move_into(ns, ne, mask, new_shift, i, H{}(_ent[i].key) * FIB);
+      this->_move_into(ns, ne, mask, new_shift, i, H{}(_ent[i].key) * FIB);
     }
 
     if ( _state != nullptr ) ::operator delete(_state);
@@ -777,7 +771,7 @@ private:
 
   void _clear_and_free() noexcept
   {
-    clear();
+    this->clear();
     if ( _state != nullptr ) ::operator delete(_state);
     if ( _ent != nullptr )   ::operator delete(_ent);
     _state = nullptr; _ent = nullptr;

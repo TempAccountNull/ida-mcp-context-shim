@@ -60,12 +60,12 @@ bool McpCommands::open(const char *file_path, bool run_auto)
   return true;
 }
 
-void McpCommands::close()
+void McpCommands::close(bool save)
 {
   if ( !is_open )
     return;
   mute_stdout();
-  ::close_database(false);
+  ::close_database(save);
   unmute_stdout();
   is_open = false;
   hexrays_ok = false;
@@ -95,11 +95,15 @@ void McpCommands::open_database(const jobj_t *args, jvalue_t *out)
   out->set_obj(result);
 }
 
-void McpCommands::close_database(jvalue_t *out)
+// Saves by default. Auto-analysis and Hex-Rays both write to the database, so closing without
+// saving throws that work away and the next open pays for it again.
+void McpCommands::close_database(const jobj_t *args, jvalue_t *out)
 {
-  close();
+  const bool save = args != nullptr ? jbool(*args, "save", true) : true;
+  close(save);
   jobj_t *result = new jobj_t;
   result->put("status", "closed");
+  result->put("saved", save);
   out->set_obj(result);
 }
 

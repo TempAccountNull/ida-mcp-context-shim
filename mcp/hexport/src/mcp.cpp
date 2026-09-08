@@ -91,7 +91,7 @@ void Mcp::call_tool(const jobj_t &params, jvalue_t *result_out, bool *is_error, 
   switch ( str_hash(name.c_str()) )
   {
     case "open_database"_h:   cmds.open_database(args, result_out);    break;
-    case "close_database"_h:  cmds.close_database(result_out);         break;
+    case "close_database"_h:  cmds.close_database(args, result_out);   break;
     case "list_databases"_h:  cmds.list_databases(result_out);         break;
     case "server_health"_h:   cmds.server_health(result_out);          break;
     case "entity_query"_h:    cmds.entity_query(queries, result_out);  break;

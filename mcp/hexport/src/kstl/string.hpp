@@ -132,7 +132,7 @@ public:
       _size = 0;
       _cap = SSO_CAPACITY;
       _store.buf[0] = 0;
-      append(o.data(), o._size);
+      this->append(o.data(), o._size);
     }
     else
     {
@@ -155,15 +155,15 @@ public:
   {
     if ( this != &o )
     {
-      if ( !_large_mode() && !o._large_mode() )
+      if ( !this->_large_mode() && !o._large_mode() )
       {
         _store = o._store;
         _size = o._size;
       }
       else
       {
-        clear();
-        append(o.data(), o._size);
+        this->clear();
+        this->append(o.data(), o._size);
       }
     }
     return *this;
@@ -173,7 +173,7 @@ public:
   {
     if ( this != &o )
     {
-      if ( _large_mode() )
+      if ( this->_large_mode() )
         delete[] _store.ptr;
       _size = o._size;
       _cap = o._cap;
@@ -190,14 +190,14 @@ public:
 
   string &operator=(const char *s)
   {
-    clear();
-    append(s, detail::strlen_(s));
+    this->clear();
+    this->append(s, detail::strlen_(s));
     return *this;
   }
 
   ~string()
   {
-    if ( _large_mode() )
+    if ( this->_large_mode() )
       delete[] _store.ptr;
   }
 
@@ -250,7 +250,7 @@ public:
       _size = sz + 1;
       return;
     }
-    _grow_to(sz + 1);            // cold: buffer full (holds _cap chars + '\0')
+    this->_grow_to(sz + 1);            // cold: buffer full (holds _cap chars + '\0')
     char *d = _store.ptr;        // a grown string is always in large mode, so no mode test here
     d[sz] = c;
     d[sz + 1] = 0;
@@ -262,7 +262,7 @@ public:
     if ( _size != 0 )
     {
       --_size;
-      data()[_size] = 0;
+      this->data()[_size] = 0;
     }
   }
 
@@ -272,8 +272,8 @@ public:
       return;
     unsigned sz = _size;                    // same reload-avoidance as push_back
     if ( sz + n > _cap )
-      _grow_to(sz + n);
-    char *d = data();
+      this->_grow_to(sz + n);
+    char *d = this->data();
     detail::memcpy_(d + sz, s, n);
     d[sz + n] = 0;
     _size = sz + n;
@@ -293,7 +293,7 @@ public:
   {
     if ( _size != o._size )
       return false;
-    const char *a = data();
+    const char *a = this->data();
     const char *b = o.data();
     unsigned n = _size;
     while ( n >= 8 )
@@ -317,7 +317,7 @@ public:
 
   bool operator==(const char *s) const noexcept
   {
-    const char *d = data();
+    const char *d = this->data();
     unsigned i = 0;
     for ( ; i < _size; ++i )
       if ( s[i] == 0 || s[i] != d[i] )
@@ -353,7 +353,7 @@ public:
   int compare(const string &o) const noexcept
   {
     unsigned n = _size < o._size ? _size : o._size;
-    const char *a = data();
+    const char *a = this->data();
     const char *b = o.data();
     unsigned i = 0;
     for ( ; i + 8 <= n; i += 8 )
@@ -382,7 +382,7 @@ public:
   {
     unsigned m = detail::strlen_(s);
     unsigned n = _size < m ? _size : m;
-    const char *a = data();
+    const char *a = this->data();
     for ( unsigned i = 0; i < n; ++i )
       if ( a[i] != s[i] )
         return static_cast<unsigned char>(a[i]) < static_cast<unsigned char>(s[i]) ? -1 : 1;
@@ -400,7 +400,7 @@ public:
 
   unsigned find(char c, unsigned from = 0) const noexcept
   {
-    const char *d = data();
+    const char *d = this->data();
     for ( unsigned i = from; i < _size; ++i )
       if ( d[i] == c )
         return i;
@@ -409,7 +409,7 @@ public:
 
   unsigned find(const char *sub, unsigned from = 0) const noexcept
   {
-    return detail::find_sub(data(), _size, sub, detail::strlen_(sub), from);
+    return detail::find_sub(this->data(), _size, sub, detail::strlen_(sub), from);
   }
 
   bool contains(const char *sub) const noexcept { return find(sub) != npos; }
@@ -417,7 +417,7 @@ public:
 
   unsigned rfind(char c) const noexcept
   {
-    const char *d = data();
+    const char *d = this->data();
     for ( unsigned i = _size; i-- > 0; )
       if ( d[i] == c )
         return i;
@@ -431,7 +431,7 @@ public:
       return _size;
     if ( m > _size )
       return npos;
-    const char *d = data();
+    const char *d = this->data();
     for ( unsigned i = _size - m + 1; i-- > 0; )
     {
       unsigned j = 0;
@@ -445,7 +445,7 @@ public:
 
   unsigned find_first_of(const char *set, unsigned from = 0) const noexcept
   {
-    const char *d = data();
+    const char *d = this->data();
     for ( unsigned i = from; i < _size; ++i )
       for ( const char *p = set; *p != 0; ++p )
         if ( d[i] == *p )
@@ -455,7 +455,7 @@ public:
 
   unsigned find_last_of(const char *set) const noexcept
   {
-    const char *d = data();
+    const char *d = this->data();
     for ( unsigned i = _size; i-- > 0; )
       for ( const char *p = set; *p != 0; ++p )
         if ( d[i] == *p )
@@ -472,7 +472,7 @@ public:
     unsigned n = count < rem ? count : rem;
     if ( n == 0 )
       return;
-    char *d = data();
+    char *d = this->data();
     for ( unsigned i = pos; i + n < _size; ++i )
       d[i] = d[i + n];
     _size -= n;
@@ -489,7 +489,7 @@ public:
       return;
     }
     this->reserve(n);
-    char *d = this->data();            // bound after reserve(): it can move the buffer
+    char *d = this->data();            // bound after this->reserve(): it can move the buffer
     for ( unsigned i = _size; i < n; ++i )
       d[i] = fill;
     _size = n;
@@ -501,12 +501,12 @@ public:
     if ( pos > _size )
       pos = _size;
     unsigned rem = _size - pos;
-    return string(data() + pos, len < rem ? len : rem);
+    return string(this->data() + pos, len < rem ? len : rem);
   }
 
   bool starts_with(const char *p) const noexcept
   {
-    const char *d = data();
+    const char *d = this->data();
     for ( unsigned i = 0; p[i] != 0; ++i )
       if ( i >= _size || d[i] != p[i] )
         return false;
@@ -518,7 +518,7 @@ public:
     unsigned m = detail::strlen_(p);
     if ( m > _size )
       return false;
-    const char *d = data() + (_size - m);
+    const char *d = this->data() + (_size - m);
     for ( unsigned i = 0; i < m; ++i )
       if ( d[i] != p[i] )
         return false;

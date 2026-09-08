@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
-"""Export the current IDA function and its reachable callees through ida-pro-mcp.
+"""Export an IDA function and its reachable callees over MCP.
 
-Uses curl for Streamable HTTP MCP JSON-RPC requests, as requested.
+Two transports. By default the script drives hexport -- the C++ MCP server in mcp/hexport, found at
+mcp/hexport/build/hexport.exe next to this file -- as a child process speaking JSON-RPC over a pipe:
+
+    python ida_mcp_export.py --database target.i64 --function 0x140001000 --out ./export
+
+It opens the database at startup, keeps one session for every worker thread, and saves and closes
+the database on exit. There is no server to start and no port to pick.
+
+--http selects the original transport instead: an already-running MCP server (ida-pro-mcp) reached
+over Streamable HTTP with curl. That path spawns a curl.exe process, makes a temporary directory and
+writes three files for every JSON-RPC request, which is why it is no longer the default.
 """
 from __future__ import annotations
 
@@ -9,7 +19,9 @@ import argparse
 import atexit
 import json
 import os
+import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -319,6 +331,224 @@ class CurlMcpClient:
             return json.loads(joined)
         except json.JSONDecodeError:
             return joined
+
+
+def default_hexport_exe() -> str | None:
+    """hexport.exe as built by mcp/hexport/build.cmd, found relative to this script.
+
+    Nobody should have to pass a path to a binary that lives in this repository.
+    """
+    name = "hexport.exe" if os.name == "nt" else "hexport"
+    candidate = Path(__file__).resolve().parent / "mcp" / "hexport" / "build" / name
+    return str(candidate) if candidate.is_file() else None
+
+
+class HexportStdioClient:
+    """JSON-RPC to a hexport child process over its stdin/stdout.
+
+    Same surface as CurlMcpClient -- initialize / list_tools / call_tool / read_resource -- so
+    make_client() can return either and nothing else in this file needs to care.
+
+    Why this exists: CurlMcpClient spawns a curl.exe process, creates a temporary directory and
+    writes three files for EVERY JSON-RPC request. Here the process starts once, the database is
+    loaded once, and a call is a write plus a readline. hexport keeps the protocol on fd 1 and its
+    live status on fd 2, so stdout is nothing but one JSON object per line -- stderr must NOT be
+    merged into it.
+    """
+
+    def __init__(self, exe: str, database: str | None = None, *, timeout: int = 600,
+                 run_auto: bool = False, extra_args: list[str] | None = None,
+                 save_on_close: bool = True):
+        self.exe = exe
+        self.database = database
+        self.url = f"stdio:{exe}"       # what the banner prints; parity with CurlMcpClient.url
+        self._closed_db = False
+        self.save_on_close = save_on_close
+        self.timeout = timeout
+        self.request_id = 0
+        self.session_id = None          # hexport has no session header; kept for interface parity
+        self.lock = threading.Lock()
+        self._stderr_tail: deque[str] = deque(maxlen=40)
+
+        cmd = [exe, "--stdio"]
+        if run_auto:
+            cmd.append("--run-auto")
+        if extra_args:
+            cmd += list(extra_args)
+        if database:
+            cmd.append(database)
+
+        vlog(2, "HEXPORT", "spawning " + subprocess.list2cmdline(cmd))
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise McpError(f"Could not start hexport at {exe!r}: {exc}") from exc
+
+        # stdout is drained by a reader thread so a hung server hits our timeout instead of
+        # blocking forever on readline, and so a full stderr pipe can never deadlock the child.
+        self._replies: "queue.Queue[str | None]" = queue.Queue()
+        self._reader = threading.Thread(target=self._read_stdout, name="hexport-out", daemon=True)
+        self._reader.start()
+        self._errthread = threading.Thread(target=self._read_stderr, name="hexport-err", daemon=True)
+        self._errthread.start()
+        atexit.register(self.close)
+
+    def _read_stdout(self) -> None:
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if line:
+                    self._replies.put(line)
+        except (ValueError, OSError):
+            pass
+        finally:
+            self._replies.put(None)          # EOF sentinel: the child died
+
+    def _read_stderr(self) -> None:
+        try:
+            for line in self.proc.stderr:
+                line = line.rstrip()
+                if not line:
+                    continue
+                self._stderr_tail.append(line)
+                vlog(5, "HEXPORT-ERR", line)
+        except (ValueError, OSError):
+            pass
+
+    def _died(self, what: str) -> "McpError":
+        tail = "\n".join(self._stderr_tail) or "<no stderr>"
+        code = self.proc.poll()
+        return McpError(f"hexport exited (code {code}) during {what}:\n{tail}")
+
+    def _post(self, method: str, params=None, *, notification: bool = False):
+        payload = {"jsonrpc": "2.0", "method": method}
+        if not notification:
+            self.request_id += 1
+            payload["id"] = self.request_id
+        if params is not None:
+            payload["params"] = params
+
+        line = json.dumps(payload, ensure_ascii=False)
+        started = time.monotonic()
+        vlog(3, "MCP", f"stdio method={method} request_id={payload.get('id', 'notification')}")
+        if VERBOSE.enabled(6):
+            vlog(6, "MCP-PAYLOAD", line)
+
+        with self.lock:
+            if self.proc.poll() is not None:
+                raise self._died(method)
+            try:
+                self.proc.stdin.write(line + "\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError) as exc:
+                raise self._died(method) from exc
+
+            if notification:
+                return None                   # hexport answers only requests that carry an id
+
+            try:
+                raw = self._replies.get(timeout=self.timeout if self.timeout > 0 else None)
+            except queue.Empty as exc:
+                raise McpError(f"MCP request {method!r} timed out after {self.timeout}s") from exc
+
+        if raw is None:
+            raise self._died(method)
+
+        duration = time.monotonic() - started
+        vlog(3, "MCP", f"stdio complete method={method} duration={duration:.3f}s response_bytes={len(raw)}")
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise McpError(f"Invalid JSON response for {method!r}: {exc}\n{raw[:1000]}") from exc
+        if "error" in message:
+            err = message["error"]
+            raise McpError(f"MCP error {err.get('code')}: {err.get('message')}")
+        return message.get("result")
+
+    # ---- same interface as CurlMcpClient ------------------------------------------------------
+    def initialize(self):
+        result = self._post("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "ida-mcp-export-shim", "version": "1.0.0"},
+        })
+        self._post("notifications/initialized", notification=True)
+        return result
+
+    def list_tools(self):
+        result = self._post("tools/list")
+        return {tool["name"]: tool for tool in result.get("tools", [])}
+
+    def read_resource(self, uri: str):
+        result = self._post("resources/read", {"uri": uri})
+        contents = result.get("contents", [])
+        if not contents:
+            raise McpError(f"Resource {uri!r} returned no contents")
+        item = contents[0]
+        text = item.get("text")
+        if text is None:
+            return item
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        vlog(3, "TOOL", f"Calling {name} arguments={json.dumps(arguments, ensure_ascii=False)}")
+        result = self._post("tools/call", {"name": name, "arguments": arguments})
+        if result.get("isError"):
+            text = "\n".join(x.get("text", "") for x in result.get("content", []) if x.get("type") == "text")
+            raise McpError(f"Tool {name!r} failed: {text or result}")
+
+        # hexport returns whole results -- it has no preview/truncation path -- so unlike the curl
+        # client there is never a download URL to follow.
+        if "structuredContent" in result:
+            data = result["structuredContent"]
+            if isinstance(data, dict) and set(data) == {"result"}:
+                return data["result"]
+            return data
+        texts = [x.get("text", "") for x in result.get("content", []) if x.get("type") == "text"]
+        if not texts:
+            return None
+        joined = "\n".join(texts)
+        try:
+            return json.loads(joined)
+        except json.JSONDecodeError:
+            return joined
+
+    def close(self) -> None:
+        proc = getattr(self, "proc", None)
+        if proc is None or proc.poll() is not None:
+            return
+        # Save and close the database before shutting the child down. Auto-analysis and Hex-Rays
+        # both write to it, so dropping the process without this throws that work away and the next
+        # run pays to redo it. Best effort: a failure here must not mask a real export error.
+        if self.database and not self._closed_db:
+            self._closed_db = True
+            try:
+                vlog(2, "HEXPORT", f"closing database (save={self.save_on_close})")
+                self._post("tools/call",
+                           {"name": "close_database", "arguments": {"save": self.save_on_close}})
+            except (McpError, OSError, ValueError) as exc:
+                vlog(2, "HEXPORT", f"close_database failed, continuing: {exc}")
+        vlog(2, "HEXPORT", "closing child process")
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def extract_cursor_function(cursor: Any) -> tuple[str, str]:
@@ -1062,8 +1292,12 @@ def format_function(info: FunctionInfo) -> str:
 class HealthMonitor:
     """Dedicated MCP health checker shared by discovery and export workers."""
 
-    def __init__(self, args: argparse.Namespace, required_tools: set[str], stats: RunStats):
+    def __init__(self, args: argparse.Namespace, required_tools: set[str], stats: RunStats,
+                 client=None):
         self.args = args
+        # In hexport mode the health check must reuse the one live session. Building a throwaway
+        # client would start a second process against a database the first one holds open.
+        self.client = client if resolve_transport(args) else None
         self.required_tools = required_tools
         self.stats = stats
         self.lock = threading.Lock()
@@ -1108,11 +1342,16 @@ class HealthMonitor:
             self.state = "CHECK"
         self.stats.increment("health_checks")
         try:
-            client = CurlMcpClient(
-                self.args.server, curl=self.args.curl, timeout=max(1, self.args.health_timeout)
-            )
-            client.initialize()
-            tools = client.list_tools()
+            if self.client is not None:
+                tools = self.client.list_tools()
+            else:
+                client = make_client(self.args)
+                try:
+                    tools = client.list_tools()
+                finally:
+                    closer = getattr(client, "close", None)
+                    if closer is not None:
+                        closer()
             missing = sorted(self.required_tools - set(tools))
             if missing:
                 raise McpError("missing tools: " + ", ".join(missing))
@@ -2095,27 +2334,260 @@ class EnumStatusLine(LiveStatusBase):
         self.close()
 
 
-def make_client(args: argparse.Namespace) -> CurlMcpClient:
-    client = CurlMcpClient(args.server, curl=args.curl, timeout=args.timeout)
-    client.initialize()
+def resolve_transport(args: argparse.Namespace) -> str | None:
+    """The hexport executable to drive, or None to fall back to HTTP + curl.
+
+    hexport is the default when it has been built, because it is a local process on a pipe rather
+    than a curl.exe spawn and a TCP connect per request. --http forces the old path.
+    """
+    if getattr(args, "http", False):
+        return None
+    exe = getattr(args, "hexport", None) or default_hexport_exe()
+    if exe is None and not getattr(args, "http", False):
+        vlog(1, "HEXPORT", "hexport.exe not built; falling back to HTTP. Run mcp/hexport/build.cmd.")
+    return exe
+
+
+def make_client(args: argparse.Namespace):
+    """One MCP session: hexport over stdio when available, else curl over HTTP."""
+    exe = resolve_transport(args)
+    if exe:
+        client = HexportStdioClient(
+            exe,
+            database=getattr(args, "database", None),
+            timeout=args.timeout,
+            run_auto=getattr(args, "run_auto", False),
+        )
+    else:
+        client = CurlMcpClient(args.server, curl=args.curl, timeout=args.timeout)
+    client.last_init = client.initialize()   # callers read serverInfo off this
     return client
 
 
+DB_SUFFIXES = (".i64", ".idb")
+
+# IDA unpacks an open database into .id0/.id1/.id2/.nam/.til beside the .i64 and folds them back in
+# on a clean close -- verified by opening one and watching the files appear and then vanish. So their
+# presence means some process still has the database open, or was killed while holding it.
+#
+# That distinction is worth reporting because a SECOND process opening the same database gets no
+# database at all: it comes up ready=false and answers every request with "no function at address".
+# Predicting that here beats letting it surface as a few hundred confusing per-function failures.
+#
+# Note what this deliberately does NOT claim. An .i64 older than its companions is not evidence of
+# unsaved work -- an unpacked companion is rewritten just by opening the database read-only, so the
+# timestamps say nothing about whether anything was edited.
+WORKING_SUFFIXES = (".id0", ".id1", ".id2", ".nam", ".til")
+
+
+def available_memory_bytes() -> int | None:
+    """Free physical memory, or None when we cannot tell. Used only to cap --db-copies."""
+    if os.name == "nt":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullAvailPhys)
+        return None
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def plan_db_copies(database: str, requested: int) -> tuple[int, str]:
+    """How many private database copies we can afford, and why.
+
+    A database is locked by whichever process opens it -- measured: a second hexport on the same
+    .i64 reports ready=false and answers "no function at address". So parallel workers need private
+    copies, and a copy costs its size on disk AND in the worker's RAM. On a 6 GB database that is
+    6 GB per extra worker, which is why this is opt-in and capped rather than automatic.
+
+    Running the server inside IDA as a plugin does not lift the cap either: every SDK call that
+    touches the database goes through execute_sync with MFF_READ/MFF_WRITE and so runs on IDA's
+    idle main thread. One database is one core, whatever the transport.
+    """
+    if requested <= 1:
+        return 1, "single session"
+    size = os.path.getsize(database)
+    if size == 0:
+        return 1, "database is empty"
+
+    reasons = []
+    allowed = requested
+    ram = available_memory_bytes()
+    if ram is not None:
+        by_ram = max(1, int(ram * 0.5 // size))     # leave half of free RAM to everything else
+        if by_ram < allowed:
+            allowed = by_ram
+            reasons.append(f"free RAM {ram / 1e9:.1f} GB")
+    try:
+        free_disk = shutil.disk_usage(tempfile.gettempdir()).free
+        by_disk = max(1, int(free_disk * 0.5 // size))
+        if by_disk < allowed:
+            allowed = by_disk
+            reasons.append(f"free disk {free_disk / 1e9:.1f} GB")
+    except OSError:
+        pass
+
+    note = (f"{allowed} x {size / 1e9:.2f} GB copies"
+            + (f" (capped by {', '.join(reasons)})" if reasons else ""))
+    return allowed, note
+
+
+def database_busy_warning(database: str) -> str | None:
+    path = Path(database)
+    if path.suffix.lower() not in DB_SUFFIXES or not path.is_file():
+        return None
+    companions = [path.with_suffix(s) for s in WORKING_SUFFIXES]
+    present = [c for c in companions if c.exists()]
+    if not present:
+        return None
+    for c in present:
+        try:
+            fh = os.open(str(c), os.O_RDWR)
+        except OSError:
+            return (f"{path.name} is already open in another process (IDA, or another hexport). "
+                    f"A database can only be open once -- this run would see no database at all. "
+                    f"Close it there first.")
+        else:
+            os.close(fh)
+    return (f"{path.name} has leftover working files ({', '.join(c.suffix for c in present)}) from a "
+            f"process that was killed while it was open. Nothing holds them now, so this run is "
+            f"fine; they can be deleted.")
+
+class DatabasePool:
+    """Private copies of the database, one per worker process, deleted afterwards."""
+
+    def __init__(self, database: str, limit: int):
+        self.database = database
+        self.limit = limit
+        self.dir = tempfile.mkdtemp(prefix="hexport_workers_")
+        self.made = 0
+        self.lock = threading.Lock()
+        self.size = os.path.getsize(database)
+
+    def acquire(self) -> str | None:
+        """A fresh copy, or None once the affordable number has been handed out."""
+        with self.lock:
+            if self.made >= self.limit:
+                return None
+            self.made += 1
+            n = self.made
+        dst = os.path.join(self.dir, f"w{n}{Path(self.database).suffix or '.i64'}")
+        started = time.monotonic()
+        shutil.copy2(self.database, dst)
+        vlog(2, "HEXPORT", f"copy {n}/{self.limit} ({self.size / 1e6:.0f} MB) "
+                           f"in {time.monotonic() - started:.2f}s")
+        return dst
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+        if self.made:
+            vlog(2, "HEXPORT", f"removed {self.made} database copies")
+
+
 class ThreadClients:
-    """One initialized MCP client/session per worker thread."""
-    def __init__(self, args: argparse.Namespace):
+    """One initialized MCP session per worker thread -- except in hexport mode, which shares one.
+
+    Over HTTP a session per thread is what gives parallelism. hexport cannot use that model for two
+    reasons, and the second one is fatal rather than merely wasteful:
+
+      * it is single-threaded by construction (idalib requires every call on the thread that
+        initialised it), so N processes would serialise on the work anyway; and
+      * an IDA database is locked by the process that opens it, so the second hexport would come up
+        with no database at all and answer every request with "no function at address".
+
+    So hexport mode hands every thread the same client. HexportStdioClient serialises its own
+    write-then-read under a lock, which is exactly the discipline the child needs. It also means the
+    database is loaded once instead of once per worker.
+    """
+    def __init__(self, args: argparse.Namespace, shared=None):
         self.args = args
         self.local = threading.local()
+        self.hexport = resolve_transport(args)
+        self.control = shared if self.hexport else None
+        self.workers: list[Any] = []
+        self.worker_lock = threading.Lock()
+        self.pool: DatabasePool | None = None
 
-    def get(self) -> CurlMcpClient:
+        # Default is ONE session: correct at any database size, and the only sane default when a
+        # database can be several gigabytes. --db-copies buys extra cores by spending that much RAM
+        # and disk per worker, and plan_db_copies caps it at what the machine can actually take.
+        db = getattr(args, "database", None)
+        want = max(1, int(getattr(args, "db_copies", 1) or 1))
+        if self.hexport and db and want > 1:
+            if Path(db).suffix.lower() in DB_SUFFIXES and os.path.isfile(db):
+                allowed, note = plan_db_copies(db, want)
+                vlog(1, "HEXPORT", f"parallel databases: {note}")
+                if allowed > 1:
+                    self.pool = DatabasePool(db, allowed)
+            else:
+                vlog(1, "HEXPORT", f"{db!r} is not a .i64/.idb, so it cannot be copied; "
+                                   f"running one session")
+
+    def _worker_for_thread(self):
         client = getattr(self.local, "client", None)
-        if client is None:
-            client = make_client(self.args)
-            self.local.client = client
+        if client is not None:
+            return client
+        copy = self.pool.acquire() if self.pool is not None else None
+        if copy is None:
+            self.local.client = self.control        # pool exhausted: share, do not fail
+            return self.control
+        client = HexportStdioClient(
+            self.hexport, database=copy, timeout=self.args.timeout,
+            run_auto=False,                 # the copy inherits the original's analysis
+            save_on_close=False,            # throwaway; the control session saves the real one
+        )
+        client.last_init = client.initialize()
+        with self.worker_lock:
+            self.workers.append(client)
+        self.local.client = client
         return client
 
+    def close(self) -> None:
+        for client in self.workers:
+            try:
+                client.close()
+            except Exception as exc:                # cleanup must never mask a real export error
+                vlog(2, "HEXPORT", f"worker close failed: {exc}")
+        if self.pool is not None:
+            self.pool.cleanup()
+
+    def get(self):
+        if not self.hexport:                        # HTTP mode: a session per thread, unchanged
+            client = getattr(self.local, "client", None)
+            if client is None:
+                client = make_client(self.args)
+                self.local.client = client
+            return client
+        if self.pool is None:
+            return self.control                     # one session, shared; it serialises internally
+        if threading.current_thread() is threading.main_thread():
+            return self.control                     # discovery runs here and needs no copy
+        return self._worker_for_thread()
+
     def reset(self) -> None:
+        if self.hexport:
+            return          # a child process per worker; reconnecting means reloading a database
         self.local.client = None
+
+
+def make_thread_clients(args: argparse.Namespace, control) -> "ThreadClients":
+    """Workers share the control session in hexport mode, get their own over HTTP."""
+    return ThreadClients(args, shared=control)
 
 
 def run_with_retry(
@@ -2189,6 +2661,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-cache-flush", action="store_true",
                    help="Disable releasing ida-pro-mcp's Hex-Rays decompiler cache after each batch. Flushing (force_recompile on just the batch's functions) prevents IDA memory bloat and progressive slowdown/timeouts on huge exports; only runs when decompiling and when the force_recompile tool is available.")
     p.add_argument("--curl", default="curl.exe" if os.name == "nt" else "curl", help="curl executable")
+    p.add_argument("--database", "--db", "--hexport-db", dest="database", default=None, metavar="PATH",
+                   help="Database (.i64/.idb) or binary to open. hexport opens it at startup and "
+                        "saves and closes it on exit.")
+    p.add_argument("--run-auto", "--hexport-run-auto", dest="run_auto", action="store_true",
+                   help="Have hexport run auto-analysis on the database after opening it")
+    p.add_argument("--db-copies", type=int, default=1, metavar="N",
+                   help="Run N hexport processes over N private copies of the database for real "
+                        "multi-core throughput. Costs one copy of the database in disk AND RAM per "
+                        "worker, so it is capped at what free memory allows; default 1 (no copies). "
+                        "One database can only ever be driven by one core -- IDA serialises every "
+                        "database access onto a single thread, in a plugin just as much as here.")
+    p.add_argument("--http", action="store_true",
+                   help="Use the old transport: an already-running MCP server over HTTP via curl, "
+                        "instead of driving a local hexport process")
+    p.add_argument("--hexport", default=None, metavar="EXE",
+                   help="Override the hexport executable (default: mcp/hexport/build/hexport.exe "
+                        "next to this script)")
     p.add_argument("--list-tools", action="store_true", help="Print enabled MCP tools and exit")
     p.add_argument(
         "--verbose", nargs="?", const=1, default=0, type=int, choices=range(0, 7), metavar="LEVEL",
@@ -2549,8 +3038,12 @@ def main() -> int:
     args.page_size = min(50000, max(1, args.page_size))
     workers = auto_workers(args.workers)
 
-    control = CurlMcpClient(args.server, curl=args.curl, timeout=args.timeout)
-    init = control.initialize()
+    if getattr(args, "database", None):
+        busy = database_busy_warning(args.database)
+        if busy:
+            console_print(color("[WARN] " + busy, Colors.YELLOW + Colors.BOLD))
+    control = make_client(args)      # hexport over stdio, or curl over HTTP
+    init = getattr(control, "last_init", None) or {}
     tools = control.list_tools()
     required = {"lookup_funcs", "disasm", "decompile"}
     missing = sorted(required - set(tools))
@@ -2626,8 +3119,10 @@ def main() -> int:
 
     root_source = "--all-fns" if args.all_fns else ("--address" if args.address else ("--function" if args.function else "IDA cursor"))
     root = FunctionInfo(root_addr, root_name, 0, root_source)
-    clients = ThreadClients(args)
-    health = HealthMonitor(args, required, stats)
+    clients = ThreadClients(args, shared=control)   # hexport mode reuses the control session
+    # Worker processes and their database copies must go even if the export raises.
+    atexit.register(clients.close)
+    health = HealthMonitor(args, required, stats, client=control)
     health.mark_initial_ok()
     health.start()
 

@@ -8,14 +8,14 @@ class McpCommands
 public:
   // --- database lifecycle (also exposed as MCP tools) ---
   bool open(const char *file_path, bool run_auto);   // used by --open and open_database
-  void close();
+  void close(bool save = false);
   bool opened() const { return is_open; }
 
   qstring module_name() const;     // normalized "name.ext" (strips " - Copy" etc.)
 
   // --- tools: build structured result into `out` (Mcp wraps as {"result": out}) ---
   void open_database(const jobj_t *args, jvalue_t *out);
-  void close_database(jvalue_t *out);
+  void close_database(const jobj_t *args, jvalue_t *out);
   void list_databases(jvalue_t *out);
   void server_health(jvalue_t *out);
   void entity_query(const jvalue_t *queries, jvalue_t *out);

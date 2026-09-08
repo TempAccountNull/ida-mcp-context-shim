@@ -31,7 +31,7 @@ public:
 
   vector(const vector &o) : _first(nullptr), _last(nullptr), _end(nullptr)
   {
-    _copy_from(o._first, o.size());
+    this->_copy_from(o._first, o.size());
   }
 
   vector(vector &&o) noexcept : _first(o._first), _last(o._last), _end(o._end)
@@ -43,8 +43,8 @@ public:
   {
     if ( this != &o )
     {
-      clear();
-      _copy_from(o._first, o.size());
+      this->clear();
+      this->_copy_from(o._first, o.size());
     }
     return *this;
   }
@@ -53,7 +53,7 @@ public:
   {
     if ( this != &o )
     {
-      _free();
+      this->_free();
       _first = o._first;
       _last = o._last;
       _end = o._end;
@@ -100,32 +100,32 @@ public:
 
   void shrink_to_fit()
   {
-    if ( capacity() == size() )
+    if ( this->capacity() == this->size() )
       return;
-    if ( empty() )
+    if ( this->empty() )
     {
-      _free();
+      this->_free();
       return;
     }
-    _reallocate(size());
+    this->_reallocate(this->size());
   }
 
   void clear() noexcept
   {
-    _destroy(_first, _last);
+    this->_destroy(_first, _last);
     _last = _first;
   }
 
   void reserve(unsigned n)
   {
-    if ( n > capacity() )
-      _grow_to(n);
+    if ( n > this->capacity() )
+      this->_grow_to(n);
   }
 
   void push_back(const T &v)
   {
     if ( _last == _end )
-      _grow_to(size() + 1);
+      this->_grow_to(this->size() + 1);
     ::new (static_cast<void *>(_last), place_t{}) T(v);            // copy-construct in place
     ++_last;
   }
@@ -133,7 +133,7 @@ public:
   void push_back(T &&v)
   {
     if ( _last == _end )
-      _grow_to(size() + 1);
+      this->_grow_to(this->size() + 1);
     ::new (static_cast<void *>(_last), place_t{}) T(static_cast<T &&>(v));   // move-construct in place
     ++_last;
   }
@@ -142,7 +142,7 @@ public:
   T &emplace_back(A &&...a)
   {
     if ( _last == _end )
-      _grow_to(size() + 1);
+      this->_grow_to(this->size() + 1);
     ::new (static_cast<void *>(_last), place_t{}) T(static_cast<A &&>(a)...);
     return *_last++;
   }
@@ -158,15 +158,15 @@ public:
 
   void resize(unsigned n)
   {
-    if ( n < size() )
+    if ( n < this->size() )
     {
-      _destroy(_first + n, _last);
+      this->_destroy(_first + n, _last);
       _last = _first + n;
     }
-    else if ( n > size() )
+    else if ( n > this->size() )
     {
-      reserve(n);
-      while ( size() < n )
+      this->reserve(n);
+      while ( this->size() < n )
       {
         ::new (static_cast<void *>(_last), place_t{}) T();
         ++_last;
@@ -176,15 +176,15 @@ public:
 
   void resize(unsigned n, const T &value)
   {
-    if ( n < size() )
+    if ( n < this->size() )
     {
-      _destroy(_first + n, _last);
+      this->_destroy(_first + n, _last);
       _last = _first + n;
     }
     else
     {
-      reserve(n);
-      while ( size() < n )
+      this->reserve(n);
+      while ( this->size() < n )
       {
         ::new (static_cast<void *>(_last), place_t{}) T(value);
         ++_last;
@@ -194,29 +194,29 @@ public:
 
   void assign(unsigned count, const T &value)
   {
-    clear();
-    reserve(count);
+    this->clear();
+    this->reserve(count);
     for ( unsigned i = 0; i < count; ++i )
-      push_back(value);
+      this->push_back(value);
   }
 
   void erase(unsigned pos) noexcept
   {
-    unsigned n = size();
+    unsigned n = this->size();
     if ( pos >= n )
       return;
     for ( unsigned j = pos; j + 1 < n; ++j )
       _first[j] = static_cast<T &&>(_first[j + 1]);   // shift the tail down one
-    pop_back();                                        // destroy the vacated last slot
+    this->pop_back();                                        // destroy the vacated last slot
   }
 
   void insert(unsigned pos, const T &v)
   {
-    unsigned n = size();
+    unsigned n = this->size();
     if ( pos > n )
       pos = n;
     if ( _last == _end )
-      _grow_to(n + 1);
+      this->_grow_to(n + 1);
     if ( n == 0 )
     {
       ::new (static_cast<void *>(_last), place_t{}) T(v);
@@ -243,9 +243,9 @@ public:
 
   bool operator==(const vector &o) const
   {
-    if ( size() != o.size() )
+    if ( this->size() != o.size() )
       return false;
-    for ( unsigned i = 0, n = size(); i < n; ++i )
+    for ( unsigned i = 0, n = this->size(); i < n; ++i )
       if ( !(_first[i] == o._first[i]) )
         return false;
     return true;
@@ -267,10 +267,10 @@ private:
   // grow took push_back from 0.95 to 0.58 ns/op.
   __declspec(noinline) void _grow_to(unsigned min_cap)
   {
-    unsigned old_cap = capacity();
+    unsigned old_cap = this->capacity();
     unsigned geo = old_cap + old_cap / 2;                 // 1.5x geometric growth
     unsigned new_cap = geo < min_cap ? min_cap : geo;     // ...at least what's needed
-    _reallocate(new_cap == 0 ? 1 : new_cap);
+    this->_reallocate(new_cap == 0 ? 1 : new_cap);
   }
 
   // Move every element into a block of exactly new_cap and free the old one. Split out of _grow_to
@@ -278,7 +278,7 @@ private:
   void _reallocate(unsigned new_cap)
   {
     T *nb = static_cast<T *>(::operator new(static_cast<unsigned long long>(new_cap) * sizeof(T)));
-    unsigned n = size();
+    unsigned n = this->size();
     if constexpr ( __is_trivially_copyable(T) )
     {
       for ( unsigned i = 0; i < n; ++i )     // fast path: trivial relocate
@@ -303,7 +303,7 @@ private:
   {
     if ( n != 0 )
     {
-      reserve(n);
+      this->reserve(n);
       for ( unsigned i = 0; i < n; ++i )
         ::new (static_cast<void *>(_first + i), place_t{}) T(src[i]);
       _last = _first + n;
@@ -312,7 +312,7 @@ private:
 
   void _free() noexcept
   {
-    _destroy(_first, _last);
+    this->_destroy(_first, _last);
     if ( _first != nullptr )
       ::operator delete(_first);
     _first = _last = _end = nullptr;
