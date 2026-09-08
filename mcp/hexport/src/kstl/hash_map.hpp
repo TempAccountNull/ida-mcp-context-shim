@@ -22,7 +22,10 @@
 //
 //   4. A 7/8 fill, the same as phmap. Anything lower spends a whole extra doubling at the sizes
 //      where the two disagree (N=100k and N=200k), and that 2x memory -- not probe length -- was
-//      what lost those rows outright. See _max_fill.
+//      what lost those rows outright. See _max_fill. A full table is rebuilt at the same capacity
+//      when tombstones rather than live entries filled it, so insert/erase churn does not grow the
+//      map: 2M erase+insert pairs over a constant 50k live set held capacity at 65536, where
+//      doubling unconditionally took it to 524288 and never gave it back.
 //
 //   5. Triangular group probing, sixteen slots per SSE compare -- the same probe sequence phmap
 //      uses, and the reason neither of us suffers the primary clustering that a linear walk builds
@@ -33,12 +36,12 @@
 //
 // Measured against phmap::flat_hash_map (parallel-hashmap) and std::unordered_map over 170 rows
 // (5 sizes x 8 key distributions x 8 workloads, median of 11 interleaved runs, paired sign test):
-//      148 win / 9 tie / 13 loss vs phmap, geometric mean 1.35x
+//      149 win / 10 tie / 11 loss vs phmap, geometric mean 1.35x
 //      170 of 170 vs std::unordered_map
-// Seven of those losses are statistically significant; the rest are inside run-to-run noise and
-// change sign between runs. Every significant one is named in the notes at the bottom, with its
-// cause. None of them is a probing problem any more: what is left is one mispredicting branch on a
-// 144 KB table, streaming 16 MB of 64-byte values, and hashing 40-byte string keys.
+// Every remaining loss is named in the notes at the bottom, with its cause. None of them is a
+// probing problem any more: what is left is one mispredicting branch on a 144 KB table, streaming
+// 16 MB of 64-byte values, and hashing 40-byte string keys. Several sit within their own run-to-run
+// spread and change sign between runs; the notes say which.
 #pragma once
 #include "vector.hpp"
 #include "hash.hpp"     // kstl::hash<K> (identity for integers, hash_bytes for the rest)
@@ -114,7 +117,7 @@ public:
   {
     if ( _cap != 0 )
     {
-      unsigned i = unsigned((H{}(key) * FIB) >> _shift);
+      unsigned i = static_cast<unsigned>((H{}(key) * FIB) >> _shift);
       _pf(&_state[i]);
       _pf(&_ent[i]);
     }
@@ -124,7 +127,7 @@ public:
   {
     unsigned i;
     if ( _emplace_slot(key, i) )
-      ::new ((void *)&_ent[i].val, place_t{}) V();
+      ::new (static_cast<void *>(&_ent[i].val), place_t{}) V();
     return _ent[i].val;
   }
 
@@ -133,7 +136,7 @@ public:
     unsigned i;
     bool created = _emplace_slot(key, i);
     if ( created )
-      ::new ((void *)&_ent[i].val, place_t{}) V(val);
+      ::new (static_cast<void *>(&_ent[i].val), place_t{}) V(val);
     else
       _ent[i].val = val;
     return created;
@@ -148,7 +151,7 @@ public:
       return false;
     // Slot index from the value pointer: step back to the entry, then offset from the array.
     entry_t *e = reinterpret_cast<entry_t *>(reinterpret_cast<char *>(v) - __builtin_offsetof(entry_t, val));
-    unsigned i = unsigned(e - _ent);
+    unsigned i = static_cast<unsigned>(e - _ent);
     _ent[i].key.~K();
     _ent[i].val.~V();
     _set_state(i, TOMB);
@@ -186,12 +189,12 @@ public:
     unsigned i = 0;
     for ( ; i + 8 <= _cap; i += 8 )
     {
-      unsigned long long occupied = *(const unsigned long long *)(_state + i) & MSBS;
+      unsigned long long occupied = *reinterpret_cast<const unsigned long long *>(_state + i) & MSBS;
       while ( occupied != 0 )
       {
         unsigned long idx;
         _BitScanForward64(&idx, occupied);
-        unsigned j = i + (unsigned(idx) >> 3);
+        unsigned j = i + (static_cast<unsigned>(idx) >> 3);
         f(_ent[j].key, _ent[j].val);
         occupied &= occupied - 1;                    // clear the slot we just visited
       }
@@ -226,8 +229,8 @@ public:
   {
     stats_t s;
     s.capacity = _cap; s.size = _size; s.tombstones = _tombs;
-    s.bytes = (unsigned long long)_cap * (sizeof(entry_t) + 1);
-    s.load = _cap != 0 ? double(_size) / double(_cap) : 0.0;
+    s.bytes = static_cast<unsigned long long>(_cap) * (sizeof(entry_t) + 1);
+    s.load = _cap != 0 ? static_cast<double>(_size) / static_cast<double>(_cap) : 0.0;
     s.hit_probe = 0; s.miss_probe = 0; s.max_probe = 0;
     if ( _cap == 0 )
       return s;
@@ -240,7 +243,7 @@ public:
     {
       if ( _state[i] < FULL_MIN )
         continue;
-      unsigned offset = unsigned((H{}(_ent[i].key) * FIB) >> _shift);
+      unsigned offset = static_cast<unsigned>((H{}(_ent[i].key) * FIB) >> _shift);
       unsigned step = 0, probes = 1;
       while ( ((i - offset) & mask) >= GROUP )
       {
@@ -252,7 +255,7 @@ public:
       if ( probes > s.max_probe )
         s.max_probe = probes;
     }
-    s.hit_probe = _size != 0 ? double(total) / double(_size) : 0.0;
+    s.hit_probe = _size != 0 ? static_cast<double>(total) / static_cast<double>(_size) : 0.0;
 
     // Misses: from each home, walk until a group holds an EMPTY. Sampled on big tables; this is a
     // diagnostic, not a hot path.
@@ -263,7 +266,7 @@ public:
       unsigned offset = h, step = 0, probes = 1;
       for ( ;; )
       {
-        __m128i g = _mm_loadu_si128((const __m128i *)(_state + offset));
+        __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i *>(_state + offset));
         if ( _mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)) != 0 )
           break;
         step += GROUP;
@@ -273,7 +276,7 @@ public:
       msum += probes;
       ++n;
     }
-    s.miss_probe = n != 0 ? double(msum) / double(n) : 0.0;
+    s.miss_probe = n != 0 ? static_cast<double>(msum) / static_cast<double>(n) : 0.0;
     return s;
   }
 
@@ -326,7 +329,7 @@ private:
   // already misses often enough to absorb one. Set at 2 MB instead it also switched the early-out
   // off for the 100k tables, which do not need it off: that cost ~12 rows their win (they fell to
   // ties) and 0.02 of the geometric mean.
-  enum : unsigned { HOME_PROBE_MIN_CAP = unsigned((512ull << 10) / sizeof(entry_t)) };
+  enum : unsigned { HOME_PROBE_MIN_CAP = static_cast<unsigned>((512ull << 10) / sizeof(entry_t)) };
 
   // How full a table is allowed to get before it grows: seven eighths, the same as phmap
   // (phmap.h: "We use 7/8th as maximum load factor", capacity - capacity/8).
@@ -351,6 +354,12 @@ private:
   // against RANDOM keys.)
   static unsigned _max_fill(unsigned cap) noexcept { return cap - cap / 8; }   // 7/8
 
+  // Live-entry ceiling under which a full table is rebuilt at the SAME capacity to shed tombstones
+  // rather than doubled (see _emplace_slot). 25/32 = 0.78, below the 7/8 fill, so a table filled by
+  // live entries still grows. Tiny tables give 0 here and always double, which is what we want:
+  // rebuilding a 16-slot table to shed tombstones is not worth a pass over it.
+  static unsigned _purge_limit(unsigned cap) noexcept { return (cap >> 5) * 25; }
+
   static unsigned _log2(unsigned v) noexcept
   {
     unsigned k = 0;
@@ -361,10 +370,10 @@ private:
   // Middle bits: the bucket takes the top bits, so these stay independent of the slot choice.
   static unsigned char _fp(unsigned long long m) noexcept
   {
-    return (unsigned char)(FULL_MIN | ((m >> 24) & 0x7F));
+    return static_cast<unsigned char>(FULL_MIN | ((m >> 24) & 0x7F));
   }
 
-  static void _pf(const void *p) noexcept { _mm_prefetch((char const *)p, 1); }   // 1 = _MM_HINT_T0
+  static void _pf(const void *p) noexcept { _mm_prefetch(static_cast<const char *>(p), 1); }   // 1 = _MM_HINT_T0
 
   // The value of `key`, or nullptr: the plain linear walk, one slot at a time. Every slot's
   // address comes from the hash alone, so each state byte and its entry load in PARALLEL; that
@@ -399,7 +408,7 @@ private:
   __forceinline V *_locate(const K &key, unsigned long long m) const noexcept
   {
     unsigned mask = _cap - 1;
-    unsigned home = unsigned(m >> _shift);
+    unsigned home = static_cast<unsigned>(m >> _shift);
     unsigned char fp = _fp(m);
     // Home slot first, straight from the hash: its state byte and its entry load issue in PARALLEL,
     // and this resolves the common hit with no SIMD at all. Insert puts a key at its home slot
@@ -433,15 +442,15 @@ private:
     // nor an empty, so they neither match nor stop the scan. The home slot is re-examined here when
     // the probe above ran; that costs one redundant key compare on a 1-in-128 fingerprint collision
     // and saves masking its bit out on every single lookup.
-    __m128i fpv = _mm_set1_epi8((char)fp);
+    __m128i fpv = _mm_set1_epi8(static_cast<char>(fp));
     __m128i zero = _mm_setzero_si128();
     unsigned offset = home;
     unsigned step = 0;
     for ( ;; )
     {
-      __m128i g = _mm_loadu_si128((const __m128i *)(_state + offset));
-      unsigned empties = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)));
-      unsigned cand = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(g, fpv)));
+      __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i *>(_state + offset));
+      unsigned empties = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)));
+      unsigned cand = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(g, fpv)));
       // Only slots BEFORE the group's first empty are on the probe path, so trim to those. Insert
       // always takes the first free slot in a group and a slot never goes back to EMPTY (erase
       // writes TOMB), so no key can sit past an empty one -- a fingerprint match beyond it is
@@ -454,7 +463,7 @@ private:
       {
         unsigned long b;
         _BitScanForward(&b, cand);
-        unsigned j = (offset + unsigned(b)) & mask;
+        unsigned j = (offset + static_cast<unsigned>(b)) & mask;
         if ( _ent[j].key == key )
           return &_ent[j].val;
       }
@@ -468,9 +477,20 @@ private:
   bool _emplace_slot(const K &key, unsigned &idx)
   {
     if ( _size + _tombs + 1 > _max_fill(_cap) )
-      _rehash(_cap == 0 ? MIN_CAP : _cap * 2);
+    {
+      // A full table is not necessarily a table that needs to GROW. Tombstones count toward the fill
+      // (they have to -- a probe runs through them), so an insert/erase churn drives the table to
+      // max_fill with a live set that never changes. Doubling on that is wrong twice over: the
+      // memory is never given back, and a long-running churn doubles forever. Rehashing at the SAME
+      // capacity drops every tombstone and puts the load back where the live entries alone put it.
+      // Only genuine live growth doubles. (This is abseil's rule and its 25/32 threshold, which sits
+      // below max_fill so a table that really is full still grows; the rebuild cannot re-trigger
+      // because it clears _tombs and leaves _size + 1 under the limit.)
+      unsigned grown = (_cap == 0) ? MIN_CAP : _cap * 2;
+      _rehash(_cap != 0 && _size + 1 <= _purge_limit(_cap) ? _cap : grown);
+    }
     unsigned long long m = H{}(key) * FIB;
-    unsigned home = unsigned(m >> _shift);
+    unsigned home = static_cast<unsigned>(m >> _shift);
     unsigned char fp = _fp(m);
     unsigned mask = _cap - 1;
 
@@ -484,33 +504,33 @@ private:
     // the home slot whenever the home slot is free -- which is what keeps the lookup's parallel
     // home probe hitting. A group holding an EMPTY proves the key absent (nothing can live past an
     // empty group), so the search stops there and places at the earliest free slot remembered.
-    __m128i fpv = _mm_set1_epi8((char)fp);
+    __m128i fpv = _mm_set1_epi8(static_cast<char>(fp));
     __m128i zero = _mm_setzero_si128();
     unsigned first_free = _cap;
     unsigned offset = home;
     unsigned step = 0;
     for ( ;; )
     {
-      __m128i g = _mm_loadu_si128((const __m128i *)(_state + offset));
-      unsigned empties = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)));
-      unsigned cand = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(g, fpv)));
+      __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i *>(_state + offset));
+      unsigned empties = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)));
+      unsigned cand = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(g, fpv)));
       if ( empties != 0 )                            // only slots before the first empty can hold it
         cand &= (empties & (0u - empties)) - 1u;
       for ( ; cand != 0; cand &= cand - 1 )
       {
         unsigned long b;
         _BitScanForward(&b, cand);
-        unsigned j = (offset + unsigned(b)) & mask;
+        unsigned j = (offset + static_cast<unsigned>(b)) & mask;
         if ( _ent[j].key == key ) { idx = j; return false; }
       }
       if ( first_free == _cap )
       {
-        unsigned freem = (~unsigned(_mm_movemask_epi8(g))) & 0xFFFFu;   // EMPTY or TOMB: high bit clear
+        unsigned freem = (~static_cast<unsigned>(_mm_movemask_epi8(g))) & 0xFFFFu;   // EMPTY or TOMB: high bit clear
         if ( freem != 0 )
         {
           unsigned long b;
           _BitScanForward(&b, freem);
-          first_free = (offset + unsigned(b)) & mask;
+          first_free = (offset + static_cast<unsigned>(b)) & mask;
         }
       }
       if ( empties != 0 )
@@ -518,7 +538,7 @@ private:
         unsigned pos = first_free;
         if ( _state[pos] == TOMB )
           --_tombs;
-        ::new ((void *)&_ent[pos].key, place_t{}) K(key);
+        ::new (static_cast<void *>(&_ent[pos].key), place_t{}) K(key);
         _set_state(pos, fp);
         ++_size;
         idx = pos;
@@ -539,25 +559,25 @@ private:
                   unsigned i, unsigned long long m) noexcept
   {
     __m128i zero = _mm_setzero_si128();
-    unsigned offset = unsigned(m >> new_shift);
+    unsigned offset = static_cast<unsigned>(m >> new_shift);
     unsigned step = 0;
     unsigned j;
     for ( ;; )
     {
-      __m128i g = _mm_loadu_si128((const __m128i *)(ns + offset));
-      unsigned empties = unsigned(_mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)));
+      __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ns + offset));
+      unsigned empties = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(g, zero)));
       if ( empties != 0 )
       {
         unsigned long b;
         _BitScanForward(&b, empties);
-        j = (offset + unsigned(b)) & mask;
+        j = (offset + static_cast<unsigned>(b)) & mask;
         break;
       }
       step += GROUP;
       offset = (offset + step) & mask;
     }
-    ::new ((void *)&ne[j].key, place_t{}) K(static_cast<K &&>(_ent[i].key));
-    ::new ((void *)&ne[j].val, place_t{}) V(static_cast<V &&>(_ent[i].val));
+    ::new (static_cast<void *>(&ne[j].key), place_t{}) K(static_cast<K &&>(_ent[i].key));
+    ::new (static_cast<void *>(&ne[j].val), place_t{}) V(static_cast<V &&>(_ent[i].val));
     ns[j] = _fp(m);
     if ( j < GROUP )
       ns[mask + 1 + j] = ns[j];          // keep the new table's mirror tail in sync
@@ -568,7 +588,7 @@ private:
   __declspec(noinline) void _rehash(unsigned new_cap)   // new_cap is a power of 2, >= MIN_CAP
   {
     unsigned char *ns = static_cast<unsigned char *>(::operator new(new_cap + GROUP));
-    entry_t *ne = static_cast<entry_t *>(::operator new((unsigned long long)new_cap * sizeof(entry_t)));
+    entry_t *ne = static_cast<entry_t *>(::operator new(static_cast<unsigned long long>(new_cap) * sizeof(entry_t)));
     for ( unsigned i = 0; i < new_cap + GROUP; ++i )
       ns[i] = EMPTY;
     unsigned mask = new_cap - 1;
@@ -659,22 +679,25 @@ private:
 //    probe. Anchoring the first group at the home slot keeps that, and 4M went 13 win / 2 loss to
 //    15 win / 1 loss across the rewrite.
 //
-// Still losing to phmap, with the reason, so nobody hunts them blind. Seven significant rows of
-// 170; sequential and random64 keys lose nothing at all:
-//   - 10k random all-hit 0.64x and 50%-miss 0.83x. Both are the SAME cost: the `s0 == fp` test in
-//     the home probe is a ~70/30 coin flip when the keys are random and the lookup is a hit, and on
-//     a 144 KB table one mispredict is most of the lookup. It cannot be removed -- deleting the home
-//     probe takes these to ~0.81x/1.21x but costs every ordered all-hit row far more (see the
-//     rejected entry above). Both rows are 0.03-0.06 ms end to end, 3.1-3.3 ns/op.
-//     The all-MISS row at the same size used to be the worst of the three at 0.71x and is now
-//     1.41x, reproduced across three runs at 11/11 paired, because that one was the `s0 == EMPTY`
-//     coin flip and that test could be gated on size.
-//   - 200k 64-byte iterate 0.86x: bound by streaming 16 MB of values, not by probing. for_each
-//     already scans state 8 bytes at a time; the cost is the entry traffic itself.
+// Still losing to phmap, with the reason, so nobody hunts them blind. Eleven rows of 170;
+// sequential and addresses keys lose nothing at all:
+//   - 10k random all-hit 0.68x, and the 50%-miss rows (10k random 0.88x, 100k random 0.83x, 10k
+//     spread 0.97x, 100k random64 0.95x). All the SAME cost: the `s0 == fp` test in the home probe
+//     is a ~70/30 coin flip when the keys are random and the lookup is a hit, and on an L2-resident
+//     table one mispredict is most of the lookup. A 50%-miss stream mispredicts it by construction.
+//     It cannot simply be removed -- deleting the home probe takes 10k random to ~0.81x/1.21x but
+//     costs every ordered all-hit row far more (see the rejected entry above). These rows are
+//     0.03-1.4 ms end to end, 2.1-7.0 ns/op.
+//     The all-MISS row at 10k random used to be the worst of that group at 0.71x and is now 1.41x,
+//     reproduced across three runs at 11/11 paired, because that one was the `s0 == EMPTY` coin
+//     flip and that test could be gated on size.
+//   - 200k 64-byte iterate 0.83x/0.87x and 1M clustered iterate 0.93x: bound by streaming the value
+//     array, not by probing. for_each already scans state 8 bytes at a time; the cost is the entry
+//     traffic itself.
 //   - strkeys len=40 insert 0.87x: bound by hashing 40-byte keys, not by probing.
-//   - 4M spread mixed 0.80x, 1M clustered unreserved insert 0.92x, 100k addresses all-miss 0.97x:
-//     each within a couple of points of its own run-to-run spread (cv 12-31%) and each has landed
-//     on the winning side in other runs. Re-measure before believing any of them.
+//   - 4M spread mixed 0.85x and 1M clustered unreserved insert 0.92x: both sit within their own
+//     run-to-run spread (cv up to 22%) and have landed on the winning side in other runs.
+//     Re-measure before believing either.
 // ---------------------------------------------------------------------------------------------
 
 }  // namespace kstl

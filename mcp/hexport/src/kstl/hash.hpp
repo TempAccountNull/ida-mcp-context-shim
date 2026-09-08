@@ -29,24 +29,24 @@ inline unsigned long long hash_bytes(const char *p, unsigned n) noexcept
 {
   const unsigned long long S0 = 0x9E3779B97F4A7C15ull;
   const unsigned long long S1 = 0xC2B2AE3D27D4EB4Full;
-  unsigned long long h = S0 ^ ((unsigned long long)n * S1);
+  unsigned long long h = S0 ^ (static_cast<unsigned long long>(n) * S1);
   while ( n >= 8 )
   {
-    h = hash_mix(h ^ *(const unsigned long long *)p, S1);
+    h = hash_mix(h ^ *reinterpret_cast<const unsigned long long *>(p), S1);
     p += 8;
     n -= 8;
   }
   if ( n >= 4 )
   {
-    unsigned long long lo = *(const unsigned *)p;
-    unsigned long long hi = *(const unsigned *)(p + n - 4);
+    unsigned long long lo = *reinterpret_cast<const unsigned *>(p);
+    unsigned long long hi = *reinterpret_cast<const unsigned *>(p + n - 4);
     h = hash_mix(h ^ (lo | (hi << 32)), S1);
   }
   else if ( n != 0 )
   {
-    unsigned long long t = (unsigned long long)(unsigned char)p[0]
-                         | ((unsigned long long)(unsigned char)p[n >> 1] << 8)
-                         | ((unsigned long long)(unsigned char)p[n - 1] << 16);
+    unsigned long long t = static_cast<unsigned long long>(static_cast<unsigned char>(p[0]))
+                         | (static_cast<unsigned long long>(static_cast<unsigned char>(p[n >> 1])) << 8)
+                         | (static_cast<unsigned long long>(static_cast<unsigned char>(p[n - 1])) << 16);
     h = hash_mix(h ^ t, S1);
   }
   return hash_mix(h, S0);
@@ -66,11 +66,11 @@ struct hash
 };
 
 // Integer keys -> identity. The map multiplies by 2^64/phi internally, so distribution is fine.
-template <> struct hash<int>                { unsigned long long operator()(int v) const noexcept { return (unsigned)v; } };
+template <> struct hash<int>                { unsigned long long operator()(int v) const noexcept { return static_cast<unsigned>(v); } };
 template <> struct hash<unsigned>           { unsigned long long operator()(unsigned v) const noexcept { return v; } };
-template <> struct hash<long>               { unsigned long long operator()(long v) const noexcept { return (unsigned long)v; } };
+template <> struct hash<long>               { unsigned long long operator()(long v) const noexcept { return static_cast<unsigned long>(v); } };
 template <> struct hash<unsigned long>      { unsigned long long operator()(unsigned long v) const noexcept { return v; } };
-template <> struct hash<long long>          { unsigned long long operator()(long long v) const noexcept { return (unsigned long long)v; } };
+template <> struct hash<long long>          { unsigned long long operator()(long long v) const noexcept { return static_cast<unsigned long long>(v); } };
 template <> struct hash<unsigned long long> { unsigned long long operator()(unsigned long long v) const noexcept { return v; } };
 
 }  // namespace kstl

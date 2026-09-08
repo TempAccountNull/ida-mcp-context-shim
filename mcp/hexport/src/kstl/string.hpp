@@ -205,7 +205,7 @@ public:
     unsigned n = _size;
     while ( n >= 8 )
     {
-      if ( *(const unsigned long long *)a != *(const unsigned long long *)b )
+      if ( *reinterpret_cast<const unsigned long long *>(a) != *reinterpret_cast<const unsigned long long *>(b) )
         return false;
       a += 8;
       b += 8;
@@ -213,8 +213,8 @@ public:
     }
     if ( n >= 4 )
     {
-      return *(const unsigned *)a == *(const unsigned *)b
-          && *(const unsigned *)(a + n - 4) == *(const unsigned *)(b + n - 4);
+      return *reinterpret_cast<const unsigned *>(a) == *reinterpret_cast<const unsigned *>(b)
+          && *reinterpret_cast<const unsigned *>(a + n - 4) == *reinterpret_cast<const unsigned *>(b + n - 4);
     }
     for ( unsigned i = 0; i < n; ++i )
       if ( a[i] != b[i] )

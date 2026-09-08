@@ -91,7 +91,7 @@ inline void sift_down(T *a, unsigned root, unsigned n, C comp)
 template <class T, class C>
 inline void heap_sort(T *first, T *last, C comp)
 {
-  unsigned n = unsigned(last - first);
+  unsigned n = static_cast<unsigned>(last - first);
   for ( unsigned i = n / 2; i-- > 0; )
     sift_down(first, i, n, comp);
   for ( unsigned end = n; end > 1; )

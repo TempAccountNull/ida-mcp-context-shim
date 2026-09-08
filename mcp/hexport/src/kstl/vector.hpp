@@ -60,8 +60,8 @@ public:
 
   ~vector() { _free(); }
 
-  unsigned size() const noexcept     { return unsigned(_last - _first); }
-  unsigned capacity() const noexcept { return unsigned(_end - _first); }
+  unsigned size() const noexcept     { return static_cast<unsigned>(_last - _first); }
+  unsigned capacity() const noexcept { return static_cast<unsigned>(_end - _first); }
   bool empty() const noexcept        { return _first == _last; }
 
   T *data() noexcept              { return _first; }
@@ -92,7 +92,7 @@ public:
   {
     if ( _last == _end )
       _grow_to(size() + 1);
-    ::new ((void *)_last, place_t{}) T(v);            // copy-construct in place
+    ::new (static_cast<void *>(_last), place_t{}) T(v);            // copy-construct in place
     ++_last;
   }
 
@@ -100,7 +100,7 @@ public:
   {
     if ( _last == _end )
       _grow_to(size() + 1);
-    ::new ((void *)_last, place_t{}) T(static_cast<T &&>(v));   // move-construct in place
+    ::new (static_cast<void *>(_last), place_t{}) T(static_cast<T &&>(v));   // move-construct in place
     ++_last;
   }
 
@@ -109,7 +109,7 @@ public:
   {
     if ( _last == _end )
       _grow_to(size() + 1);
-    ::new ((void *)_last, place_t{}) T(static_cast<A &&>(a)...);
+    ::new (static_cast<void *>(_last), place_t{}) T(static_cast<A &&>(a)...);
     return *_last++;
   }
 
@@ -134,7 +134,7 @@ public:
       reserve(n);
       while ( size() < n )
       {
-        ::new ((void *)_last, place_t{}) T();
+        ::new (static_cast<void *>(_last), place_t{}) T();
         ++_last;
       }
     }
@@ -152,7 +152,7 @@ public:
       reserve(n);
       while ( size() < n )
       {
-        ::new ((void *)_last, place_t{}) T(value);
+        ::new (static_cast<void *>(_last), place_t{}) T(value);
         ++_last;
       }
     }
@@ -185,11 +185,11 @@ public:
       _grow_to(n + 1);
     if ( n == 0 )
     {
-      ::new ((void *)_last, place_t{}) T(v);
+      ::new (static_cast<void *>(_last), place_t{}) T(v);
     }
     else
     {
-      ::new ((void *)_last, place_t{}) T(static_cast<T &&>(_first[n - 1]));   // new last <- old last
+      ::new (static_cast<void *>(_last), place_t{}) T(static_cast<T &&>(_first[n - 1]));   // new last <- old last
       for ( unsigned j = n - 1; j > pos; --j )
         _first[j] = static_cast<T &&>(_first[j - 1]);                         // shift [pos..n-1) up one
       _first[pos] = v;
@@ -227,7 +227,7 @@ private:
     {
       for ( unsigned i = 0; i < n; ++i )     // move old elements into new storage, destroy old
       {
-        ::new ((void *)(nb + i), place_t{}) T(static_cast<T &&>(_first[i]));
+        ::new (static_cast<void *>(nb + i), place_t{}) T(static_cast<T &&>(_first[i]));
         _first[i].~T();
       }
     }
@@ -244,7 +244,7 @@ private:
     {
       reserve(n);
       for ( unsigned i = 0; i < n; ++i )
-        ::new ((void *)(_first + i), place_t{}) T(src[i]);
+        ::new (static_cast<void *>(_first + i), place_t{}) T(src[i]);
       _last = _first + n;
     }
   }

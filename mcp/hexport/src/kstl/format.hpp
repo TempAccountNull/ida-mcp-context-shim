@@ -27,20 +27,20 @@ inline int uint_to_buf(char *buf, unsigned long long v) noexcept
   int n = 24;
   while ( v >= 100 )
   {
-    unsigned d = unsigned(v % 100) * 2;
+    unsigned d = static_cast<unsigned>(v % 100) * 2;
     v /= 100;
     buf[--n] = DIGITS2[d + 1];
     buf[--n] = DIGITS2[d];
   }
   if ( v >= 10 )
   {
-    unsigned d = unsigned(v) * 2;
+    unsigned d = static_cast<unsigned>(v) * 2;
     buf[--n] = DIGITS2[d + 1];
     buf[--n] = DIGITS2[d];
   }
   else
   {
-    buf[--n] = char('0' + unsigned(v));
+    buf[--n] = char('0' + static_cast<unsigned>(v));
   }
   return n;
 }
@@ -49,7 +49,7 @@ inline void append_uint(string &s, unsigned long long v)
 {
   char tmp[24];
   int n = uint_to_buf(tmp, v);
-  s.append(tmp + n, unsigned(24 - n));           // one grow-check + one copy (not per-digit)
+  s.append(tmp + n, static_cast<unsigned>(24 - n));           // one grow-check + one copy (not per-digit)
 }
 
 inline void append_int(string &s, long long v)
@@ -57,11 +57,11 @@ inline void append_int(string &s, long long v)
   if ( v < 0 )
   {
     s.push_back('-');
-    append_uint(s, (unsigned long long)(-(v + 1)) + 1);   // negate without overflowing at min
+    append_uint(s, static_cast<unsigned long long>(-(v + 1)) + 1);   // negate without overflowing at min
   }
   else
   {
-    append_uint(s, (unsigned long long)v);
+    append_uint(s, static_cast<unsigned long long>(v));
   }
 }
 
@@ -69,9 +69,9 @@ inline void append_uint_padded(string &s, unsigned long long v, unsigned width)
 {
   char tmp[24];
   int n = uint_to_buf(tmp, v);
-  while ( unsigned(24 - n) < width && n > 0 )     // leading zeros to reach `width`
+  while ( static_cast<unsigned>(24 - n) < width && n > 0 )     // leading zeros to reach `width`
     tmp[--n] = '0';
-  s.append(tmp + n, unsigned(24 - n));
+  s.append(tmp + n, static_cast<unsigned>(24 - n));
 }
 
 inline void append_hex(string &s, unsigned long long v, unsigned min_digits = 0)
@@ -80,18 +80,18 @@ inline void append_hex(string &s, unsigned long long v, unsigned min_digits = 0)
   int n = 24;
   do
   {
-    unsigned d = unsigned(v & 0xF);
+    unsigned d = static_cast<unsigned>(v & 0xF);
     tmp[--n] = char(d < 10 ? '0' + d : 'a' + (d - 10));
     v >>= 4;
   } while ( v != 0 );
-  while ( unsigned(24 - n) < min_digits && n > 0 )
+  while ( static_cast<unsigned>(24 - n) < min_digits && n > 0 )
     tmp[--n] = '0';
-  s.append(tmp + n, unsigned(24 - n));
+  s.append(tmp + n, static_cast<unsigned>(24 - n));
 }
 
 // Fixed-point double. Good for display values (durations, rates); not a full float printer
 // (no inf/huge-magnitude handling beyond u64 range -- callers here stay well inside it).
-inline void append_double(string &s, double d, unsigned precision = 6)
+inline void append_static_cast<double>(string &s, double d, unsigned precision = 6)
 {
   if ( d != d )   // NaN
   {
@@ -106,9 +106,9 @@ inline void append_double(string &s, double d, unsigned precision = 6)
   unsigned long long pow10 = 1;
   for ( unsigned i = 0; i < precision; ++i )
     pow10 *= 10;
-  unsigned long long ip = (unsigned long long)d;
-  double frac = d - double(ip);
-  unsigned long long fp = (unsigned long long)(frac * double(pow10) + 0.5);
+  unsigned long long ip = static_cast<unsigned long long>(d);
+  double frac = d - static_cast<double>(ip);
+  unsigned long long fp = static_cast<unsigned long long>(frac * static_cast<double>(pow10) + 0.5);
   if ( fp >= pow10 )   // rounding carried into the integer part
   {
     ip += 1;
@@ -145,11 +145,11 @@ inline void append_arg(string &s, long v)               { append_int(s, v); }
 inline void append_arg(string &s, unsigned long v)      { append_uint(s, v); }
 inline void append_arg(string &s, long long v)          { append_int(s, v); }
 inline void append_arg(string &s, unsigned long long v) { append_uint(s, v); }
-inline void append_arg(string &s, double v)             { append_double(s, v, 6); }
-inline void append_arg(string &s, const void *p)        { s.append("0x"); append_hex(s, (unsigned long long)p); }
+inline void append_arg(string &s, double v)             { append_static_cast<double>(s, v, 6); }
+inline void append_arg(string &s, const void *p)        { s.append("0x"); append_hex(s, reinterpret_cast<unsigned long long>(p)); }
 inline void append_arg(string &s, Hex h)                { append_hex(s, h.v, h.width); }
 inline void append_arg(string &s, Pad p)                { append_uint_padded(s, p.v, p.width); }
-inline void append_arg(string &s, Fixed f)              { append_double(s, f.v, f.prec); }
+inline void append_arg(string &s, Fixed f)              { append_static_cast<double>(s, f.v, f.prec); }
 
 // ---- concatenating format(): append each argument in turn ----
 
