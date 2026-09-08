@@ -926,12 +926,12 @@ double _castu64_f64 (unsigned __int64);
 #define _XCR_XFEATURE_ENABLED_MASK 0
 #define _mm256_bslli_epi128 _mm256_slli_si256
 #define _mm256_bsrli_epi128 _mm256_srli_si256
-#define _mm_loadu_si16(p) _mm_cvtsi32_si128(*(unsigned short const*)(p))
-#define _mm_storeu_si16(p, a) (void)(*(short*)(p) = (short)_mm_cvtsi128_si32((a)))
-#define _mm_loadu_si32(p) _mm_cvtsi32_si128(*(unsigned int const*)(p))
-#define _mm_storeu_si32(p, a) (void)(*(int*)(p) = _mm_cvtsi128_si32((a)))
-#define _mm_loadu_si64(p) _mm_loadl_epi64((__m128i const*)(p))
-#define _mm_storeu_si64(p, a) (_mm_storel_epi64((__m128i*)(p), (a)))
+#define _mm_loadu_si16(p) _mm_cvtsi32_si128(*reinterpret_cast<unsigned short const*>((p)))
+#define _mm_storeu_si16(p, a) static_cast<void>((*reinterpret_cast<short*>((p)) = static_cast<short>(_mm_cvtsi128_si32((a)))))
+#define _mm_loadu_si32(p) _mm_cvtsi32_si128(*reinterpret_cast<unsigned int const*>((p)))
+#define _mm_storeu_si32(p, a) static_cast<void>((*reinterpret_cast<int*>((p)) = _mm_cvtsi128_si32((a))))
+#define _mm_loadu_si64(p) _mm_loadl_epi64(reinterpret_cast<__m128i const*>((p)))
+#define _mm_storeu_si64(p, a) (_mm_storel_epi64(reinterpret_cast<__m128i*>((p)), (a)))
 #define _XBEGIN_STARTED          (~0u)
 #define _XABORT_EXPLICIT         (1 << 0)
 #define _XABORT_RETRY            (1 << 1)
@@ -939,13 +939,13 @@ double _castu64_f64 (unsigned __int64);
 #define _XABORT_CAPACITY         (1 << 3)
 #define _XABORT_DEBUG            (1 << 4)
 #define _XABORT_NESTED           (1 << 5)
-#define _XABORT_CODE(x)          ((unsigned char)(((x) >> 24) & 0xFF))
-#define _loadbe_i16(be_ptr) ((short)  _load_be_u16(be_ptr))
-#define _loadbe_i32(be_ptr) ((int)    _load_be_u32(be_ptr))
-#define _loadbe_i64(be_ptr) ((__int64)_load_be_u64(be_ptr))
-#define _storebe_i16(be_ptr, val) _store_be_u16(be_ptr, (unsigned short)(val))
-#define _storebe_i32(be_ptr, val) _store_be_u32(be_ptr, (unsigned int)(val))
-#define _storebe_i64(be_ptr, val) _store_be_u64(be_ptr, (unsigned __int64)(__int64)(val))
+#define _XABORT_CODE(x)          (static_cast<unsigned char>((((x) >> 24) & 0xFF)))
+#define _loadbe_i16(be_ptr) (static_cast<short>(_load_be_u16(be_ptr)))
+#define _loadbe_i32(be_ptr) (static_cast<int>(_load_be_u32(be_ptr)))
+#define _loadbe_i64(be_ptr) (static_cast<__int64>(_load_be_u64(be_ptr)))
+#define _storebe_i16(be_ptr, val) _store_be_u16(be_ptr, static_cast<unsigned short>((val)))
+#define _storebe_i32(be_ptr, val) _store_be_u32(be_ptr, static_cast<unsigned int>((val)))
+#define _storebe_i64(be_ptr, val) _store_be_u64(be_ptr, static_cast<unsigned __int64>(static_cast<__int64>((val))))
 #define _mm_idiv_epi32 _mm_div_epi32
 #define _mm_irem_epi32 _mm_rem_epi32
 #define _mm_udiv_epi32 _mm_div_epu32
@@ -961,7 +961,7 @@ double _castu64_f64 (unsigned __int64);
 #define _cldemote  _mm_cldemote
 extern "C" {
 inline bool __check_isa_support(unsigned __x, unsigned __v = 0)
-{ return ((__x & __isa_inverted) == 0) && ((unsigned char)__avx10_version >= __v); }
+{ return ((__x & __isa_inverted) == 0) && (static_cast<unsigned char>(__avx10_version) >= __v); }
 inline bool
 __check_isa_avx10_512(unsigned __v) { return (__avx10_version >= (__v | __IA_AVX10_512)); }
 inline bool __check_arch_support(unsigned __x, unsigned __v = 0)

@@ -311,7 +311,7 @@ int Mcp::run_http(int port)
     if ( s == INVALID_SOCKET )
       continue;
     BOOL excl = TRUE;   // borrowed from re-mcp: EXCLUSIVEADDRUSE makes the scan race-free
-    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&excl, sizeof(excl));
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char *>(&excl), sizeof(excl));
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;

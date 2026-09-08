@@ -347,6 +347,123 @@ def extract_inlines(text):
     return out
 
 
+# ------------------------------------------------------------------ C-style casts -> named casts
+# The declarations we copy carry no casts, but the toolset's MACROS and its inline ISA helpers do.
+# Once emitted those bodies are ours, so they get named casts like the rest of kstl. This runs ONLY
+# on macro and helper bodies -- never on a declaration, where "(int)" is a parameter list and not a
+# cast at all, and never on a function-like macro's own parameter list.
+CAST_TYPE = (r'(?:(?:const|volatile|unsigned|signed)\s+)*'
+             r'(?:__m\d+[a-z]*|__mmask\d+|__bfloat16|__int\d+|long\s+long|char|short|int|long|float|'
+             r'double|void|size_t)'
+             r'(?:\s+(?:const|volatile))*'
+             r'(?:\s*\*(?:\s*const)?)*')
+CAST_RE = re.compile(r'\(\s*(' + CAST_TYPE + r')\s*\)')
+
+
+def _operand_end(s, i):
+    """End of the unary-expression a cast applies to, or None when nothing follows (so it was not a
+    cast at all -- e.g. the `(void)` of a `f(void)` signature, which is followed by a brace)."""
+    n = len(s)
+    while i < n and s[i] in " \t":
+        i += 1
+    if i >= n:
+        return None
+    m = CAST_RE.match(s, i)
+    if m:                                   # a nested cast: (T)(U)x
+        return _operand_end(s, m.end())
+    if s[i] in "&*-~":                      # a unary operator binds inside the cast: (int *)&x
+        return _operand_end(s, i + 1)
+    if s[i] == "(":
+        depth = 0
+        while i < n:
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        else:
+            return None
+    elif s[i].isalpha() or s[i] == "_":
+        while i < n and (s[i].isalnum() or s[i] == "_"):
+            i += 1
+    else:
+        return None                          # *, &, a literal... not something we rewrite
+    while i < n:                             # postfix calls: foo(a)(b)
+        j = i
+        while j < n and s[j] in " \t":
+            j += 1
+        if j >= n or s[j] != "(":
+            break
+        depth = 0
+        k = j
+        while k < n:
+            if s[k] == "(":
+                depth += 1
+            elif s[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    k += 1
+                    break
+            k += 1
+        else:
+            return None
+        i = k
+    return i
+
+
+def to_named_casts(text, const_pointers=False):
+    """Rewrite (T)x as static_cast<T>(x), or reinterpret_cast for pointer targets. const_pointers
+    widens a pointer cast to const, which is for LOAD macros: the toolset writes (float *)(x) there
+    and relies on a C cast to strip const off the caller's pointer, which a named cast will not do.
+    Casting to `const float *` instead accepts both and still matches the load intrinsic."""
+    out, i = [], 0
+    while True:
+        m = CAST_RE.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        end = _operand_end(text, m.end())
+        if end is None:
+            out.append(text[i:m.end()])
+            i = m.end()
+            continue
+        ty = " ".join(m.group(1).split())
+        operand = to_named_casts(text[m.end():end].strip(), const_pointers)
+        if "*" in ty:
+            if const_pointers and "const" not in ty:
+                ty = "const " + ty
+            kind = "reinterpret_cast"
+        else:
+            kind = "static_cast"
+        out.append(text[i:m.start()])
+        out.append("%s<%s>(%s)" % (kind, ty, operand))
+        i = end
+    return "".join(out)
+
+
+def define_named_casts(d):
+    """to_named_casts over a #define's BODY, leaving its name and parameter list alone."""
+    m = re.match(r"#define\s+(\w+)", d)
+    if not m:
+        return to_named_casts(d)
+    body = m.end()
+    if body < len(d) and d[body] == "(":          # function-like: step over the parameter list
+        depth = 0
+        while body < len(d):
+            if d[body] == "(":
+                depth += 1
+            elif d[body] == ")":
+                depth -= 1
+                if depth == 0:
+                    body += 1
+                    break
+            body += 1
+    return d[:body] + to_named_casts(d[body:], const_pointers="load" in m.group(1).lower())
+
+
 def extract_types(text):
     """typedef union/struct ... NAME; blocks: the vector types, ammintrin.h's plain SEV-SNP structs
     (a later real <intrin.h> declares functions over them, so a stand-in must define them), plus the
@@ -404,7 +521,7 @@ def synth_args(decl):
     """One argument expression per parameter, chosen so the call compiles and is safe to run."""
     fname = fn_name(decl)
     if fname == "__builtin_assume_aligned":
-        return "(const void *)buf, 16"                  # (pointer, alignment, offsets...): a hint, needs a real power of two
+        return "static_cast<const void *>(buf), 16"                  # (pointer, alignment, offsets...): a hint, needs a real power of two
     ps = params_of(decl)
     types = [" ".join(param_type(p).split()) for p in ps]
     last_int = max((i for i, t in enumerate(types) if is_integral(t)), default=-1)
@@ -414,7 +531,7 @@ def synth_args(decl):
     tile_no = 0                                         # AMX: tile operands must be distinct immediates
     for i, (p, t) in enumerate(zip(ps, types)):
         if t.replace("const ", "") in ENUM_TYPES:
-            args.append(f"({t.replace('const ', '')})0")   # C++ will not convert int to an enum implicitly
+            args.append(f"static_cast<{t.replace('const ', '')}>(0)")   # C++ will not convert int to an enum implicitly
             continue
         if fname.startswith("_tile_") and is_integral(t):
             args.append(str(tile_no))
@@ -426,7 +543,7 @@ def synth_args(decl):
         if "[" in t:
             args.append("qbuf" if ("size_t" in t or "__int64" in t) else "info4")
         elif "*" in t or "&" in t:
-            args.append(f"({t})buf")
+            args.append(f"reinterpret_cast<{t}>(buf)")
         elif not is_integral(t):
             v = next(v for v in VECTOR_TYPES if t.endswith(v) or t == v or t == "const " + v) if "float" not in t and "double" not in t else None
             if v is not None:
@@ -436,7 +553,7 @@ def synth_args(decl):
                 # gather: with src, index and mask all the same zero value the compiler may put them in
                 # one register, and VPGATHER raises #UD unless the three registers are distinct.
                 ones = (i == last_vec and VECTOR_DIV_RE.search(fname)) or ("gather" in fname and "mask_i" in fname and i == 3)
-                args.append(f"({v})g_mask" if v.startswith("__mmask") else ("o_" if ones else "z_") + v.lstrip("_"))
+                args.append(f"static_cast<{v}>(g_mask)" if v.startswith("__mmask") else ("o_" if ones else "z_") + v.lstrip("_"))
             else:
                 args.append("0.0f" if "float" in t else "0.0")
         elif i == last_int and ("gather" in fname or "scatter" in fname):
@@ -507,8 +624,8 @@ def main():
             segments.append(dict(decls=uniq,
                                  types=extract_types(seg) if ns != "x64" else [],
                                  data=extract_extern_data(seg) if ns != "x64" else [],
-                                 inlines=extract_inlines(seg) if ns != "x64" else [],
-                                 defines=extract_defines(seg, guard) if ns != "x64" else []))
+                                 inlines=[to_named_casts(b) for b in extract_inlines(seg)] if ns != "x64" else [],
+                                 defines=[define_named_casts(d) for d in extract_defines(seg, guard)] if ns != "x64" else []))
         decls = [d for s in segments for d in s["decls"]]
         defines = [d for s in segments for d in s["defines"]]
         inlines = [b for s in segments for b in s["inlines"]]
@@ -654,20 +771,20 @@ def main():
                 "  if ( code == 0xC000001Dul ) { ++g_unsupported; printf(\"    %-36s not supported by this CPU\\n\", name); return 0; }\n"
                 "  ++g_other; printf(\"    %-36s FAULT 0x%08lX\\n\", name, code); return 1;\n"
                 "}\n")
-    LOCALS = ("  __m64 z_m64 = {}; (void)z_m64;\n"
+    LOCALS = ("  __m64 z_m64 = {}; static_cast<void>(z_m64);\n"
               "  __m128 z_m128 = {}; __m128i z_m128i = {}; __m128d z_m128d = {};\n"
               "  __m256 z_m256 = {}; __m256i z_m256i = {}; __m256d z_m256d = {};\n"
               "  __m512 z_m512 = {}; __m512i z_m512i = {}; __m512d z_m512d = {};\n"
               "  __m128bh z_m128bh = {}; __m256bh z_m256bh = {}; __m512bh z_m512bh = {};\n"
               "  __m128h z_m128h = {}; __m256h z_m256h = {}; __m512h z_m512h = {};\n"
-              "  (void)z_m128; (void)z_m128i; (void)z_m128d; (void)z_m256; (void)z_m256i; (void)z_m256d;\n"
-              "  (void)z_m512; (void)z_m512i; (void)z_m512d; (void)z_m128bh; (void)z_m256bh; (void)z_m512bh;\n"
-              "  (void)z_m128h; (void)z_m256h; (void)z_m512h; (void)info4; (void)qbuf;\n"
+              "  static_cast<void>(z_m128); static_cast<void>(z_m128i); static_cast<void>(z_m128d); static_cast<void>(z_m256); static_cast<void>(z_m256i); static_cast<void>(z_m256d);\n"
+              "  static_cast<void>(z_m512); static_cast<void>(z_m512i); static_cast<void>(z_m512d); static_cast<void>(z_m128bh); static_cast<void>(z_m256bh); static_cast<void>(z_m512bh);\n"
+              "  static_cast<void>(z_m128h); static_cast<void>(z_m256h); static_cast<void>(z_m512h); static_cast<void>(info4); static_cast<void>(qbuf);\n"
               # all-ones vectors (every lane nonzero, sign bits clear): divisors and gather masks
               f"  __m128 o_m128 = {{{{{', '.join(['1.f'] * 4)}}}}}; __m128d o_m128d = {{{{1.0, 1.0}}}}; __m128i o_m128i = {{{{{', '.join(['1'] * 16)}}}}};\n"
               f"  __m256 o_m256 = {{{{{', '.join(['1.f'] * 8)}}}}}; __m256d o_m256d = {{{{{', '.join(['1.0'] * 4)}}}}}; __m256i o_m256i = {{{{{', '.join(['1'] * 32)}}}}};\n"
               f"  __m512 o_m512 = {{{{{', '.join(['1.f'] * 16)}}}}}; __m512d o_m512d = {{{{{', '.join(['1.0'] * 8)}}}}}; __m512i o_m512i = {{{{{', '.join(['1'] * 64)}}}}};\n"
-              "  (void)o_m128; (void)o_m128d; (void)o_m128i; (void)o_m256; (void)o_m256d; (void)o_m256i; (void)o_m512; (void)o_m512d; (void)o_m512i;\n")
+              "  static_cast<void>(o_m128); static_cast<void>(o_m128d); static_cast<void>(o_m128i); static_cast<void>(o_m256); static_cast<void>(o_m256d); static_cast<void>(o_m256i); static_cast<void>(o_m512); static_cast<void>(o_m512d); static_cast<void>(o_m512i);\n")
     CH = 24
     plan = {}                                   # ns -> list of chunks (each a list of decls)
     nfiles = 1

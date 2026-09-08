@@ -88,7 +88,7 @@ __m128i _mm_stream_load_si128(const __m128i*);
 #define _mm_test_all_ones(val)                _mm_testc_si128((val), _mm_cmpeq_epi32((val),(val)))
 #define _mm_test_mix_ones_zeros(mask, val) _mm_testnzc_si128((mask), (val))
 #define _MM_MK_INSERTPS_NDX(srcField, dstField, zeroMask)          (((srcField)<<6) | ((dstField)<<4) | (zeroMask))
-#define _MM_EXTRACT_FLOAT(dest, src, ndx)          *((int*)&(dest)) = _mm_extract_ps((src), (ndx))
+#define _MM_EXTRACT_FLOAT(dest, src, ndx)          *(reinterpret_cast<int*>(&(dest))) = _mm_extract_ps((src), (ndx))
 #define _MM_PICK_OUT_PS(src, num)          _mm_insert_ps(_mm_setzero_ps(), (src),                        _MM_MK_INSERTPS_NDX((num), 0, 0x0e))
 #define _INCLUDED_SMM
 #endif  // _INCLUDED_SMM
