@@ -1,3 +1,7 @@
 # Fetched SDK (pulled by setup_sdk.cmd) and build outputs - never committed.
 /src/dep/
 /build/
+
+# Benchmarks and the generated intrinsic test harness. Development scaffolding only: nothing under
+# src/ includes any of it, and bench/intrin_all is regenerated wholesale by tools/gen_intrin.py.
+/bench/

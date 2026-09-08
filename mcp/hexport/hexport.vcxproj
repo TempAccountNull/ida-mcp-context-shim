@@ -74,6 +74,10 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\mcp.cpp" />
     <ClCompile Include="src\mcp_commands.cpp" />
+    <ClCompile Include="src\kstl\string.cpp">
+      <!-- our own string: self-contained, no PCH / SDK headers -->
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\pch.h" />
