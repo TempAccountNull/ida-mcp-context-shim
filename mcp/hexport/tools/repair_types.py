@@ -3,16 +3,19 @@
 
 Hex-Rays abandons a whole function when it cannot work out the arguments of a call inside it
 (MERR_BADCALL). The usual cause is an indirect call through a global function pointer that IDA
-guessed a wrong, concrete signature for -- typically a VARIADIC dispatcher, which IDA cannot guess
-because the argument list differs per call site.
+guessed a wrong CONCRETE signature for -- typically a variadic dispatcher, which IDA cannot guess
+because the argument list differs at every call site.
 
-Measured on hexx64.dll: all 38 failures were MERR_BADCALL, no retry or force_recompile fixed any of
-them, and typing the single `callui` global as a variadic function pointer fixed 34 of the 38.
+Measured on hexx64.dll: all 38 failures were MERR_BADCALL. Neither a plain retry nor
+force_recompile fixed a single one. Typing the single `callui` global recovered 34; typing one
+callee recovered 2 more.
 
 Safety, in order:
-  * verifies each recipe actually FIXES something before it is kept,
-  * works on a COPY by default; --in-place is required to touch the real database,
-  * saves only when at least one function was recovered.
+  * runs in-session and does NOT save unless --in-place is given, so the .i64 is untouched;
+  * rehearses on a COPY unless --in-place, so even a save has a dry run first;
+  * reverts every trial prototype that does not actually fix the caller. A prototype that has not
+    earned its place is a lie about the argument count, and confidently wrong pseudocode is worse
+    than a function that visibly failed.
 
   python repair_types.py <database.i64> [--in-place] [--hexport PATH]
 """
@@ -22,23 +25,19 @@ import argparse
 import json
 import os
 import shutil
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-# Prototypes worth trying, as (address-or-symbol, C declaration, why).
-# Keep these conservative: a wrong prototype produces confidently wrong pseudocode, which is worse
-# than a function that visibly failed.
+# Global fixes. One wrong global type breaks every caller at once, so this is where the leverage is.
 RECIPES = [
     ("callui", "__int64 (__fastcall *callui)(int, ...)",
      "IDA's UI dispatcher is variadic; IDA guesses a fixed signature and Hex-Rays then cannot "
      "reconcile it with the actual call sites"),
 ]
 
-
-# Tried in order on the callee at a failure point. Deliberately short: each extra guess is another
+# Tried in order on the callee Hex-Rays choked on. Deliberately short: each extra guess is another
 # chance to assert a wrong argument count.
 CALLEE_CANDIDATES = [
     "__int64 __fastcall f(__int64)",
@@ -47,30 +46,70 @@ CALLEE_CANDIDATES = [
 ]
 
 
-def decompiles(call, addr) -> bool:
-    call("tools/call", {"name": "force_recompile", "arguments": {"items": [{"addr": addr}]}})
-    d = result_of(call("tools/call", {"name": "decompile", "arguments": {"addr": addr}})) or {}
-    return bool(d.get("code"))
+class Hexport:
+    """One headless hexport session over stdio."""
+
+    def __init__(self, exe: str, database: str):
+        self.proc = subprocess.Popen(
+            [exe, "--stdio", database],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+        self._id = 0
+        self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                "clientInfo": {"name": "repair_types", "version": "2"}})
+
+    def rpc(self, method, params):
+        self._id += 1
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self._id,
+                                          "method": method, "params": params}) + "\n")
+        self.proc.stdin.flush()
+        return json.loads(self.proc.stdout.readline())
+
+    def tool(self, name, args):
+        r = self.rpc("tools/call", {"name": name, "arguments": args})
+        return (r.get("result") or {}).get("structuredContent", {}).get("result")
+
+    def decompiles(self, addr) -> bool:
+        self.tool("force_recompile", {"items": [{"addr": addr}]})
+        d = self.tool("decompile", {"addr": addr}) or {}
+        return bool(d.get("code"))
+
+    def close(self, save: bool):
+        try:
+            self.tool("close_database", {"save": save})
+            self.proc.stdin.close()
+            self.proc.wait(timeout=300)
+        except Exception:
+            self.proc.kill()
 
 
-def rpc(proc, ident, method, params):
-    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": ident, "method": method,
-                                 "params": params}) + "\n")
-    proc.stdin.flush()
-    return json.loads(proc.stdout.readline())
-
-
-def result_of(reply):
-    return (reply.get("result") or {}).get("structuredContent", {}).get("result")
+def scan_failures(h: Hexport):
+    """Every function that will not decompile, with the Hex-Rays reason."""
+    rows = h.tool("list_funcs", {"queries": {"offset": 0, "count": 0}})
+    data = rows[0]["data"] if isinstance(rows, list) else rows["data"]
+    addrs = [d.get("start") or d.get("addr") for d in data]
+    print(f"{len(addrs):,} functions; scanning...", flush=True)
+    failing = []
+    for k in range(0, len(addrs), 150):
+        r = h.tool("analyze_batch", {"queries": [
+            {"addr": a, "include_decompile": True, "include_disasm": False}
+            for a in addrs[k:k + 150]]}) or []
+        for item in r:
+            an = (item or {}).get("analysis") or {}
+            if an.get("decompile") is None:
+                failing.append((item.get("addr"), item.get("name", ""),
+                                an.get("decompile_merror")))
+    return len(addrs), failing
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("database")
-    ap.add_argument("--hexport", default=str(Path(__file__).resolve().parents[1] / "build" / "hexport.exe"))
+    ap.add_argument("--hexport",
+                    default=str(Path(__file__).resolve().parents[1] / "build" / "hexport.exe"))
     ap.add_argument("--in-place", action="store_true",
-                    help="modify the real database instead of a throwaway copy")
+                    help="save the repaired types into the real database (default: rehearse only)")
     args = ap.parse_args()
 
     if not os.path.isfile(args.database):
@@ -82,122 +121,82 @@ def main() -> int:
     if not args.in_place:
         tmp = tempfile.mkdtemp(prefix="repair_types_")
         target = os.path.join(tmp, "work" + Path(args.database).suffix)
-        print(f"copying to {target} (use --in-place to edit the original)", flush=True)
+        print("rehearsing on a copy; the real database is not touched "
+              "(--in-place to keep the result)", flush=True)
         shutil.copy2(args.database, target)
 
-    proc = subprocess.Popen([args.hexport, "--stdio", target],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                            errors="replace", bufsize=1)
-    ident = [0]
-
-    def call(method, params):
-        ident[0] += 1
-        return rpc(proc, ident[0], method, params)
-
+    h = Hexport(args.hexport, target)
+    saved = False
     try:
-        call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
-                            "clientInfo": {"name": "repair_types", "version": "1"}})
-
-        # Which functions currently fail, and why.
-        rows = result_of(call("tools/call", {"name": "list_funcs",
-                                             "arguments": {"queries": {"offset": 0, "count": 0}}}))
-        data = rows[0]["data"] if isinstance(rows, list) else rows["data"]
-        addrs = [d.get("start") or d.get("addr") for d in data]
-        print(f"{len(addrs):,} functions; scanning for decompilation failures...", flush=True)
-
-        failing = []
-        for k in range(0, len(addrs), 150):
-            chunk = addrs[k:k + 150]
-            r = result_of(call("tools/call", {"name": "analyze_batch", "arguments": {"queries": [
-                {"addr": a, "include_decompile": True, "include_disasm": False} for a in chunk]}})) or []
-            for item in r:
-                an = (item or {}).get("analysis") or {}
-                if an.get("decompile") is None:
-                    failing.append((item.get("addr"), item.get("name", ""), an.get("decompile_merror")))
+        _total, failing = scan_failures(h)
         badcall = [f for f in failing if f[2] == -12]
         print(f"  {len(failing)} failing, {len(badcall)} of them MERR_BADCALL", flush=True)
         if not badcall:
             print("nothing this tool can repair")
             return 0
 
-        before = {a for a, _, _ in badcall}
-        applied = []
+        before = [a for a, _, _ in badcall]
+        names = {a: n for a, n, _ in badcall}
 
-        # Phase 1: global recipes. One wrong global type can break hundreds of callers at once, so
-        # this is where the leverage is -- `callui` alone recovered 34 of 38 on hexx64.dll.
+        # ---- phase 1: global recipes -------------------------------------------------------
         for where, decl, why in RECIPES:
-            r = result_of(call("tools/call", {"name": "set_type",
-                                              "arguments": {"addr": where, "decl": decl}})) or {}
+            r = h.tool("set_type", {"addr": where, "decl": decl}) or {}
             if r.get("error"):
                 print(f"  skip {where}: {r['error']}")
                 continue
-            fixed_now = sum(1 for a in sorted(before) if decompiles(call, a))
+            fixed = sum(1 for a in before if h.decompiles(a))
             print(f"  {where}: {decl}")
             print(f"    {why}")
-            print(f"    -> recovered {fixed_now}/{len(before)}")
-            if fixed_now:
-                applied.append((where, fixed_now))
+            print(f"    -> recovered {fixed}/{len(before)}", flush=True)
 
-        still = [a for a in sorted(before) if not decompiles(call, a)]
-        print(f"\n{len(still)} still failing; trying the callee at each failure point")
+        still = [a for a in before if not h.decompiles(a)]
+        print(f"\n  {len(still)} still failing; asking each one what it calls", flush=True)
 
-        # Phase 2: per-function. Type the callee Hex-Rays choked on. EVERY trial is reverted unless
-        # it actually fixes the caller -- a prototype that does not earn its place is a lie about the
-        # argument count, and confidently wrong pseudocode is worse than a visible failure.
-        #
-        # These are hand-written on purpose. ida-pro-mcp's infer_types (guess_tinfo) was ported and
-        # tried here first: it returns argument-less signatures like `__int64 __fastcall()`, which is
-        # precisely what Hex-Rays cannot use, and it recovered 0 of 4.
+        # ---- phase 2: per-function ---------------------------------------------------------
+        # `callees` reports the call targets directly, with names. Before that tool existed the
+        # only way to find them was to disassemble around the failure address and regex the text.
         for a in list(still):
-            d = result_of(call("tools/call", {"name": "decompile", "arguments": {"addr": a}})) or {}
-            ea = d.get("error_addr") or a
-            dis = result_of(call("tools/call", {"name": "disasm",
-                                                "arguments": {"addr": ea, "max_instructions": 14}})) or {}
-            callees = []
-            for line in ((dis.get("asm") or {}).get("lines") or []):
-                m = re.search(r"call\s+([A-Za-z_][A-Za-z0-9_]*)", line.get("instruction", ""))
-                if m and m.group(1) not in callees:
-                    callees.append(m.group(1))
+            c = h.tool("callees", {"addr": a}) or {}
+            targets = [x.get("name") for x in (c.get("callees") or []) if x.get("name")]
+            if not targets:
+                print(f"    {a} {names.get(a, '')}: no resolvable call at the failure point")
+                continue
             done = False
-            for callee in callees[:4]:
+            for callee in targets[:4]:
                 for decl in CALLEE_CANDIDATES:
-                    r = result_of(call("tools/call", {"name": "set_type",
-                                                      "arguments": {"addr": callee, "decl": decl}})) or {}
+                    r = h.tool("set_type", {"addr": callee, "decl": decl}) or {}
                     if r.get("error"):
                         continue
-                    if decompiles(call, a):
-                        print(f"    {a}: {callee} := {decl}")
-                        applied.append((callee, 1))
+                    if h.decompiles(a):
+                        print(f"    {a} {names.get(a, '')}: {callee} := {decl}")
                         still.remove(a)
                         done = True
                         break
-                    old_type = r.get("old_type")
-                    if old_type:                       # revert: it did not fix anything
-                        call("tools/call", {"name": "set_type",
-                                            "arguments": {"addr": callee, "decl": old_type + ";"}})
+                    old = r.get("old_type")
+                    if old:                       # revert: it did not earn its place
+                        h.tool("set_type", {"addr": callee, "decl": old + ";"})
                 if done:
                     break
 
         recovered = len(before) - len(still)
-        total = recovered
-        if not applied:
-            print("no recipe recovered anything; nothing saved")
-            return 1
+        print(f"\nrecovered {recovered} of {len(before)} MERR_BADCALL functions")
+        for a in still:
+            print(f"  still failing: {a} {names.get(a, '')}")
 
-        print(f"\nrecovered {total} of {len(before)} MERR_BADCALL functions")
-        if args.in_place:
-            call("tools/call", {"name": "close_database", "arguments": {"save": True}})
+        if args.in_place and recovered:
+            h.close(save=True)
+            saved = True
             print("saved to the database")
         else:
-            print("copy only -- rerun with --in-place to keep these types")
+            print("database unchanged" if not args.in_place
+                  else "nothing recovered, so nothing saved")
         return 0
     finally:
         try:
-            proc.stdin.close()
-            proc.wait(timeout=120)
+            if not saved and h.proc.poll() is None:
+                h.close(save=False)
         except Exception:
-            proc.kill()
+            pass
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 

@@ -49,7 +49,7 @@ $reqs = @(
 )
 $R = run $Exe @("--stdio", $Idb) $reqs $errFile
 ok ($R[1].result.serverInfo.name -eq "hexport") "initialize -> serverInfo.name=hexport"
-ok ($R[2].result.tools.Count -eq 32) "tools/list advertises 32 tools ($($R[2].result.tools.Count))"
+ok ($R[2].result.tools.Count -eq 33) "tools/list advertises 33 tools ($($R[2].result.tools.Count))"
 ok ((($R[2].result.tools.name) -contains "disasm") -and (($R[2].result.tools.name) -contains "decompile") -and (($R[2].result.tools.name) -contains "lookup_funcs")) "tools/list includes required tools"
 ok ((tv $R[3]).status -eq "ok" -and (tv $R[3]).functions -gt 0) "server_health ok, functions=$((tv $R[3]).functions)"
 ok ((tv $R[4])[0].data.Count -eq 1 -and (tv $R[4])[0].next_offset -eq 1) "list_funcs count=1 -> 1 row, next_offset=1"

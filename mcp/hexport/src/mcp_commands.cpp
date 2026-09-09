@@ -1287,6 +1287,212 @@ void McpCommands::type_apply_batch(const jobj_t *args, jvalue_t *out)
   out->set_obj(result);
 }
 
+// ---- repair_badcall ---------------------------------------------------------------------------
+//
+// MERR_BADCALL means Hex-Rays could not work out the arguments of a call inside a function, so it
+// abandoned the whole function. It is not transient: on hexx64.dll a plain retry and force_recompile
+// each recovered 0 of 38. What does recover them is telling Hex-Rays the prototype of whatever it
+// choked on -- and that is a database edit, which is why this lives in the server rather than in a
+// script that copies .i64 files around and saves them.
+//
+// The repair runs entirely in the loaded database. Nothing reaches disk unless close_database is
+// explicitly asked to save, so a caller can repair, export, and discard.
+//
+// Two kinds of culprit, and the indirect one is easy to miss:
+//   * a DIRECT call to a function with no usable prototype;
+//   * an INDIRECT call through a global function pointer -- `mov rax, cs:callui; call rax`. IDA
+//     guesses a fixed concrete signature for such a global, and if the real one is variadic that
+//     guess cannot be reconciled with the call sites. One global broke 34 of hexx64's 38.
+//
+// Every trial is reverted unless it actually makes the caller decompile. A prototype that has not
+// earned its place is a lie about the argument count, and confidently wrong pseudocode is worse
+// than a function that visibly failed.
+
+static const char *BADCALL_PROTOS[] = {
+  "__int64 __fastcall f(__int64)",
+  "__int64 __fastcall f(__int64, __int64)",
+  "__int64 __fastcall f(__int64, __int64, __int64)",
+};
+
+// Tried first on a global reached by an indirect call: the variadic dispatcher case.
+static const char *BADCALL_PTR_PROTOS[] = {
+  "__int64 (__fastcall *f)(int, ...)",
+  "__int64 (__fastcall *f)(__int64, ...)",
+};
+
+bool McpCommands::badcall_at(ea_t fea)
+{
+  qstring err;
+  int merr = 0;
+  ea_t errea = BADADDR;
+  pseudocode(fea, &err, &merr, &errea);
+  return !err.empty() && merr == -12;      // MERR_BADCALL
+}
+
+bool McpCommands::decompiles_now(ea_t fea)
+{
+  qstring err;
+  mark_cfunc_dirty(fea);                   // drop the cached failure before re-asking
+  pseudocode(fea, &err);
+  return err.empty();
+}
+
+// Everything this function might be blaming: functions it calls, and globals it references (a
+// function pointer is reached by a data reference, not a code one).
+void McpCommands::badcall_candidates(ea_t fea, qvector<ea_t> *direct, qvector<ea_t> *indirect)
+{
+  func_t *pfn = get_func(fea);
+  if ( pfn == nullptr )
+    return;
+  for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
+  {
+    for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+    {
+      if ( t >= pfn->start_ea && t < pfn->end_ea )
+        continue;                          // stays inside: a branch, not a call
+      if ( get_func(t) != nullptr && !direct->has(t) )
+        direct->push_back(t);
+    }
+    for ( ea_t t = get_first_dref_from(p); t != BADADDR; t = get_next_dref_from(p, t) )
+    {
+      if ( get_func(t) != nullptr )
+        continue;                          // a function, not a pointer to one
+      if ( !indirect->has(t) )
+        indirect->push_back(t);
+    }
+  }
+}
+
+void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  const bool apply = args != nullptr ? jbool(*args, "apply", true) : true;
+
+  // ---- which functions are failing this way ----------------------------------------------
+  qvector<ea_t> failing;
+  size_t nfuncs = get_func_qty();
+  for ( size_t i = 0; i < nfuncs; ++i )
+  {
+    func_t *pfn = getn_func(i);
+    if ( pfn == nullptr )
+      continue;
+    status("repair-scan", pfn->start_ea, "");
+    if ( badcall_at(pfn->start_ea) )
+      failing.push_back(pfn->start_ea);
+  }
+  result->put("badcall_found", int64(failing.size()));
+  if ( failing.empty() || !apply )
+  {
+    jarr_t *fs = new jarr_t;
+    for ( size_t i = 0; i < failing.size(); ++i )
+    {
+      qstring a;
+      a.sprnt("0x%" FMT_64 "x", uint64(failing[i]));
+      fs->values.push_back().set_str(a.c_str());
+    }
+    result->get_value_or_new("functions")->set_arr(fs);
+    out->set_obj(result);
+    return;
+  }
+
+  // ---- repair ------------------------------------------------------------------------------
+  jarr_t *fixes = new jarr_t;
+  qvector<ea_t> todo = failing;
+  for ( size_t i = 0; i < todo.size(); ++i )
+  {
+    ea_t fea = todo[i];
+    if ( decompiles_now(fea) )
+      continue;                            // an earlier fix already covered this one
+
+    qvector<ea_t> direct;
+    qvector<ea_t> indirect;
+    badcall_candidates(fea, &direct, &indirect);
+
+    bool done = false;
+    // Indirect first: one shared function pointer is usually the cause of many failures at once,
+    // so fixing it early spares every later function a search.
+    for ( int phase = 0; phase < 2 && !done; ++phase )
+    {
+      const qvector<ea_t> &cands = phase == 0 ? indirect : direct;
+      const char **protos = phase == 0 ? BADCALL_PTR_PROTOS : BADCALL_PROTOS;
+      size_t nprotos = phase == 0 ? qnumber(BADCALL_PTR_PROTOS) : qnumber(BADCALL_PROTOS);
+      for ( size_t c = 0; c < cands.size() && !done; ++c )
+      {
+        tinfo_t old_tif;
+        bool had_old = get_tinfo(&old_tif, cands[c]);
+        for ( size_t k = 0; k < nprotos && !done; ++k )
+        {
+          tinfo_t tif;
+          qstring nm;
+          qstring decl(protos[k]);
+          decl.append(';');
+          if ( !parse_decl(&tif, &nm, nullptr, decl.c_str(), PT_SIL | PT_TYP) )
+            continue;
+          if ( !apply_tinfo(cands[c], tif, TINFO_DEFINITE) )
+            continue;
+          if ( decompiles_now(fea) )
+          {
+            jobj_t *e = new jobj_t;
+            qstring a;
+            a.sprnt("0x%" FMT_64 "x", uint64(fea));
+            e->put("function", a);
+            qstring fn;
+            get_func_name(&fn, fea);
+            e->put("name", fn);
+            a.sprnt("0x%" FMT_64 "x", uint64(cands[c]));
+            e->put("culprit", a);
+            qstring cn;
+            get_name(&cn, cands[c]);
+            e->put("culprit_name", cn);
+            e->put("kind", phase == 0 ? "indirect call through a global" : "direct call");
+            e->put("applied", protos[k]);
+            fixes->values.push_back().set_obj(e);
+            done = true;
+            break;
+          }
+          // Did not help: put the old type back rather than leave a guess behind.
+          if ( had_old )
+            apply_tinfo(cands[c], old_tif, TINFO_DEFINITE);
+          else
+            del_tinfo(cands[c]);
+        }
+      }
+    }
+  }
+
+  int64 still = 0;
+  jarr_t *unfixed = new jarr_t;
+  for ( size_t i = 0; i < failing.size(); ++i )
+  {
+    if ( decompiles_now(failing[i]) )
+      continue;
+    ++still;
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(failing[i]));
+    e->put("addr", a);
+    qstring fn;
+    get_func_name(&fn, failing[i]);
+    e->put("name", fn);
+    unfixed->values.push_back().set_obj(e);
+  }
+
+  result->put("recovered", int64(failing.size()) - still);
+  result->put("still_failing", still);
+  result->get_value_or_new("fixes")->set_arr(fixes);
+  result->get_value_or_new("unfixed")->set_arr(unfixed);
+  // Say it plainly: the caller has to opt into persistence, and by default nothing reaches disk.
+  result->put("saved", false);
+  result->put("note", "in-session only; close_database with save=true to persist");
+  out->set_obj(result);
+}
+
 void McpCommands::decompile(const jobj_t *args, jvalue_t *out)
 {
   ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
