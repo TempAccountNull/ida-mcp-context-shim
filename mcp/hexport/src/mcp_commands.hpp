@@ -25,6 +25,27 @@ public:
   void analyze_batch(const jvalue_t *queries, jvalue_t *out);
   void lookup_funcs(const jvalue_t *queries, jvalue_t *out);
   void force_recompile(const jobj_t *args, jvalue_t *out);
+  void set_type(const jobj_t *args, jvalue_t *out);
+  void redefine_func(const jobj_t *args, jvalue_t *out);
+  void infer_types(const jobj_t *args, jvalue_t *out);
+  void get_bytes(const jobj_t *args, jvalue_t *out);
+  void patch_bytes(const jobj_t *args, jvalue_t *out);
+  void undefine(const jobj_t *args, jvalue_t *out);
+  void define_func(const jobj_t *args, jvalue_t *out);
+  void rename(const jobj_t *args, jvalue_t *out);
+  void set_comments(const jobj_t *args, jvalue_t *out);
+  void get_string(const jobj_t *args, jvalue_t *out);
+  void xrefs_to(const jobj_t *args, jvalue_t *out);
+  void callees(const jobj_t *args, jvalue_t *out);
+  void define_code(const jobj_t *args, jvalue_t *out);
+  void make_data(const jobj_t *args, jvalue_t *out);
+  void list_globals(const jobj_t *args, jvalue_t *out);
+  void find_bytes(const jobj_t *args, jvalue_t *out);
+  void basic_blocks(const jobj_t *args, jvalue_t *out);
+  void stack_frame(const jobj_t *args, jvalue_t *out);
+  void set_op_type(const jobj_t *args, jvalue_t *out);
+  void imports(const jobj_t *args, jvalue_t *out);
+  void type_apply_batch(const jobj_t *args, jvalue_t *out);
 
 private:
   bool is_open = false;

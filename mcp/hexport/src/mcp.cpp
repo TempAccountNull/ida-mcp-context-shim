@@ -12,7 +12,12 @@
 #define HEXPORT_TOOLS(X) \
   X(open_database) X(close_database) X(list_databases) X(server_health) \
   X(entity_query) X(list_funcs) X(disasm) X(decompile) X(analyze_batch) \
-  X(lookup_funcs) X(force_recompile)
+  X(lookup_funcs) X(force_recompile) X(set_type) X(redefine_func) X(infer_types) \
+  X(get_bytes) X(patch_bytes) X(undefine) X(define_func) \
+  X(rename) X(set_comments) X(get_string) X(xrefs_to) X(callees) \
+  X(define_code) X(make_data) X(list_globals) \
+  X(find_bytes) X(basic_blocks) X(stack_frame) X(set_op_type) X(imports) \
+  X(type_apply_batch)
 
 //-------------------------------------------------------------------------
 static void set_id(jobj_t &resp, const jvalue_t *id)
@@ -101,6 +106,27 @@ void Mcp::call_tool(const jobj_t &params, jvalue_t *result_out, bool *is_error, 
     case "analyze_batch"_h:   cmds.analyze_batch(queries, result_out); break;
     case "lookup_funcs"_h:    cmds.lookup_funcs(queries, result_out);  break;
     case "force_recompile"_h: cmds.force_recompile(args, result_out);  break;
+    case "set_type"_h:        cmds.set_type(args, result_out);         break;
+    case "redefine_func"_h:   cmds.redefine_func(args, result_out);    break;
+    case "infer_types"_h:     cmds.infer_types(args, result_out);      break;
+    case "get_bytes"_h:       cmds.get_bytes(args, result_out);        break;
+    case "patch_bytes"_h:     cmds.patch_bytes(args, result_out);      break;
+    case "undefine"_h:        cmds.undefine(args, result_out);         break;
+    case "define_func"_h:     cmds.define_func(args, result_out);      break;
+    case "rename"_h:          cmds.rename(args, result_out);           break;
+    case "set_comments"_h:    cmds.set_comments(args, result_out);     break;
+    case "get_string"_h:      cmds.get_string(args, result_out);       break;
+    case "xrefs_to"_h:        cmds.xrefs_to(args, result_out);         break;
+    case "callees"_h:         cmds.callees(args, result_out);          break;
+    case "define_code"_h:     cmds.define_code(args, result_out);      break;
+    case "make_data"_h:       cmds.make_data(args, result_out);        break;
+    case "list_globals"_h:    cmds.list_globals(args, result_out);     break;
+    case "find_bytes"_h:      cmds.find_bytes(args, result_out);       break;
+    case "basic_blocks"_h:    cmds.basic_blocks(args, result_out);     break;
+    case "stack_frame"_h:     cmds.stack_frame(args, result_out);      break;
+    case "set_op_type"_h:     cmds.set_op_type(args, result_out);      break;
+    case "imports"_h:         cmds.imports(args, result_out);          break;
+    case "type_apply_batch"_h: cmds.type_apply_batch(args, result_out); break;
     default:
       *is_error = true;
       errmsg->sprnt("unknown tool: %s", name.c_str());

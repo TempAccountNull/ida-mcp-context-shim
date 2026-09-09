@@ -60,11 +60,30 @@ bool McpCommands::open(const char *file_path, bool run_auto)
   return true;
 }
 
+// Closing is where a database gets destroyed, so it is worth doing exactly the way re-mcp does.
+//
+// close_database() blocks until the auto-analyser has drained, and the analyser can always find
+// more to do -- a decompile queues type propagation, which queues reanalysis, and so on. A close
+// that never returns looks like a hang, and a hang invites SIGKILL, and killing a process holding a
+// PACKED .i64 leaves it unpacked and inconsistent on disk. That is not hypothetical: it is how this
+// project's 374 MB database ended up giving IDA "Fatal error before kernel init".
+//
+// So: turn the analyser off, empty every queue, and only then close. `save` defaults to false
+// everywhere -- reading a database must never rewrite it.
 void McpCommands::close(bool save)
 {
   if ( !is_open )
     return;
   mute_stdout();
+
+  enable_auto(false);
+  static const atype_t QUEUES[] = {
+    AU_UNK, AU_CODE, AU_WEAK, AU_PROC, AU_TAIL, AU_FCHUNK, AU_USED,
+    AU_USD2, AU_TYPE, AU_LIBF, AU_LBF2, AU_LBF3, AU_CHLB, AU_FINAL,
+  };
+  for ( size_t i = 0; i < qnumber(QUEUES); ++i )
+    auto_unmark(0, BADADDR, QUEUES[i]);
+
   ::close_database(save);
   unmute_stdout();
   is_open = false;
@@ -99,7 +118,11 @@ void McpCommands::open_database(const jobj_t *args, jvalue_t *out)
 // saving throws that work away and the next open pays for it again.
 void McpCommands::close_database(const jobj_t *args, jvalue_t *out)
 {
-  const bool save = args != nullptr ? jbool(*args, "save", true) : true;
+  // Default FALSE, deliberately. This server exists to READ a database; writing 374 MB back
+  // because a caller omitted an argument is not a default anyone wants, and an export that
+  // silently saved through a newer idalib than the user's IDA is exactly how a database ends
+  // up refusing to open. Saving is opt-in.
+  const bool save = args != nullptr ? jbool(*args, "save", false) : false;
   close(save);
   jobj_t *result = new jobj_t;
   result->put("status", "closed");
@@ -374,6 +397,894 @@ qstring McpCommands::pseudocode(ea_t func_ea, qstring *err, int *code, ea_t *err
     text.append("\n");
   }
   return text;
+}
+
+// The ONLY write this server performs. Everything else is a query, deliberately -- a bulk exporter
+// has no business editing a database. This exists for one repair.
+//
+// 38 of hexx64.dll's 10,109 functions fail with MERR_BADCALL ("could not determine call arguments")
+// and no retry recovers them: the failure is not transient. Hex-Rays cannot work out the argument
+// list of a variadic call, so it abandons the whole function. Telling it the prototype is the fix,
+// and a prototype is a write.
+//
+// Two steps, the same ones the reference IDA MCP servers use: parse_decl() turns the text into a
+// tinfo_t, apply_tinfo() attaches it with TINFO_DEFINITE -- a definite type rather than a guess, so
+// later auto-analysis will not quietly drop it again.
+void McpCommands::set_type(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring addr = args != nullptr ? jstr(*args, "addr") : qstring();
+  qstring decl = args != nullptr ? jstr(*args, "decl") : qstring();
+  if ( addr.empty() || decl.empty() )
+  {
+    result->put("error", "addr and decl are both required");
+    out->set_obj(result);
+    return;
+  }
+  ea_t ea = resolve_ea(addr.c_str());
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+
+  qstring text = decl;               // parse_decl wants a terminated declaration
+  text.trim2();
+  if ( !text.empty() && text[text.length() - 1] != ';' )
+    text.append(';');
+
+  tinfo_t tif;
+  qstring parsed_name;
+  if ( !parse_decl(&tif, &parsed_name, nullptr, text.c_str(), PT_SIL | PT_TYP) )
+  {
+    result->put("error", "could not parse declaration");
+    out->set_obj(result);
+    return;
+  }
+
+  qstring before;
+  tinfo_t old_tif;
+  if ( get_tinfo(&old_tif, ea) )
+    old_tif.print(&before);
+
+  if ( !apply_tinfo(ea, tif, TINFO_DEFINITE) )
+  {
+    result->put("error", "failed to apply type");
+    out->set_obj(result);
+    return;
+  }
+
+  qstring after;
+  tif.print(&after);
+  result->put("status", "ok");
+  result->put("addr", addr);
+  result->put("old_type", before);
+  result->put("new_type", after);
+  out->set_obj(result);
+}
+
+// The "u then p" cycle a human performs in IDA: undefine the function and its bytes, then let the
+// analyser re-create the instructions and the function from scratch. Worth having as one tool
+// because the two halves are useless apart -- undefining and stopping leaves a hole in the database.
+//
+// Why it can fix a decompilation: MERR_BADCALL means Hex-Rays could not work out a call's
+// arguments, and that often rests on stale analysis -- a wrong function end, a call IDA never
+// created a cross-reference for, an instruction decoded as data. Re-running analysis over the range
+// rebuilds all of that. It is the fallback for the cases a prototype cannot fix, because there is
+// no single global to blame.
+void McpCommands::redefine_func(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring addr = args != nullptr ? jstr(*args, "addr") : qstring();
+  ea_t ea = resolve_ea(addr.c_str());
+  func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+  if ( pfn == nullptr )
+  {
+    result->put("error", "no function at address");
+    out->set_obj(result);
+    return;
+  }
+
+  ea_t start = pfn->start_ea;
+  ea_t end = pfn->end_ea;
+  qstring name;
+  get_func_name(&name, start);
+  result->put("addr", addr);
+  result->put("name", name);
+  result->put("old_end", int64(end));
+
+  mute_stdout();                       // analysis chatters on stdout; fd 1 carries the protocol
+  del_func(start);                     // 'u' -- drop the function
+  del_items(start, DELIT_EXPAND, asize_t(end - start));   // ...and the instructions under it
+  plan_and_wait(start, end);           // let auto-analysis re-decode the range
+  create_insn(start);                  // 'p' -- an instruction at the entry, then a function on it
+  bool made = add_func(start, end);
+  if ( !made )
+    made = add_func(start);            // let IDA find the end itself if the old one was wrong
+  plan_and_wait(start, end);
+  unmute_stdout();
+
+  func_t *now = get_func(start);
+  result->put("redefined", made && now != nullptr);
+  if ( now != nullptr )
+    result->put("new_end", int64(now->end_ea));
+  out->set_obj(result);
+}
+
+// Ask IDA to work out the type at an address from the disassembly, and apply what it finds.
+// Ported from ida-pro-mcp's infer_types, which is guess_tinfo() plus apply_tinfo().
+//
+// This is the honest form of the repair that set_type does by hand. A guessed prototype written by
+// a human -- "__int64 __fastcall f(__int64)" -- fixes the caller's decompilation while quietly
+// asserting an argument count nobody verified, and a wrong prototype produces confidently wrong
+// pseudocode, which is worse than a function that visibly failed. guess_tinfo derives the signature
+// from the code instead, so prefer it and fall back to a hand-written type only when it declines.
+void McpCommands::infer_types(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring addr = args != nullptr ? jstr(*args, "addr") : qstring();
+  ea_t ea = resolve_ea(addr.c_str());
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  result->put("addr", addr);
+
+  qstring before;
+  tinfo_t old_tif;
+  if ( get_tinfo(&old_tif, ea) )
+    old_tif.print(&before);
+  result->put("old_type", before);
+
+  tinfo_t tif;
+  if ( guess_tinfo(&tif, ea) == GUESS_FUNC_FAILED )
+  {
+    result->put("inferred", false);
+    result->put("error", "could not infer a type here");
+    out->set_obj(result);
+    return;
+  }
+
+  qstring guessed;
+  tif.print(&guessed);
+  result->put("inferred_type", guessed);
+  bool applied = jbool(*args, "apply", true) && apply_tinfo(ea, tif, TINFO_DEFINITE);
+  result->put("inferred", true);
+  result->put("applied", applied);
+  out->set_obj(result);
+}
+
+// ---- bytes: the repair primitive -------------------------------------------------------------
+//
+// Patching bytes then undefining and redefining (IDA's "u" then "p") is how a human fixes code that
+// the analyser got wrong -- a bad prologue, a jump table decoded as data, an instruction split in
+// the middle. These make that reachable from a client.
+//
+// Everything here happens in the LOADED database only. Nothing writes the .i64 unless someone
+// explicitly calls close_database with save=true, so a repair can be tried, measured, and thrown
+// away without touching the file on disk.
+
+// Hex text to bytes. Accepts "48 89 5C 24 08", "4889...", or "0x48,0x89,...".
+static bool parse_hex_bytes(const char *s, qvector<uchar> *out)
+{
+  int hi = -1;
+  for ( const char *p = s; *p != 0; ++p )
+  {
+    char c = *p;
+    if ( c == ' ' || c == ',' || c == '\t' || c == '_' )
+      continue;
+    if ( c == '0' && (p[1] == 'x' || p[1] == 'X') )   // skip a 0x prefix
+    {
+      ++p;
+      continue;
+    }
+    int v;
+    if ( c >= '0' && c <= '9' )      v = c - '0';
+    else if ( c >= 'a' && c <= 'f' ) v = 10 + (c - 'a');
+    else if ( c >= 'A' && c <= 'F' ) v = 10 + (c - 'A');
+    else                             return false;
+    if ( hi < 0 )
+      hi = v;
+    else
+    {
+      out->push_back(uchar((hi << 4) | v));
+      hi = -1;
+    }
+  }
+  return hi < 0 && !out->empty();    // an odd number of nibbles is a typo, not a patch
+}
+
+void McpCommands::get_bytes(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  int64 n = args != nullptr ? jint(*args, "size", 16) : 16;
+  if ( ea == BADADDR || n <= 0 || n > 4096 )
+  {
+    result->put("error", "addr required, size 1..4096");
+    out->set_obj(result);
+    return;
+  }
+  qvector<uchar> buf;
+  buf.resize(size_t(n));
+  ssize_t got = ::get_bytes(buf.begin(), size_t(n), ea);
+  if ( got <= 0 )
+  {
+    result->put("error", "unreadable at that address");
+    out->set_obj(result);
+    return;
+  }
+  qstring hex;
+  for ( ssize_t i = 0; i < got; ++i )
+  {
+    qstring b;
+    b.sprnt(i == 0 ? "%02X" : " %02X", buf[size_t(i)]);
+    hex.append(b);
+  }
+  result->put("addr", jstr(*args, "addr"));
+  result->put("size", int64(got));
+  result->put("bytes", hex);
+  out->set_obj(result);
+}
+
+void McpCommands::patch_bytes(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring addr = args != nullptr ? jstr(*args, "addr") : qstring();
+  qstring hex = args != nullptr ? jstr(*args, "bytes") : qstring();
+  ea_t ea = resolve_ea(addr.c_str());
+  if ( ea == BADADDR || hex.empty() )
+  {
+    result->put("error", "addr and bytes are both required");
+    out->set_obj(result);
+    return;
+  }
+  qvector<uchar> bytes;
+  if ( !parse_hex_bytes(hex.c_str(), &bytes) )
+  {
+    result->put("error", "bytes must be hex, an even number of nibbles");
+    out->set_obj(result);
+    return;
+  }
+
+  // Hand back what was there first. A caller that cannot undo its own patch has no business
+  // making one, and this is what makes a repair attempt reversible without saving anything.
+  qvector<uchar> prev;
+  prev.resize(bytes.size());
+  qstring before;
+  if ( ::get_bytes(prev.begin(), bytes.size(), ea) == ssize_t(bytes.size()) )
+  {
+    for ( size_t i = 0; i < prev.size(); ++i )
+    {
+      qstring b;
+      b.sprnt(i == 0 ? "%02X" : " %02X", prev[i]);
+      before.append(b);
+    }
+  }
+
+  ::patch_bytes(ea, bytes.begin(), bytes.size());
+  result->put("status", "ok");
+  result->put("addr", addr);
+  result->put("size", int64(bytes.size()));
+  result->put("old_bytes", before);
+  out->set_obj(result);
+}
+
+// "u" on its own: drop whatever is defined over a range, back to raw bytes.
+void McpCommands::undefine(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  int64 n = args != nullptr ? jint(*args, "size", 1) : 1;
+  func_t *pfn = get_func(ea);
+  if ( pfn != nullptr && ea == pfn->start_ea )
+  {
+    if ( n <= 1 )
+      n = int64(pfn->end_ea - pfn->start_ea);   // a whole function by default
+    del_func(pfn->start_ea);
+  }
+  mute_stdout();
+  bool ok = del_items(ea, DELIT_EXPAND, asize_t(n));
+  unmute_stdout();
+  result->put("status", ok ? "ok" : "failed");
+  result->put("addr", jstr(*args, "addr"));
+  result->put("size", n);
+  out->set_obj(result);
+}
+
+// "p" on its own: make code here, and a function starting here.
+void McpCommands::define_func(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  qstring end_s = args != nullptr ? jstr(*args, "end") : qstring();
+  ea_t end = end_s.empty() ? BADADDR : resolve_ea(end_s.c_str());
+
+  mute_stdout();
+  create_insn(ea);
+  bool made = add_func(ea, end);
+  if ( !made )
+    made = add_func(ea);                 // let IDA find the end itself
+  plan_and_wait(ea, end != BADADDR ? end : ea + 1);
+  unmute_stdout();
+
+  func_t *now = get_func(ea);
+  // add_func returns false when a function already covers the address, which auto-analysis often
+  // creates for us. What matters is whether one exists now, not which call produced it.
+  result->put("status", now != nullptr ? "ok" : "failed");
+  result->put("created_by_call", made);
+  if ( now != nullptr )
+  {
+    qstring s;
+    s.sprnt("0x%" FMT_64 "x", uint64(now->end_ea));
+    result->put("end", s);
+    qstring nm;
+    get_func_name(&nm, now->start_ea);
+    result->put("name", nm);
+  }
+  out->set_obj(result);
+}
+
+// ---- analysis and annotation, ported from ida-pro-mcp -----------------------------------------
+//
+// These exist so a failure can be UNDERSTOOD, not just repaired. When a function will not decompile
+// the useful questions are what calls it, what it calls, what its blocks look like and what strings
+// it touches -- and after a repair, being able to name and annotate what you found.
+//
+// Everything here is in-session. Nothing writes the .i64 unless close_database is asked to save.
+
+void McpCommands::rename(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  qstring name = args != nullptr ? jstr(*args, "name") : qstring();
+  if ( ea == BADADDR || name.empty() )
+  {
+    result->put("error", "addr and name are both required");
+    out->set_obj(result);
+    return;
+  }
+  qstring before;
+  get_name(&before, ea);
+  // SN_FORCE appends a suffix rather than failing when the name is taken, which is what a bulk
+  // renamer wants: one collision should not abort the pass.
+  bool ok = set_name(ea, name.c_str(), SN_CHECK | SN_FORCE);
+  qstring after;
+  get_name(&after, ea);
+  result->put("status", ok ? "ok" : "failed");
+  result->put("old_name", before);
+  result->put("new_name", after);
+  out->set_obj(result);
+}
+
+void McpCommands::set_comments(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  qstring text = args != nullptr ? jstr(*args, "comment") : qstring();
+  bool rpt = args != nullptr ? jbool(*args, "repeatable", false) : false;
+  bool func = args != nullptr ? jbool(*args, "function", false) : false;
+  bool ok = func ? set_func_cmt_ea(ea, text.c_str(), rpt)
+                 : set_cmt(ea, text.c_str(), rpt);
+  result->put("status", ok ? "ok" : "failed");
+  result->put("addr", jstr(*args, "addr"));
+  out->set_obj(result);
+}
+
+void McpCommands::get_string(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  // Ask whether a string is actually DEFINED here first. Without this check get_strlit_contents
+  // happily decodes whatever bytes it finds -- pointed at code it returned "H" for the 0x48 of a
+  // push instruction, which is a confidently wrong answer rather than a useful one.
+  if ( !is_strlit(get_flags(ea)) )
+  {
+    result->put("error", "no string literal defined here");
+    result->put("addr", jstr(*args, "addr"));
+    out->set_obj(result);
+    return;
+  }
+  qstring s;
+  ssize_t n = get_strlit_contents(&s, ea, size_t(-1), int32(-1));
+  if ( n < 0 )
+    result->put("error", "could not read the string");
+  else
+    result->put("text", s);
+  result->put("addr", jstr(*args, "addr"));
+  out->set_obj(result);
+}
+
+void McpCommands::xrefs_to(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  int64 limit = args != nullptr ? jint(*args, "limit", 200) : 200;
+  jarr_t *arr = new jarr_t;
+  xrefblk_t xb;
+  int64 n = 0;
+  for ( bool ok = xb.first_to(ea, XREF_ALL); ok && n < limit; ok = xb.next_to(), ++n )
+  {
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(xb.from));
+    e->put("from", a);
+    e->put("code", xb.iscode != 0);
+    e->put("type", int64(xb.type));
+    qstring fn;
+    func_t *pfn = get_func(xb.from);
+    if ( pfn != nullptr && get_func_name(&fn, pfn->start_ea) > 0 )
+      e->put("in_function", fn);
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("addr", jstr(*args, "addr"));
+  result->get_value_or_new("xrefs")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::callees(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+  if ( pfn == nullptr )
+  {
+    result->put("error", "no function at address");
+    out->set_obj(result);
+    return;
+  }
+  // Walk the function's own instructions and take every code reference that leaves it. Cheaper and
+  // more precise than scanning all xrefs, and it keeps tail chunks out of the answer.
+  jarr_t *arr = new jarr_t;
+  for ( ea_t p = pfn->start_ea; p < pfn->end_ea; p = next_head(p, pfn->end_ea) )
+  {
+    if ( p == BADADDR )
+      break;
+    for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+    {
+      if ( t >= pfn->start_ea && t < pfn->end_ea )
+        continue;                              // stays inside: a branch, not a call
+      jobj_t *e = new jobj_t;
+      qstring a;
+      a.sprnt("0x%" FMT_64 "x", uint64(t));
+      e->put("addr", a);
+      qstring nm;
+      if ( get_func_name(&nm, t) > 0 )
+        e->put("name", nm);
+      arr->values.push_back().set_obj(e);
+    }
+  }
+  qstring fn;
+  get_func_name(&fn, pfn->start_ea);
+  result->put("name", fn);
+  result->get_value_or_new("callees")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::define_code(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  int64 count = args != nullptr ? jint(*args, "count", 1) : 1;
+  mute_stdout();
+  int64 made = 0;
+  ea_t p = ea;
+  for ( int64 i = 0; i < count && p != BADADDR; ++i )
+  {
+    int len = create_insn(p);
+    if ( len <= 0 )
+      break;
+    ++made;
+    p += len;
+  }
+  unmute_stdout();
+  result->put("status", made > 0 ? "ok" : "failed");
+  result->put("instructions", made);
+  out->set_obj(result);
+}
+
+void McpCommands::make_data(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  qstring kind = args != nullptr ? jstr(*args, "kind", "dword") : qstring("dword");
+  int64 count = args != nullptr ? jint(*args, "count", 1) : 1;
+  if ( count < 1 )
+    count = 1;
+
+  mute_stdout();
+  bool ok = false;
+  if ( kind == "string" )
+  {
+    ok = create_strlit(ea, 0, int32(-1));       // length 0 => let IDA find the terminator
+  }
+  else
+  {
+    flags64_t f = dword_flag();
+    asize_t elem = 4;
+    if ( kind == "byte" )       { f = byte_flag();  elem = 1; }
+    else if ( kind == "word" )  { f = word_flag();  elem = 2; }
+    else if ( kind == "qword" ) { f = qword_flag(); elem = 8; }
+    del_items(ea, DELIT_SIMPLE, asize_t(count) * elem);
+    ok = create_data(ea, f, asize_t(count) * elem, BADNODE);
+  }
+  unmute_stdout();
+  result->put("status", ok ? "ok" : "failed");
+  result->put("kind", kind);
+  out->set_obj(result);
+}
+
+void McpCommands::list_globals(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  int64 limit = args != nullptr ? jint(*args, "limit", 200) : 200;
+  int64 offset = args != nullptr ? jint(*args, "offset", 0) : 0;
+  qstring filter = args != nullptr ? jstr(*args, "filter") : qstring();
+
+  jarr_t *arr = new jarr_t;
+  size_t total = get_nlist_size();
+  int64 seen = 0;
+  int64 emitted = 0;
+  for ( size_t i = 0; i < total && emitted < limit; ++i )
+  {
+    ea_t ea = get_nlist_ea(i);
+    if ( get_func(ea) != nullptr )
+      continue;                                 // functions have their own tool
+    const char *nm = get_nlist_name(i);
+    if ( nm == nullptr )
+      continue;
+    if ( !filter.empty() && strstr(nm, filter.c_str()) == nullptr )
+      continue;
+    if ( seen++ < offset )
+      continue;
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(ea));
+    e->put("addr", a);
+    e->put("name", nm);
+    arr->values.push_back().set_obj(e);
+    ++emitted;
+  }
+  result->put("total_names", int64(total));
+  result->get_value_or_new("globals")->set_arr(arr);
+  out->set_obj(result);
+}
+
+// ---- structure, search and operands ----------------------------------------------------------
+
+// Hex byte pattern with '?' wildcards, e.g. "48 8B ? ? 48 89". Wildcards matter: the whole point of
+// searching for a prologue or a call idiom is that the displacement differs at every site.
+void McpCommands::find_bytes(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring pat = args != nullptr ? jstr(*args, "pattern") : qstring();
+  if ( pat.empty() )
+  {
+    result->put("error", "pattern is required");
+    out->set_obj(result);
+    return;
+  }
+  qvector<uchar> bytes;
+  qvector<uchar> mask;
+  int hi = -1;
+  for ( const char *p = pat.c_str(); *p != 0; ++p )
+  {
+    char c = *p;
+    if ( c == ' ' || c == ',' )
+      continue;
+    // A lone '?' means a whole wildcard byte -- that is how everyone writes a pattern
+    // ("48 89 5C 24 ?"), and requiring "??" rejected the obvious form.
+    if ( c == '?' )
+    {
+      bytes.push_back(0);
+      mask.push_back(0x00);
+      if ( p[1] == '?' )
+        ++p;
+      continue;
+    }
+    int v;
+    if ( c >= '0' && c <= '9' ) v = c - '0';
+    else if ( c >= 'a' && c <= 'f' ) v = 10 + (c - 'a');
+    else if ( c >= 'A' && c <= 'F' ) v = 10 + (c - 'A');
+    else
+    {
+      result->put("error", "pattern must be hex bytes, '?' allowed");
+      out->set_obj(result);
+      return;
+    }
+    if ( hi < 0 )
+    {
+      hi = v;
+    }
+    else
+    {
+      bytes.push_back(uchar((hi << 4) | v));
+      mask.push_back(0xFF);
+      hi = -1;
+    }
+  }
+  if ( bytes.empty() || hi >= 0 )
+  {
+    result->put("error", "pattern must be whole bytes");
+    out->set_obj(result);
+    return;
+  }
+
+  int64 limit = args != nullptr ? jint(*args, "limit", 32) : 32;
+  jarr_t *arr = new jarr_t;
+  ea_t p = inf_get_min_ea();
+  ea_t end = inf_get_max_ea();
+  int64 n = 0;
+  while ( n < limit )
+  {
+    ea_t hit = bin_search(p, end, bytes.begin(), mask.begin(), bytes.size(), BIN_SEARCH_FORWARD);
+    if ( hit == BADADDR )
+      break;
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(hit));
+    e->put("addr", a);
+    qstring fn;
+    func_t *pfn = get_func(hit);
+    if ( pfn != nullptr && get_func_name(&fn, pfn->start_ea) > 0 )
+      e->put("in_function", fn);
+    arr->values.push_back().set_obj(e);
+    ++n;
+    p = hit + 1;
+  }
+  result->put("matches", n);
+  result->get_value_or_new("hits")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::basic_blocks(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+  if ( pfn == nullptr )
+  {
+    result->put("error", "no function at address");
+    out->set_obj(result);
+    return;
+  }
+  // FC_PREDS no longer exists (the SDK marks its value FC_RESERVED); predecessors and
+  // successors are computed for a normal flow chart, so no flag is needed.
+  qflow_chart_t fc("hexport", pfn, pfn->start_ea, pfn->end_ea, 0);
+  jarr_t *arr = new jarr_t;
+  for ( int i = 0; i < fc.size(); ++i )
+  {
+    const qbasic_block_t &b = fc.blocks[i];
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(b.start_ea));
+    e->put("start", a);
+    a.sprnt("0x%" FMT_64 "x", uint64(b.end_ea));
+    e->put("end", a);
+    jarr_t *succ = new jarr_t;
+    for ( int k = 0; k < fc.nsucc(i); ++k )
+    {
+      int s = fc.succ(i, k);
+      qstring sa;
+      sa.sprnt("0x%" FMT_64 "x", uint64(fc.blocks[s].start_ea));
+      succ->values.push_back().set_str(sa.c_str());
+    }
+    e->get_value_or_new("succs")->set_arr(succ);
+    arr->values.push_back().set_obj(e);
+  }
+  qstring fn;
+  get_func_name(&fn, pfn->start_ea);
+  result->put("name", fn);
+  result->put("blocks", int64(fc.size()));
+  result->get_value_or_new("basic_blocks")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::stack_frame(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+  if ( pfn == nullptr )
+  {
+    result->put("error", "no function at address");
+    out->set_obj(result);
+    return;
+  }
+  result->put("frame_size", int64(get_frame_size_ea(pfn->start_ea)));
+  result->put("ret_size", int64(get_frame_retsize_ea(pfn->start_ea)));
+
+  // The frame is a UDT: walking its members is how you see the locals and arguments Hex-Rays will
+  // work from, which is the first place to look when a decompilation comes out wrong.
+  tinfo_t frame;
+  jarr_t *arr = new jarr_t;
+  if ( get_func_frame_ea(&frame, pfn->start_ea) )
+  {
+    udt_type_data_t udt;
+    if ( frame.get_udt_details(&udt) )
+    {
+      for ( size_t i = 0; i < udt.size(); ++i )
+      {
+        const udm_t &m = udt[i];
+        jobj_t *e = new jobj_t;
+        e->put("name", m.name);
+        e->put("offset", int64(m.offset / 8));      // bit offset in the SDK
+        e->put("size", int64(m.size / 8));
+        qstring ts;
+        m.type.print(&ts);
+        e->put("type", ts);
+        arr->values.push_back().set_obj(e);
+      }
+    }
+  }
+  result->get_value_or_new("members")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::set_op_type(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( ea == BADADDR )
+  {
+    result->put("error", "bad address");
+    out->set_obj(result);
+    return;
+  }
+  int n = int(args != nullptr ? jint(*args, "operand", 0) : 0);
+  qstring kind = args != nullptr ? jstr(*args, "kind", "hex") : qstring("hex");
+  bool ok = false;
+  if ( kind == "hex" )       ok = op_hex(ea, n);
+  else if ( kind == "dec" )  ok = op_dec(ea, n);
+  else if ( kind == "oct" )  ok = op_oct(ea, n);
+  else if ( kind == "bin" )  ok = op_bin(ea, n);
+  else if ( kind == "char" ) ok = op_chr(ea, n);
+  else
+  {
+    result->put("error", "kind must be hex, dec, oct, bin or char");
+    out->set_obj(result);
+    return;
+  }
+  result->put("status", ok ? "ok" : "failed");
+  result->put("kind", kind);
+  result->put("operand", int64(n));
+  out->set_obj(result);
+}
+
+void McpCommands::imports(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring filter = args != nullptr ? jstr(*args, "filter") : qstring();
+  int64 limit = args != nullptr ? jint(*args, "limit", 500) : 500;
+
+  struct ctx_t
+  {
+    jarr_t *arr;
+    const char *module;
+    const char *filter;
+    int64 left;
+  };
+  ctx_t ctx = { new jarr_t, nullptr, filter.empty() ? nullptr : filter.c_str(), limit };
+
+  uint nmods = get_import_module_qty();
+  for ( uint m = 0; m < nmods && ctx.left > 0; ++m )
+  {
+    qstring mod;
+    get_import_module_name(&mod, int(m));
+    ctx.module = mod.c_str();
+    enum_import_names(int(m),
+      [](ea_t ea, const char *name, uval_t ord, void *param) -> int
+      {
+        ctx_t *c = static_cast<ctx_t *>(param);
+        if ( c->left <= 0 )
+          return 0;
+        if ( name != nullptr && (c->filter == nullptr || strstr(name, c->filter) != nullptr) )
+        {
+          jobj_t *e = new jobj_t;
+          qstring a;
+          a.sprnt("0x%" FMT_64 "x", uint64(ea));
+          e->put("addr", a);
+          e->put("name", name != nullptr ? name : "");
+          e->put("module", c->module != nullptr ? c->module : "");
+          e->put("ordinal", int64(ord));
+          c->arr->values.push_back().set_obj(e);
+          --c->left;
+        }
+        return 1;
+      }, &ctx);
+  }
+  result->put("modules", int64(nmods));
+  result->get_value_or_new("imports")->set_arr(ctx.arr);
+  out->set_obj(result);
+}
+
+// Several set_type calls under one round trip. A repair pass usually has a handful of prototypes to
+// apply, and each one costing its own request is the sort of thing that turns a second into a
+// minute over thousands of functions.
+void McpCommands::type_apply_batch(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  const jarr_t *items = args != nullptr ? jsubarr(*args, "items") : nullptr;
+  if ( items == nullptr )
+  {
+    result->put("error", "items must be an array of {addr, decl}");
+    out->set_obj(result);
+    return;
+  }
+  jarr_t *arr = new jarr_t;
+  int64 ok_n = 0;
+  for ( size_t i = 0; i < items->values.size(); ++i )
+  {
+    const jvalue_t &v = items->values[i];
+    jobj_t *e = new jobj_t;
+    if ( v.type() != JT_OBJ )
+    {
+      e->put("error", "not an object");
+      arr->values.push_back().set_obj(e);
+      continue;
+    }
+    jvalue_t one;
+    set_type(&v.obj(), &one);
+    if ( one.type() == JT_OBJ )
+    {
+      const jvalue_t *st = one.obj().get_value("status", JT_STR);
+      if ( st != nullptr && st->qstr() == "ok" )
+        ++ok_n;
+      arr->values.push_back().swap(one);
+      continue;
+    }
+    e->put("error", "unexpected result");
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("applied", ok_n);
+  result->put("total", int64(items->values.size()));
+  result->get_value_or_new("results")->set_arr(arr);
+  out->set_obj(result);
 }
 
 void McpCommands::decompile(const jobj_t *args, jvalue_t *out)

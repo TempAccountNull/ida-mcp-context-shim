@@ -358,7 +358,7 @@ class HexportStdioClient:
 
     def __init__(self, exe: str, database: str | None = None, *, timeout: int = 600,
                  run_auto: bool = False, extra_args: list[str] | None = None,
-                 save_on_close: bool = True):
+                 save_on_close: bool = False):
         self.exe = exe
         self.database = database
         self.url = f"stdio:{exe}"       # what the banner prints; parity with CurlMcpClient.url
@@ -535,6 +535,10 @@ class HexportStdioClient:
         if self.database and not self._closed_db:
             self._closed_db = True
             try:
+                # Exporting is a READ. It must not write the caller's database back, and the
+                # default here used to be save=True -- which silently rewrote a 374 MB .i64 on
+                # every run, and rewrote it with whichever idalib version hexport was built
+                # against. Only a tool that means to edit (repair_types.py --in-place) passes True.
                 vlog(2, "HEXPORT", f"closing database (save={self.save_on_close})")
                 self._post("tools/call",
                            {"name": "close_database", "arguments": {"save": self.save_on_close}})

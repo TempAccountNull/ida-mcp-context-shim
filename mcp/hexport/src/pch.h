@@ -32,5 +32,7 @@
 #include <bytes.hpp>
 #include <segment.hpp>
 #include <lines.hpp>
+#include <frame.hpp>    // stack frames
+#include <gdl.hpp>      // qflow_chart_t, for basic blocks
 #include <hexrays.hpp>
 #include <parsejson.hpp>
