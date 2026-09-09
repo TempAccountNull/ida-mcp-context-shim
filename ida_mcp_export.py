@@ -2348,6 +2348,47 @@ def resolve_transport(args: argparse.Namespace) -> str | None:
     return exe
 
 
+# Hex-Rays failure codes (merror_t). A permanent one describes the function, not the moment: it
+# will fail identically on every retry, so retrying is pure waste. Measured on hexx64.dll -- all 38
+# failures were MERR_BADCALL, and neither a plain retry nor force_recompile fixed a single one.
+MERROR_NAMES = {
+    -1: "MERR_INTERR (internal error)",
+    -2: "MERR_INSN (cannot convert to microcode)",
+    -3: "MERR_MEM (not enough memory)",
+    -4: "MERR_BADBLK (bad block)",
+    -5: "MERR_BADSP (positive sp value)",
+    -6: "MERR_PROLOG (prolog analysis failed)",
+    -7: "MERR_SWITCH (wrong switch idiom)",
+    -8: "MERR_EXCEPTION (exception analysis failed)",
+    -9: "MERR_HUGESTACK (stack frame too big)",
+    -10: "MERR_LVARS (local variable allocation failed)",
+    -11: "MERR_BITNESS (16-bit function)",
+    -12: "MERR_BADCALL (could not determine call arguments)",
+    -13: "MERR_BADFRAME (function frame is wrong)",
+    -15: "MERR_BADIDB (inconsistent database)",
+    -16: "MERR_SIZEOF (wrong basic type sizes)",
+}
+
+# Retrying these cannot help: they are properties of the function or the database, not transients.
+# MERR_MEM and MERR_CANCELED are deliberately absent -- those CAN clear on a retry.
+PERMANENT_MERRORS = frozenset({-1, -2, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -16})
+
+
+def decompile_failure_record(info, analysis: dict, err: Any) -> dict[str, Any]:
+    """A failure entry carrying enough to act on: which Hex-Rays error, and where it gave up."""
+    rec: dict[str, Any] = {"addr": info.addr, "name": info.name, "stage": "decompile",
+                           "error": str(err)}
+    code = analysis.get("decompile_merror")
+    if code is not None:
+        rec["merror"] = code
+        rec["merror_name"] = MERROR_NAMES.get(code, f"merror {code}")
+        rec["permanent"] = code in PERMANENT_MERRORS
+    where = analysis.get("decompile_error_addr")
+    if where:
+        rec["error_addr"] = where
+    return rec
+
+
 def make_client(args: argparse.Namespace):
     """One MCP session: hexport over stdio when available, else curl over HTTP."""
     exe = resolve_transport(args)
@@ -2876,7 +2917,7 @@ def export_batch(
             if code is None:
                 err = analysis.get("decompile_error") or r.get("error") or "no result"
                 pseudo = f"/* Decompilation failed: {err} */\n"
-                failures.append({"addr": info.addr, "name": info.name, "stage": "decompile", "error": str(err)})
+                failures.append(decompile_failure_record(info, analysis, err))
             else:
                 pseudo = str(code) + "\n"
         asm = ""
@@ -2961,6 +3002,7 @@ def load_skipped_functions(manifest_path: Path) -> list[FunctionInfo]:
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     seen: set[int | str] = set()
     out: list[FunctionInfo] = []
+    permanent = 0
     for fail in data.get("failures", []):
         addr = str(fail.get("addr", ""))
         if not addr:
@@ -2969,7 +3011,19 @@ def load_skipped_functions(manifest_path: Path) -> list[FunctionInfo]:
         if key in seen:
             continue
         seen.add(key)
+        # A permanent Hex-Rays error describes the function, not the moment. Re-running it costs a
+        # full decompile attempt to reach the identical failure -- verified on hexx64.dll, where a
+        # plain retry and a force_recompile each fixed 0 of 38 MERR_BADCALL functions. Skip them and
+        # say how many, so a retry pass is spent only on what can actually change.
+        if fail.get("permanent"):
+            permanent += 1
+            continue
         out.append(FunctionInfo(addr, str(fail.get("name") or addr), 1, "retry-skipped"))
+    if permanent:
+        console_print(color(
+            f"Skipping {permanent:,} permanently-failed function(s); they fail identically on retry. "
+            f"See merror_name in the manifest; fixing them needs a database edit, not a retry.",
+            Colors.YELLOW))
     return out
 
 

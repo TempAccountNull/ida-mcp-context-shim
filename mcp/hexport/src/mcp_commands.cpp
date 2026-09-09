@@ -333,9 +333,13 @@ void McpCommands::disasm(const jobj_t *args, jvalue_t *out)
 }
 
 //-------------------------------------------------------------------------
-qstring McpCommands::pseudocode(ea_t func_ea, qstring *err)
+qstring McpCommands::pseudocode(ea_t func_ea, qstring *err, int *code, ea_t *errea)
 {
   err->clear();
+  if ( code != nullptr )
+    *code = 0;
+  if ( errea != nullptr )
+    *errea = BADADDR;
   if ( !hexrays_ok )
   {
     *err = "decompiler unavailable";
@@ -345,7 +349,19 @@ qstring McpCommands::pseudocode(ea_t func_ea, qstring *err)
   cfuncptr_t cf = decompile_function(func_ea, &hf, DECOMP_NO_WAIT);
   if ( cf == nullptr )
   {
-    err->sprnt("decompilation failed: %s", hf.str.c_str());
+    // hf.str is very often EMPTY -- Hex-Rays puts the real reason in hf.code (a MERR_ enum) and
+    // hf.errea (where it gave up), and desc() is what formats all three into something readable.
+    // Reporting only hf.str produced "decompilation failed: " with nothing after the colon for
+    // every one of the 38 failures on hexx64.dll, which is unactionable: you cannot tell a function
+    // that is merely too big from one whose stack analysis failed.
+    qstring d = hf.desc();
+    if ( d.empty() )
+      d.sprnt("merror %d", int(hf.code));
+    err->sprnt("decompilation failed: %s", d.c_str());
+    if ( code != nullptr )
+      *code = int(hf.code);
+    if ( errea != nullptr )
+      *errea = hf.errea;
     return qstring();
   }
   const strvec_t &sv = cf->get_pseudocode();
@@ -378,11 +394,27 @@ void McpCommands::decompile(const jobj_t *args, jvalue_t *out)
   status("decompile", fea, name.c_str());
 
   qstring err;
-  qstring code = pseudocode(fea, &err);
+  int merr = 0;
+  ea_t errea = BADADDR;
+  qstring code = pseudocode(fea, &err, &merr, &errea);
   if ( !err.empty() )
+  {
+    // The message alone is not enough to act on. merror_code says WHAT failed and error_addr says
+    // WHERE, which is what makes an automated repair pass possible: "call analysis failed" plus the
+    // address of the call it choked on points straight at the callee whose prototype is missing.
     result->put("error", err);
+    result->put("merror_code", int64(merr));
+    if ( errea != BADADDR )
+    {
+      qstring hex;
+      hex.sprnt("0x%a", errea);
+      result->put("error_addr", hex);
+    }
+  }
   else
+  {
     result->put("code", code);
+  }
   out->set_obj(result);
 }
 
@@ -435,11 +467,23 @@ void McpCommands::analyze_batch(const jvalue_t *queries, jvalue_t *out)
     {
       status("decompile", pfn->start_ea, name.c_str());
       qstring err;
-      qstring code = pseudocode(pfn->start_ea, &err);
+      int merr = 0;
+      ea_t errea = BADADDR;
+      qstring code = pseudocode(pfn->start_ea, &err, &merr, &errea);
       if ( !err.empty() )
       {
+        // Same structured reason the single decompile tool reports. A bulk export needs it more,
+        // not less: it is the difference between "38 functions failed" and "38 functions hit
+        // MERR_BADCALL at these call sites", which is the only form a caller can act on.
         analysis->get_value_or_new("decompile")->set_null();
         analysis->put("decompile_error", err);
+        analysis->put("decompile_merror", int64(merr));
+        if ( errea != BADADDR )
+        {
+          qstring eh;
+          eh.sprnt("0x%" FMT_64 "x", uint64(errea));
+          analysis->put("decompile_error_addr", eh);
+        }
       }
       else
       {

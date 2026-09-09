@@ -37,5 +37,5 @@ private:
   // as_text=true  -> flat "<hexaddr>  <disasm>" strings, matching ida-pro-mcp's
   // analyze_batch (the exporter joins these with "\n" directly).
   int64 build_disasm(ea_t addr, int64 max_instructions, int64 offset, jarr_t *lines, bool *more, bool as_text);
-  qstring pseudocode(ea_t func_ea, qstring *err);
+  qstring pseudocode(ea_t func_ea, qstring *err, int *code = nullptr, ea_t *errea = nullptr);
 };
