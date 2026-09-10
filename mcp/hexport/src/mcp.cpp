@@ -326,6 +326,53 @@ void Mcp::handle_http_client(SOCKET c)
     send_all(c, reply.c_str(), reply.length());
 }
 
+// HTTP mode used to run `for ( ;; )` with no way out, which made startup_close() in main()
+// unreachable: the ONLY way to stop an --http server was to kill it. Killing a process that holds an
+// open database leaves a packed .i64 unpacked and inconsistent on disk, and that is not a
+// hypothetical -- it is the documented cause of this project's "Fatal error before kernel init" on a
+// 374 MB database. A server whose only exit is fatal to its own data is a bug, however long it has
+// been there.
+//
+// Ctrl+C, Ctrl+Break and a console close now break the accept loop so the normal shutdown path runs
+// and close_database() drains the analysis queues the way it is supposed to. accept() blocks, so the
+// handler closes the listening socket to unblock it; the loop then sees the flag and leaves.
+//
+// CTRL_CLOSE_EVENT gives roughly five seconds before Windows kills the process anyway, which may not
+// be enough to close a very large database. Ctrl+C has no such deadline. Neither is a reason to keep
+// offering no clean exit at all.
+static volatile LONG http_stop = 0;
+static SOCKET http_listener = INVALID_SOCKET;
+static HANDLE http_closed = nullptr;      // signalled once the database is really closed
+
+static BOOL WINAPI http_ctrl_handler(DWORD type)
+{
+  switch ( type )
+  {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+      InterlockedExchange(&http_stop, 1);
+      if ( http_listener != INVALID_SOCKET )
+        closesocket(http_listener);       // makes the blocking accept() fail immediately
+      // The handler runs on its own thread, and for CTRL_CLOSE / LOGOFF / SHUTDOWN Windows
+      // terminates the process the moment it returns -- returning TRUE means "handled", not
+      // "spare me". Setting the flag and returning straight away therefore killed the process
+      // mid-close and still left the database unpacked (exit 0xC000013A, four orphaned files).
+      // So block here until the main thread has finished closing. Ctrl+C has no such deadline,
+      // where waiting costs nothing.
+      //
+      // The wait is bounded: a close that hangs must not wedge a shutdown or a logoff. Losing the
+      // repack on a 30-second timeout is bad, but it is the same outcome as before this existed.
+      if ( http_closed != nullptr )
+        WaitForSingleObject(http_closed, 30000);
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
 int Mcp::run_http(int port)
 {
   WSADATA wsa;
@@ -364,16 +411,33 @@ int Mcp::run_http(int port)
     WSACleanup();
     return 1;
   }
+  http_listener = listener;
+  http_closed = CreateEventA(nullptr, TRUE, FALSE, nullptr);   // manual reset, starts unsignalled
+  SetConsoleCtrlHandler(http_ctrl_handler, TRUE);
+
   qstring m;
   m.sprnt("hexport: HTTP MCP listening on http://127.0.0.1:%d/mcp\n", bound);
   write_err(m);
 
-  for ( ;; )   // headless server: runs until the process is killed (Ctrl+C)
+  while ( InterlockedCompareExchange(&http_stop, 0, 0) == 0 )
   {
     SOCKET c = accept(listener, nullptr, nullptr);
     if ( c == INVALID_SOCKET )
-      continue;
+      continue;                            // stopping, or a transient accept failure
     handle_http_client(c);
     closesocket(c);
   }
+
+  write_err(qstring("hexport: stopping; closing the database cleanly\n"));
+  http_listener = INVALID_SOCKET;
+  closesocket(listener);
+  WSACleanup();
+
+  // Close here rather than leaving it to main(), so the control handler can be released only once
+  // the database is genuinely closed. startup_close() is idempotent (close() returns early when no
+  // database is open), so main() calling it again is a no-op.
+  startup_close();
+  if ( http_closed != nullptr )
+    SetEvent(http_closed);
+  return 0;
 }

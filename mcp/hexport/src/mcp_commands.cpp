@@ -57,6 +57,14 @@ bool McpCommands::open(const char *file_path, bool run_auto)
   processed = 0;
   t_start_100ns = KUser::get_instance().clock.interrupt_time_100ns();   // start the KUSER elapsed timer
   hexrays_ok = init_hexrays_plugin();
+  if ( !hexrays_ok )
+  {
+    // Worth one line on stderr. Without it a decompiler that never loaded is indistinguishable from
+    // a function that cannot be decompiled: server_health still reports ready (the database IS
+    // open) and every decompile returns "decompiler unavailable" as if it were a per-function fact.
+    write_err(qstring("hexport: WARNING Hex-Rays did not initialise; decompile is unavailable "
+                      "for this session (server_health reports hexrays=false)\n"));
+  }
   return true;
 }
 

@@ -98,39 +98,77 @@ ok ((tv $R2[37]).ready -eq $false) "server_health not ready after close"
 
 "=== Phase 3: module-name normalization (' - Copy' stripping) ==="
 if (Test-Path $IdbCopy) {
-  $R3 = run $Exe @("--stdio", $IdbCopy) @('{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"server_health","arguments":{}}}') $null
-  ok ((tv $R3[40]).module -eq "hexx64.dll") "module 'hexx64 - Copy.dll' -> 'hexx64.dll' (got '$((tv $R3[40]).module)')"
+  # Keep stderr. This assertion failed once in six runs reporting module 'target', and 'target' is
+  # module_name()'s fallback for get_root_filename() failing -- but stderr was being sent to $null,
+  # so whether the open had succeeded was unknowable after the fact.
+  $err3 = "$env:TEMP\hexport_test_stderr_phase3.txt"
+  Remove-Item $err3 -ea 0
+  $R3 = run $Exe @("--stdio", $IdbCopy) @('{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"server_health","arguments":{}}}') $err3
+  $h3 = tv $R3[40]
+  $note = if ($h3.module -eq "hexx64.dll") { "got '$($h3.module)'" } else {
+    $sl = (Select-String -Path $err3 -Pattern 'hexport: (opened|could not open|WARNING)' -ea 0 | ForEach-Object { $_.Line.Trim() }) -join ' | '
+    "got '$($h3.module)'; ready=$($h3.ready) hexrays=$($h3.hexrays) functions=$($h3.functions); stderr: $sl"
+  }
+  ok ($h3.module -eq "hexx64.dll") "module 'hexx64 - Copy.dll' -> 'hexx64.dll' ($note)"
 } else { "  [SKIP] no ' - Copy' test idb present" }
 
 "=== Phase 4: HTTP transport (M4) ==="
-function http_inst($base) {
-  $errf = "$env:TEMP\hexport_http_$base.err"
+function http_inst($base, $tag) {
+  $errf = "$env:TEMP\hexport_http_${base}_$tag.err"
+  Remove-Item $errf,"$errf.out" -ea 0       # a stale file means the port scan can read a dead run's
   $p = Start-Process -FilePath $Exe -ArgumentList @("--http","--port","$base","--open",$Idb) -PassThru -RedirectStandardError $errf -RedirectStandardOutput "$errf.out" -WindowStyle Hidden
   $port = $null
   for ($i=0; $i -lt 120; $i++) { Start-Sleep -Milliseconds 100
     if (Test-Path $errf) { $m = Select-String -Path $errf -Pattern 'listening on http://127\.0\.0\.1:(\d+)/mcp' | Select-Object -First 1; if ($m) { $port = [int]$m.Matches[0].Groups[1].Value; break } } }
-  [pscustomobject]@{ proc=$p; port=$port }
+  [pscustomobject]@{ proc=$p; port=$port; errf=$errf }
 }
 function http_post($port,$obj) {
   $f = "$env:TEMP\hexport_http_req.json"; [IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 8 -Compress))
   $raw = & curl.exe -s --max-time 20 -X POST -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" --data-binary "@$f" "http://127.0.0.1:$port/mcp"
   if ($raw) { $raw | ConvertFrom-Json } else { $null }
 }
-$H1 = http_inst 13500   # base away from any live ida-pro-mcp on 13337-13339
-$H2 = http_inst 13500   # second instance must auto-bump off H1's port
+$H1 = http_inst 13500 'a'   # base away from any live ida-pro-mcp on 13337-13339
+$H2 = http_inst 13500 'b'   # second instance must auto-bump off H1's port
 try {
   ok ($null -ne $H1.port) "http instance A bound a port ($($H1.port))"
   $init = http_post $H1.port @{ jsonrpc="2.0"; id=1; method="initialize"; params=@{ protocolVersion="2024-11-05"; capabilities=@{}; clientInfo=@{ name="t"; version="1" } } }
   ok ($init.result.serverInfo.name -eq "hexport") "http initialize -> serverInfo.name=hexport"
   $hh = (http_post $H1.port @{ jsonrpc="2.0"; id=2; method="tools/call"; params=@{ name="server_health"; arguments=@{} } }).result.structuredContent.result
   ok ($hh.ready -eq $true -and $hh.functions -gt 0) "http server_health ready, functions=$($hh.functions)"
-  $dc = (http_post $H1.port @{ jsonrpc="2.0"; id=3; method="tools/call"; params=@{ name="decompile"; arguments=@{ addr="0x140001000" } } }).result.structuredContent.result
-  ok ($dc.code -match "MessageBoxW") "http decompile returns full pseudocode"
+  ok ($hh.hexrays -eq $true) "http server_health reports the decompiler loaded (hexrays=$($hh.hexrays))"
+  $dcResp = http_post $H1.port @{ jsonrpc="2.0"; id=3; method="tools/call"; params=@{ name="decompile"; arguments=@{ addr="0x140001000" } } }
+  $dc = $dcResp.result.structuredContent.result
+  # Say what came back when this fails. It used to report only "no pseudocode", which is the one
+  # thing every possible cause has in common: an empty reply, a decompiler that never loaded, and a
+  # genuinely undecompilable function all looked identical.
+  $why = if ($null -eq $dcResp) { "no HTTP response (curl empty or timed out)" }
+         elseif ($null -eq $dc) { "response carried no structuredContent.result" }
+         elseif ($dc.error)     { "server said: $($dc.error)" }
+         elseif (-not $dc.code) { "no code field and no error field" }
+         elseif ($dc.code -match "MessageBoxW") { "$($dc.code.Length) chars" }
+         else                   { "code present but no MessageBoxW, $($dc.code.Length) chars" }
+  ok ($dc.code -match "MessageBoxW") "http decompile returns full pseudocode ($why)"
   $nt = http_post $H1.port @{ jsonrpc="2.0"; method="notifications/initialized" }
   ok ($null -eq $nt) "http notification -> no JSON-RPC response (202)"
   ok ($null -ne $H2.port -and $H2.port -ne $H1.port) "http instance B auto-bumped to a different port ($($H2.port))"
 } finally {
+  # Close the database BEFORE killing anything. Stop-Process -Force is TerminateProcess, so no
+  # console handler and no shutdown path run; a database still open at that point is left unpacked
+  # and inconsistent, which is how this project lost a 374 MB .i64 to "Fatal error before kernel
+  # init". Closing first means the kill lands on a process holding nothing.
+  foreach ($x in @($H1,$H2)) {
+    if ($x -and $x.port) {
+      http_post $x.port @{ jsonrpc="2.0"; id=98; method="tools/call"; params=@{ name="close_database"; arguments=@{ save=$false } } } | Out-Null
+    }
+  }
+  Start-Sleep -Milliseconds 300
   foreach ($x in @($H1,$H2)) { if ($x -and $x.proc -and -not $x.proc.HasExited) { Stop-Process -Id $x.proc.Id -Force -ea 0 } }
+  Start-Sleep -Milliseconds 200
+  # A clean close repacks the database and removes its working files. Anything left here means a
+  # database was killed while open, so assert it rather than trusting it.
+  $stem = [IO.Path]::Combine([IO.Path]::GetDirectoryName($Idb), [IO.Path]::GetFileNameWithoutExtension($Idb))
+  $orphans = @(Get-ChildItem -Path "$stem.id0","$stem.id1","$stem.id2","$stem.nam","$stem.til" -ea 0)
+  ok ($orphans.Count -eq 0) "no unpacked database left behind ($($orphans.Count) file(s): $(($orphans.Name) -join ', '))"
 }
 
 ""

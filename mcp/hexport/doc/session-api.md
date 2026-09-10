@@ -158,3 +158,133 @@ The four culprits on hexx64.dll, with the call site Hex-Rays named:
 The rename half (`off_...` on a proven function pointer becomes `pfn_...`) did not fire on this
 binary: all four culprits already had real names, and inventing a name for something already called
 `callui` would be a loss. It is built but unexercised here.
+
+## HTTP mode had no clean exit
+
+Found while chasing an intermittent `http decompile returns full pseudocode` failure in
+`test_hexport.ps1` (seen once in three runs). The flake itself did not reproduce -- 12 isolated
+Phase-4 runs and 12 full-suite runs, all clean -- but the investigation turned up something worse
+and fully deterministic.
+
+`run_http` was `for ( ;; )` with no exit. So `startup_close()` in `main()` was unreachable in HTTP
+mode: the only way to stop an `--http` server was to kill it. Killing a process that holds an open
+database leaves a packed `.i64` unpacked and inconsistent on disk, which is exactly how this
+project's 374 MB database came to give IDA "Fatal error before kernel init".
+
+The shipped test did this on every run. After a loop of the suite, four orphaned files sat beside
+the fixture:
+
+```
+db.i64  db.id0  db.id1  db.nam  db.til
+```
+
+The `.i64` itself was byte-identical, but the next open sees that working set rather than the packed
+file. A clean close repacks and removes them -- confirmed in both directions, since a later
+clean-closing session tidied up residue an earlier killed run had left.
+
+### The fix, and the wrong first version of it
+
+A console control handler now breaks the accept loop so the normal shutdown path runs.
+
+The first attempt set a stop flag and returned `TRUE` immediately. That was wrong, and the test
+caught it: for `CTRL_CLOSE_EVENT` Windows terminates the process as soon as the handler returns --
+returning `TRUE` means "handled", not "spare me". The process died mid-close with exit code
+`0xC000013A` (`STATUS_CONTROL_C_EXIT`) and still left all four files.
+
+The handler now blocks on an event that the shutdown path signals once the database is really
+closed, bounded at 30 seconds so a hung close cannot wedge a logoff. `run_http` calls
+`startup_close()` itself and then signals; `close()` returns early when nothing is open, so
+`main()` calling it again is a no-op.
+
+| | before | after |
+|---|---|---|
+| exit code | `0xC000013A` | `0` |
+| unpacked files left | 4 | 0 |
+| database bytes | unchanged | unchanged |
+
+`tools/test_http_shutdown.ps1` asserts all four of those. It never force-kills anything and runs on
+a copy.
+
+### Test changes
+
+- **Close before stopping.** Phase 4's `finally` now calls `close_database` on each instance and
+  then stops the process, so the kill lands on a process holding nothing. It also asserts that no
+  unpacked files remain, rather than trusting it.
+- **Assert `hexrays`.** The health check tested `ready` and `functions` only. `ready` means the
+  database is open; decompiling additionally needs the decompiler, so a session where Hex-Rays
+  failed to load passed that assertion and then failed at the decompile with no explanation.
+- **Say what came back.** The decompile assertion now reports which of the possible causes actually
+  happened -- empty HTTP reply, missing `structuredContent`, a server-side error string, or code
+  present without the expected symbol. Previously all of them read as "no pseudocode".
+- **One stderr file per instance.** Both `http_inst` calls passed the same base port, so both
+  redirected stderr to the same path; the second `Start-Process` truncated the file the first was
+  still writing to, and the port was then parsed out of whatever survived. Stale files from a
+  previous run are removed too, since the port scan could otherwise read a dead run's line.
+
+### Server diagnostic
+
+`open()` set `hexrays_ok = init_hexrays_plugin()` and carried on silently when it failed. It now
+warns once on stderr. Without that line a decompiler that never loaded is indistinguishable from a
+function that cannot be decompiled: `server_health` still reports `ready` (the database really is
+open) and every `decompile` returns "decompiler unavailable" as though it were a per-function fact.
+
+`ready` deliberately still means "database open". A database can legitimately be open with no
+decompiler -- an unsupported processor, or no decompiler licence -- so folding `hexrays` into
+`ready` would report a working session as broken.
+
+### Not reproduced
+
+The original intermittent failure did not recur in 24 attempts. What is established: if
+`hexrays_ok` is false, `decompile` returns `{"error": "decompiler unavailable"}` with no `code`
+field, which matches the observed symptom exactly, and the old assertions could not tell that apart
+from anything else. A stress test that killed instances at randomised delays to damage the working
+set deliberately was written but not run -- force-killing database-holding processes is precisely
+what this repo forbids. If the flake returns, the new assertions name the cause on the spot.
+
+### A second flake, found while verifying
+
+Run 3 of a six-run loop failed a different assertion:
+
+```
+[FAIL] module 'hexx64 - Copy.dll' -> 'hexx64.dll' (got 'target')
+```
+
+`"target"` is `module_name()`'s fallback for `get_root_filename()` returning <= 0, and
+`server_health` only calls `module_name()` when `is_open` is true. So the database was open and the
+filename lookup failed, which is not the same as a failed open. The cause could not be recovered
+after the fact, because Phase 3 was passing `$null` as its stderr file and throwing the server's
+own account of the open away.
+
+Phase 3 now keeps stderr and, on failure, reports `ready`, `hexrays`, `functions` and the relevant
+stderr lines alongside the module name.
+
+Six direct probes of that same open (`tools/../probe`, Python, stderr kept) came back
+`module='hexx64.dll' ready=True hexrays=True funcs=10109` every time, so it is rare rather than
+systematic. Cause not established.
+
+Worth noting for whoever picks this up: `module_name()` returning `"target"` when the lookup fails
+is a plausible-looking value standing in for an error, which is the same shape as `server_health`
+reporting `ready` while the decompiler is missing. Both make an initialisation failure read as
+success. It was left alone here because the export path uses `module` for output naming and changing
+it is a behaviour change that wants its own measurement.
+
+### Tally
+
+| | attempts | recurrences |
+|---|---|---|
+| Phase 4 `http decompile`, isolated repro | 12 | 0 |
+| Phase 4, via the full suite | 34 | 0 |
+| Phase 3 `module`, via the full suite | 34 | 1 |
+| Phase 3, direct probe | 6 | 0 |
+
+34 full-suite runs: 12 before the fix, 22 after (20 against copies, 2 against the real fixtures).
+The single Phase 3 failure landed in the third of those, before Phase 3 kept its stderr.
+
+The suite is 40 passed / 0 failed against the real fixtures, and the two databases it opens are left
+with no orphaned working files.
+
+Unrelated but visible from here: `D:\source\repos\test_research\hexrays\` holds 10 orphaned files
+from earlier sessions -- `hexx64.dll.id0/.id1/.id2/.nam/.til` and the same set for `ida.dll`, the
+latter 834 MB beside a 1.06 GB `ida.dll.i64`. They predate this fix (Sep 3 and Sep 6) and belong to
+databases the test does not open. Left in place; deleting someone's unpacked database is not a
+cleanup to do unasked.
