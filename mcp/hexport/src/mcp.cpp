@@ -17,7 +17,8 @@
   X(rename) X(set_comments) X(get_string) X(xrefs_to) X(callees) \
   X(define_code) X(make_data) X(list_globals) \
   X(find_bytes) X(basic_blocks) X(stack_frame) X(set_op_type) X(imports) \
-  X(type_apply_batch) X(repair_badcall)
+  X(type_apply_batch) X(repair_badcall) X(microcode) X(make_sigs) \
+  X(save_as) X(revert_decisions)
 
 //-------------------------------------------------------------------------
 static void set_id(jobj_t &resp, const jvalue_t *id)
@@ -128,6 +129,10 @@ void Mcp::call_tool(const jobj_t &params, jvalue_t *result_out, bool *is_error, 
     case "imports"_h:         cmds.imports(args, result_out);          break;
     case "type_apply_batch"_h: cmds.type_apply_batch(args, result_out); break;
     case "repair_badcall"_h:  cmds.repair_badcall(args, result_out);   break;
+    case "microcode"_h:       cmds.microcode(args, result_out);        break;
+    case "make_sigs"_h:       cmds.make_sigs(args, result_out);        break;
+    case "save_as"_h:         cmds.save_as(args, result_out);          break;
+    case "revert_decisions"_h: cmds.revert_decisions(args, result_out); break;
     default:
       *is_error = true;
       errmsg->sprnt("unknown tool: %s", name.c_str());

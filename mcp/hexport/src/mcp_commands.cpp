@@ -152,6 +152,13 @@ void McpCommands::server_health(jvalue_t *out)
   o->put("ready", is_open);
   o->put("hexrays", hexrays_ok);
   o->put("functions", int64(is_open ? get_func_qty() : 0));
+  int major = 0, minor = 0, build = 0;
+  if ( get_library_version(major, minor, build) )
+  {
+    qstring v;
+    v.sprnt("%d.%d.%d", major, minor, build);
+    o->put("ida_version", v);
+  }
   out->set_obj(o);
 }
 
@@ -1320,12 +1327,14 @@ static const char *BADCALL_PTR_PROTOS[] = {
   "__int64 (__fastcall *f)(__int64, ...)",
 };
 
-bool McpCommands::badcall_at(ea_t fea)
+bool McpCommands::badcall_at(ea_t fea, ea_t *errea)
 {
   qstring err;
   int merr = 0;
-  ea_t errea = BADADDR;
-  pseudocode(fea, &err, &merr, &errea);
+  ea_t at = BADADDR;
+  pseudocode(fea, &err, &merr, &at);
+  if ( errea != nullptr )
+    *errea = at;
   return !err.empty() && merr == -12;      // MERR_BADCALL
 }
 
@@ -1337,30 +1346,87 @@ bool McpCommands::decompiles_now(ea_t fea)
   return err.empty();
 }
 
-// Everything this function might be blaming: functions it calls, and globals it references (a
-// function pointer is reached by a data reference, not a code one).
-void McpCommands::badcall_candidates(ea_t fea, qvector<ea_t> *direct, qvector<ea_t> *indirect)
+// One instruction's worth of "what could this be calling": code references that leave the function
+// are direct calls, data references to non-functions are the globals a call might go through.
+static void harvest_refs(ea_t p, ea_t lo, ea_t hi, qvector<ea_t> *direct, qvector<ea_t> *indirect)
+{
+  for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+  {
+    if ( t >= lo && t < hi )
+      continue;                            // stays inside: a branch, not a call
+    if ( get_func(t) != nullptr && !direct->has(t) )
+      direct->push_back(t);
+  }
+  for ( ea_t t = get_first_dref_from(p); t != BADADDR; t = get_next_dref_from(p, t) )
+  {
+    if ( get_func(t) != nullptr )
+      continue;                            // a function, not a pointer to one
+    if ( !indirect->has(t) )
+      indirect->push_back(t);
+  }
+}
+
+// How far back from the failing call to look for the load that set up an indirect target. The load
+// is nearly always within a handful of instructions; when it is not, the whole-function fallback
+// below still finds it, just slower.
+static const int BADCALL_BACKWALK = 24;
+
+// What the call Hex-Rays choked on might be reaching.
+//
+// hexrays_failure_t carries errea -- the exact address where the decompiler gave up. The first
+// version of this tool ignored it and searched every callee and every global in the whole function,
+// which on a large function is hundreds of candidates and a full re-decompilation per trial. Start
+// where Hex-Rays pointed instead.
+//
+// `call rax` holds no reference to the global that produced rax: that data reference sits on the
+// earlier `mov rax, cs:callui`. So take the call site's own references, then walk backwards a
+// bounded distance to pick up the load.
+void McpCommands::badcall_candidates(
+        ea_t fea,
+        ea_t errea,
+        qvector<ea_t> *direct,
+        qvector<ea_t> *indirect)
 {
   func_t *pfn = get_func(fea);
   if ( pfn == nullptr )
     return;
-  for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
+  const ea_t lo = pfn->start_ea;
+  const ea_t hi = pfn->end_ea;
+
+  if ( errea >= lo && errea < hi )
   {
-    for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
-    {
-      if ( t >= pfn->start_ea && t < pfn->end_ea )
-        continue;                          // stays inside: a branch, not a call
-      if ( get_func(t) != nullptr && !direct->has(t) )
-        direct->push_back(t);
-    }
-    for ( ea_t t = get_first_dref_from(p); t != BADADDR; t = get_next_dref_from(p, t) )
-    {
-      if ( get_func(t) != nullptr )
-        continue;                          // a function, not a pointer to one
-      if ( !indirect->has(t) )
-        indirect->push_back(t);
-    }
+    ea_t p = errea;
+    for ( int i = 0; i <= BADCALL_BACKWALK && p != BADADDR && p >= lo; ++i, p = prev_head(p, lo) )
+      harvest_refs(p, lo, hi, direct, indirect);
+    if ( !direct->empty() || !indirect->empty() )
+      return;                              // the named spot named a target: no need to sweep
   }
+
+  // No usable errea, or the call site referenced nothing we can type. Sweep the function.
+  for ( ea_t p = lo; p < hi && p != BADADDR; p = next_head(p, hi) )
+    harvest_refs(p, lo, hi, direct, indirect);
+}
+
+// The rename half. A global we have just PROVED is a called function pointer -- typing it as one
+// turned a failing decompilation into a working one -- should not keep an anonymous `off_...`
+// name. Only dummy names are touched: a global that already reads `callui` is better named than
+// anything invented here.
+static bool name_as_fptr(ea_t ea, qstring *newname)
+{
+  if ( !has_dummy_name(get_flags(ea)) )
+    return false;
+  qstring old;
+  if ( get_name(&old, ea) <= 0 )
+    return false;
+  const char *us = strchr(old.c_str(), '_');
+  if ( us == nullptr )
+    return false;
+  qstring nn("pfn");
+  nn.append(us);
+  if ( !set_name(ea, nn.c_str(), SN_CHECK | SN_FORCE | SN_NOWARN) )
+    return false;
+  get_name(newname, ea);
+  return true;
 }
 
 void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
@@ -1373,18 +1439,46 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
     return;
   }
   const bool apply = args != nullptr ? jbool(*args, "apply", true) : true;
+  const bool do_rename = args != nullptr ? jbool(*args, "rename", true) : true;
 
   // ---- which functions are failing this way ----------------------------------------------
-  qvector<ea_t> failing;
-  size_t nfuncs = get_func_qty();
-  for ( size_t i = 0; i < nfuncs; ++i )
+  // A caller that already knows which functions failed (an export just told it) can pass them in
+  // and skip the sweep entirely -- the sweep decompiles all 10,109 functions to find 38.
+  qvector<ea_t> scan;
+  const jarr_t *only = args != nullptr ? jsubarr(*args, "addrs") : nullptr;
+  if ( only != nullptr )
   {
-    func_t *pfn = getn_func(i);
-    if ( pfn == nullptr )
-      continue;
-    status("repair-scan", pfn->start_ea, "");
-    if ( badcall_at(pfn->start_ea) )
-      failing.push_back(pfn->start_ea);
+    const jarr_t &a = *only;
+    for ( size_t i = 0; i < a.values.size(); ++i )
+    {
+      ea_t ea = resolve_ea(a.values[i].type() == JT_STR ? a.values[i].qstr().c_str() : "");
+      func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+      if ( pfn != nullptr )
+        scan.push_back(pfn->start_ea);
+    }
+  }
+  else
+  {
+    size_t nfuncs = get_func_qty();
+    for ( size_t i = 0; i < nfuncs; ++i )
+    {
+      func_t *pfn = getn_func(i);
+      if ( pfn != nullptr )
+        scan.push_back(pfn->start_ea);
+    }
+  }
+
+  qvector<ea_t> failing;
+  qvector<ea_t> failing_at;                // where Hex-Rays gave up, one per failing function
+  for ( size_t i = 0; i < scan.size(); ++i )
+  {
+    status("repair-scan", scan[i], "");
+    ea_t at = BADADDR;
+    if ( badcall_at(scan[i], &at) )
+    {
+      failing.push_back(scan[i]);
+      failing_at.push_back(at);
+    }
   }
   result->put("badcall_found", int64(failing.size()));
   if ( failing.empty() || !apply )
@@ -1412,7 +1506,7 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
 
     qvector<ea_t> direct;
     qvector<ea_t> indirect;
-    badcall_candidates(fea, &direct, &indirect);
+    badcall_candidates(fea, failing_at[i], &direct, &indirect);
 
     bool done = false;
     // Indirect first: one shared function pointer is usually the cause of many failures at once,
@@ -1452,6 +1546,11 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
             e->put("culprit_name", cn);
             e->put("kind", phase == 0 ? "indirect call through a global" : "direct call");
             e->put("applied", protos[k]);
+            a.sprnt("0x%" FMT_64 "x", uint64(failing_at[i]));
+            e->put("failed_at", a);        // the call Hex-Rays named, not a guess
+            qstring renamed;
+            if ( do_rename && phase == 0 && name_as_fptr(cands[c], &renamed) )
+              e->put("renamed", renamed);
             fixes->values.push_back().set_obj(e);
             done = true;
             break;
@@ -1490,6 +1589,282 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
   // Say it plainly: the caller has to opt into persistence, and by default nothing reaches disk.
   result->put("saved", false);
   result->put("note", "in-session only; close_database with save=true to persist");
+  out->set_obj(result);
+}
+
+// ---- microcode --------------------------------------------------------------------------------
+//
+// The decompiler runs the function through a pipeline of maturity levels, and a failure kills the
+// whole thing. MERR_BADCALL happens at MMAT_CALLS, the level whose job is working out call
+// arguments -- so asking for microcode at the level BEFORE that succeeds on exactly the functions
+// that will not decompile. That is the point of this tool: to see what the decompiler saw at the
+// moment it gave up, instead of inferring it from pseudocode that does not exist.
+//
+// Pair it with repair_badcall's failed_at: dump the microcode around that address and the offending
+// call is right there, with the registers live across it.
+
+struct mba_text_t : public vd_printer_t
+{
+  qstring text;
+  AS_PRINTF(3, 4) int print(int indent, const char *format, ...) override
+  {
+    qstring line;
+    if ( indent > 0 )
+      line.sprnt("%*s", indent, "");
+    va_list va;
+    va_start(va, format);
+    line.cat_vsprnt(format, va);
+    va_end(va);
+    qstring plain;
+    tag_remove(&plain, line.c_str());       // microcode text is colour-tagged like everything else
+    text.append(plain);
+    return int(plain.length());
+  }
+};
+
+static mba_maturity_t maturity_by_name(const qstring &s)
+{
+  if ( s == "generated" )    return MMAT_GENERATED;
+  if ( s == "preoptimized" ) return MMAT_PREOPTIMIZED;
+  if ( s == "locopt" )       return MMAT_LOCOPT;
+  if ( s == "calls" )        return MMAT_CALLS;
+  if ( s == "glbopt1" )      return MMAT_GLBOPT1;
+  if ( s == "glbopt2" )      return MMAT_GLBOPT2;
+  if ( s == "glbopt3" )      return MMAT_GLBOPT3;
+  if ( s == "lvars" )        return MMAT_LVARS;
+  return MMAT_ZERO;
+}
+
+void McpCommands::microcode(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+  if ( !is_open || !hexrays_ok || pfn == nullptr )
+  {
+    result->put("error", !is_open      ? "no database is open"
+                       : !hexrays_ok   ? "decompiler unavailable"
+                                       : "no function at address");
+    out->set_obj(result);
+    return;
+  }
+
+  // Default to the level just before call analysis, because that is the one that still works when
+  // call analysis is what failed.
+  qstring want = args != nullptr ? jstr(*args, "maturity", "preoptimized") : qstring("preoptimized");
+  mba_maturity_t mat = maturity_by_name(want);
+  if ( mat == MMAT_ZERO )
+  {
+    result->put("error", "maturity must be one of: generated preoptimized locopt calls "
+                         "glbopt1 glbopt2 glbopt3 lvars");
+    out->set_obj(result);
+    return;
+  }
+
+  mute_stdout();
+  hexrays_failure_t hf;
+  decomp_ranges_t dcr(pfn->start_ea);
+  mba_t *mba = gen_microcode(dcr, &hf, nullptr, DECOMP_NO_WAIT, mat);
+  unmute_stdout();
+  if ( mba == nullptr )
+  {
+    qstring d = hf.desc();
+    if ( d.empty() )
+      d.sprnt("merror %d", int(hf.code));
+    result->put("error", d);
+    result->put("merror_code", int64(hf.code));
+    if ( hf.errea != BADADDR )
+    {
+      qstring h;
+      h.sprnt("0x%" FMT_64 "x", uint64(hf.errea));
+      result->put("error_addr", h);
+    }
+    out->set_obj(result);
+    return;
+  }
+
+  mba_text_t p;
+  mba->print(p);
+  delete mba;                                // ~mba_t calls term(); this is not garbage collected
+
+  // Whole listings run to thousands of lines. `around` keeps the window near the interesting
+  // address, which for a repair is whatever failed_at reported.
+  ea_t around = resolve_ea(args != nullptr ? jstr(*args, "around").c_str() : "");
+  int64 ctx = args != nullptr ? jint(*args, "context", 40) : 40;
+  qstring text = p.text;
+  if ( around != BADADDR && ctx > 0 )
+  {
+    qstring needle;
+    needle.sprnt("%a", around);
+    qvector<qstring> lines;
+    size_t start = 0;
+    for ( size_t i = 0; i <= text.length(); ++i )
+    {
+      if ( i == text.length() || text[i] == '\n' )
+      {
+        lines.push_back(qstring(text.c_str() + start, i - start));
+        start = i + 1;
+      }
+    }
+    ssize_t hit = -1;
+    for ( size_t i = 0; i < lines.size() && hit < 0; ++i )
+      if ( strstr(lines[i].c_str(), needle.c_str()) != nullptr )
+        hit = ssize_t(i);
+    if ( hit >= 0 )
+    {
+      size_t lo = size_t(hit) > size_t(ctx) ? size_t(hit) - size_t(ctx) : 0;
+      size_t hi = qmin(lines.size(), size_t(hit) + size_t(ctx) + 1);
+      qstring win;
+      for ( size_t i = lo; i < hi; ++i )
+      {
+        win.append(lines[i]);
+        win.append('\n');
+      }
+      text = win;
+      result->put("window", needle);
+    }
+  }
+
+  qstring fn;
+  get_func_name(&fn, pfn->start_ea);
+  result->put("name", fn);
+  result->put("maturity", want);
+  result->put("microcode", text);
+  out->set_obj(result);
+}
+
+// ---- idalib session ---------------------------------------------------------------------------
+//
+// idalib's own surface is small: init_library, open_database, close_database, make_signatures,
+// enable_console_messages, set_screen_ea, get_library_version. Everything else hexport does comes
+// from the SDK proper. Of the four we were not using, make_signatures is the only one that does
+// real work; get_library_version belongs in server_health so a caller can tell which IDA produced
+// an export. enable_console_messages is redundant here (hexport mutes at the file-descriptor
+// level, which also catches output from the kernel's own C runtime) and set_screen_ea has no
+// meaning without a screen.
+void McpCommands::make_sigs(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  const bool only_pat = args != nullptr ? jbool(*args, "only_pat", false) : false;
+  mute_stdout();
+  bool ok = make_signatures(only_pat);
+  unmute_stdout();
+  result->put("status", ok ? "ok" : "failed");
+  result->put("only_pat", only_pat);
+  // Written beside the input file, named after it. This is the one hexport operation that produces
+  // a file on disk without being asked to save a database.
+  result->put("note", only_pat ? "wrote .pat beside the input file"
+                               : "wrote .pat and .sig beside the input file");
+  out->set_obj(result);
+}
+
+// ---- save_as ----------------------------------------------------------------------------------
+//
+// The session-level call that matters most here, and it is not in idalib.hpp at all -- it is
+// loader.hpp's save_database(outfile, ...). It writes the CURRENT in-memory database to a
+// DIFFERENT path.
+//
+// Until now a repair had exactly two endings: discard it on close, or save over the original. The
+// first wastes eight minutes of work every time; the second is the thing that must never happen to
+// a database somebody cares about. save_as gives the third ending -- keep the repair, write it
+// somewhere new, leave the input file byte-identical.
+//
+// DBFL_BAK is deliberately not offered: a backup of a file we are not writing to is meaningless,
+// and the flag is about the current path, not the output path.
+void McpCommands::save_as(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring path = args != nullptr ? jstr(*args, "path") : qstring();
+  if ( !is_open || path.empty() )
+  {
+    result->put("error", !is_open ? "no database is open" : "path is required");
+    out->set_obj(result);
+    return;
+  }
+  // Refuse to write over the database we opened. That is what close_database(save=true) is for,
+  // and confusing the two is exactly the mistake this tool exists to prevent.
+  const char *cur = get_path(PATH_TYPE_IDB);
+  if ( cur != nullptr && qstrcmp(cur, path.c_str()) == 0 )
+  {
+    result->put("error", "path is the current database; use close_database with save=true "
+                         "if overwriting it is really what you want");
+    out->set_obj(result);
+    return;
+  }
+
+  const bool compress = args != nullptr ? jbool(*args, "compress", false) : false;
+  mute_stdout();
+  // Analysis queued by the repairs has to settle before the snapshot, or it is written half-done.
+  auto_wait();
+  bool ok = save_database(path.c_str(), compress ? DBFL_COMP : 0);
+  unmute_stdout();
+
+  result->put("status", ok ? "ok" : "failed");
+  result->put("path", path);
+  result->put("compressed", compress);
+  result->put("source_untouched", true);
+  out->set_obj(result);
+}
+
+// ---- revert_decisions -------------------------------------------------------------------------
+//
+// "Undefine, then let IDA redefine it" as one operation. revert_ida_decisions throws away only what
+// the auto-analyser concluded about a range -- guessed code, guessed data, guessed types -- and
+// leaves anything a human (or an earlier repair) set explicitly. Re-planning the range then makes
+// IDA work it out again from scratch.
+//
+// This is the safe form of the undefine/redefine cycle: undefine() plus define_func() destroys user
+// annotations along with the bad guess.
+void McpCommands::revert_decisions(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t start = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( !is_open || start == BADADDR )
+  {
+    result->put("error", !is_open ? "no database is open" : "bad address");
+    out->set_obj(result);
+    return;
+  }
+  qstring end_s = args != nullptr ? jstr(*args, "end") : qstring();
+  ea_t end = BADADDR;
+  if ( !end_s.empty() )
+  {
+    end = resolve_ea(end_s.c_str());
+  }
+  else
+  {
+    func_t *pfn = get_func(start);           // no end given: the enclosing function, else one item
+    end = pfn != nullptr ? pfn->end_ea : next_head(start, BADADDR);
+  }
+  if ( end == BADADDR || end <= start )
+  {
+    result->put("error", "could not work out a range to revert");
+    out->set_obj(result);
+    return;
+  }
+
+  const bool wait = args != nullptr ? jbool(*args, "wait", true) : true;
+  mute_stdout();
+  revert_ida_decisions(start, end);
+  plan_range(start, end);
+  if ( wait )
+    auto_wait_range(start, end);
+  unmute_stdout();
+
+  qstring a;
+  a.sprnt("0x%" FMT_64 "x", uint64(start));
+  result->put("start", a);
+  a.sprnt("0x%" FMT_64 "x", uint64(end));
+  result->put("end", a);
+  result->put("status", "ok");
+  func_t *pfn = get_func(start);
+  result->put("function_after", pfn != nullptr);
   out->set_obj(result);
 }
 

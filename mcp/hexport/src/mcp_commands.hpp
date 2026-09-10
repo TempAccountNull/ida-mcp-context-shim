@@ -47,11 +47,16 @@ public:
   void imports(const jobj_t *args, jvalue_t *out);
   void type_apply_batch(const jobj_t *args, jvalue_t *out);
   void repair_badcall(const jobj_t *args, jvalue_t *out);
+  void microcode(const jobj_t *args, jvalue_t *out);
+  void make_sigs(const jobj_t *args, jvalue_t *out);
+  void save_as(const jobj_t *args, jvalue_t *out);
+  void revert_decisions(const jobj_t *args, jvalue_t *out);
 
 private:
-  bool badcall_at(ea_t fea);
+  bool badcall_at(ea_t fea, ea_t *errea);
   bool decompiles_now(ea_t fea);
-  void badcall_candidates(ea_t fea, qvector<ea_t> *direct, qvector<ea_t> *indirect);
+  void badcall_candidates(ea_t fea, ea_t errea, qvector<ea_t> *direct,
+                          qvector<ea_t> *indirect);
 public:
 
 private:
