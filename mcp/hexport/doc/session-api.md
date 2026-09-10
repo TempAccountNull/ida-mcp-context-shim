@@ -288,3 +288,109 @@ from earlier sessions -- `hexx64.dll.id0/.id1/.id2/.nam/.til` and the same set f
 latter 834 MB beside a 1.06 GB `ida.dll.i64`. They predate this fix (Sep 3 and Sep 6) and belong to
 databases the test does not open. Left in place; deleting someone's unpacked database is not a
 cleanup to do unasked.
+
+## The Phase 3 flake, found
+
+Reproduced and characterised. It was never a failed open.
+
+A dedicated probe opened the 374 MB database 250 times, keeping stderr, and caught it three times:
+
+```
+it=97   module='target'  ready=True  hexrays=True  funcs=10109
+it=161  module='target'  ready=True  hexrays=True  funcs=10109
+it=231  module='target'  ready=True  hexrays=True  funcs=10109
+
+module wrong: 3 / 250        (1.2%, consistent with 1 in 34 full-suite runs)
+```
+
+On every hit the open succeeded completely: all 10,109 functions present, the decompiler
+initialised, and a stderr file **byte-identical** to a passing run. Only `get_root_filename()` came
+back empty, so `module_name()` returned its `"target"` fallback.
+
+That fallback is the actual defect. `"target"` reads like a real module name, so an export could be
+filed under the wrong binary with nothing anywhere saying so — the same shape as `server_health`
+reporting `ready` while the decompiler is missing: an initialisation failure wearing the costume of
+a success.
+
+### Transient or sticky
+
+A second probe asked four times per session, and also called `list_databases`, which reads the same
+name. On an affected session all eight answers agreed:
+
+```
+health=['target','target','target','target']
+list_databases=['target','target','target','target']
+```
+
+So it is **sticky**, not a momentary read failure — retrying inside the session cannot help. That
+session simply has no readable root filename. (One affected session, eight consecutive reads; enough
+to rule out a transient blip, not enough to say what the kernel was doing.)
+
+### The fix
+
+The database **path** is never in doubt: hexport passed it to `open_database` itself, and
+`get_path(PATH_TYPE_IDB)` hands it back. `hexx64 - Copy.dll.i64` minus the database suffix is
+`hexx64 - Copy.dll`, which is exactly what the root netnode would have said.
+
+So `module_name()` now tries, in order:
+
+1. `get_root_filename()` — the authoritative input file name;
+2. the opened database path, with `.i64`/`.idb` stripped, through the same `clean_module_name`;
+3. `"target"`, and only now with a warning on stderr.
+
+It caches on success, since the answer cannot change while a database is open and re-reading a
+netnode on every `server_health` call was work for nothing. A failure is **not** cached. The cache is
+cleared on close.
+
+Falling back to the path also logs a line, so a session that took the second route says so rather
+than looking indistinguishable from a clean one.
+
+### Root cause not established
+
+What makes the root netnode unreadable in 1.2% of opens is still unknown; it is inside the kernel,
+below anything hexport can see. What is established is that the database is otherwise fully loaded,
+that the condition lasts the whole session, and that a second source of the same fact is available
+and reliable. The fix removes the wrong answer without pretending to explain the kernel.
+
+### Verified, and what the diagnostic revealed
+
+Same 250-open probe, after the fix:
+
+| | before | after |
+|---|---|---|
+| wrong module name | 3 / 250 | **0 / 250** |
+| sessions where `get_root_filename` failed | 3 | 6 |
+| sessions that recovered via the database path | n/a | 6 |
+
+Every failure was caught and answered correctly. The differing failure counts (3 vs 6) are noise on
+small numbers, not a change in behaviour — nothing in the fix touches when the kernel call fails.
+
+The added diagnostic settled the question the earlier probe could not:
+
+```
+hexport: root filename unreadable (get_root_filename returned -1);
+         naming the module from the database path instead
+```
+
+**-1, not 0.** The SDK is reporting an error, not handing back a root netnode that happens to hold
+no name. That is a meaningfully different failure and it was invisible from outside.
+
+### The failures are periodic, not random
+
+Iterations where the call failed:
+
+| run | failing iterations | gaps |
+|---|---|---|
+| before the fix | 97, 161, 231 | 64, 70 |
+| after the fix | 28, 60, 154, 186, 217, 248 | 32, 94, 32, 31, 31 |
+
+Four of the five gaps are 31 or 32, and the fifth is almost exactly three times that. Against a
+period of 31 the predicted hits are 28, 59, 90, 121, 152, 183, 214, 245 — six of those eight landed,
+two did not. Six events falling that regularly across 250 slots is not what a random fault looks
+like.
+
+So whatever this is, it cycles with roughly every 31st opening of the database rather than striking
+at random. That points at a resource that fills and is released — a cache, a handle or temp-file
+table, a memory watermark — rather than a corrupt value in the database. Chasing it further means
+instrumenting inside the kernel, which is past what hexport can see; recorded here so the next person
+starts from a pattern rather than from "sometimes it breaks".

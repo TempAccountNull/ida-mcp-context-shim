@@ -73,7 +73,7 @@ set_type callui  ->  __int64 (__fastcall *callui)(int, ...)
 **recovered 34 of the 38.** One type on one global, and 34 functions came back.
 
 Packaged as `tools/repair_types.py`: it scans for MERR_BADCALL, applies each recipe, verifies the
-recipe actually recovered something before keeping it, works on a copy unless given `--in-place`,
+recipe actually recovered something before keeping it, always works on a copy and never saves,
 and saves only if it helped.
 
 Applied to `ref/hexx64 - Copy.dll.i64` (backed up first). Full export before and after:

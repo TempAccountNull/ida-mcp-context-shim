@@ -10,14 +10,19 @@ Measured on hexx64.dll: all 38 failures were MERR_BADCALL. Neither a plain retry
 force_recompile fixed a single one. Typing the single `callui` global recovered 34; typing one
 callee recovered 2 more.
 
+This script no longer writes anything, ever. It works on a copy, closes with save=false, and
+reports what it found. There is no flag to make it persist: hexport's `repair_badcall` tool does the
+same repair inside the session and `save_as` writes the result to a NEW path, which is a better
+answer than teaching a throwaway script to overwrite a database.
+
 Safety, in order:
-  * runs in-session and does NOT save unless --in-place is given, so the .i64 is untouched;
-  * rehearses on a COPY unless --in-place, so even a save has a dry run first;
+  * works on a COPY, so the real .i64 is never opened, let alone written;
+  * closes with save=false regardless;
   * reverts every trial prototype that does not actually fix the caller. A prototype that has not
     earned its place is a lie about the argument count, and confidently wrong pseudocode is worse
     than a function that visibly failed.
 
-  python repair_types.py <database.i64> [--in-place] [--hexport PATH]
+  python repair_types.py <database.i64> [--hexport PATH]
 """
 from __future__ import annotations
 
@@ -108,25 +113,18 @@ def main() -> int:
     ap.add_argument("database")
     ap.add_argument("--hexport",
                     default=str(Path(__file__).resolve().parents[1] / "build" / "hexport.exe"))
-    ap.add_argument("--in-place", action="store_true",
-                    help="save the repaired types into the real database (default: rehearse only)")
     args = ap.parse_args()
 
     if not os.path.isfile(args.database):
         print(f"no such database: {args.database}", file=sys.stderr)
         return 2
 
-    tmp = None
-    target = args.database
-    if not args.in_place:
-        tmp = tempfile.mkdtemp(prefix="repair_types_")
-        target = os.path.join(tmp, "work" + Path(args.database).suffix)
-        print("rehearsing on a copy; the real database is not touched "
-              "(--in-place to keep the result)", flush=True)
-        shutil.copy2(args.database, target)
+    tmp = tempfile.mkdtemp(prefix="repair_types_")
+    target = os.path.join(tmp, "work" + Path(args.database).suffix)
+    print("working on a copy; the real database is never opened", flush=True)
+    shutil.copy2(args.database, target)
 
     h = Hexport(args.hexport, target)
-    saved = False
     try:
         _total, failing = scan_failures(h)
         badcall = [f for f in failing if f[2] == -12]
@@ -183,17 +181,11 @@ def main() -> int:
         for a in still:
             print(f"  still failing: {a} {names.get(a, '')}")
 
-        if args.in_place and recovered:
-            h.close(save=True)
-            saved = True
-            print("saved to the database")
-        else:
-            print("database unchanged" if not args.in_place
-                  else "nothing recovered, so nothing saved")
+        print("database unchanged")
         return 0
     finally:
         try:
-            if not saved and h.proc.poll() is None:
+            if h.proc.poll() is None:
                 h.close(save=False)
         except Exception:
             pass

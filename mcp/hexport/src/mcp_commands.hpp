@@ -51,6 +51,24 @@ public:
   void make_sigs(const jobj_t *args, jvalue_t *out);
   void save_as(const jobj_t *args, jvalue_t *out);
   void revert_decisions(const jobj_t *args, jvalue_t *out);
+  void declare_type(const jobj_t *args, jvalue_t *out);
+  void type_inspect(const jobj_t *args, jvalue_t *out);
+  void type_query(const jobj_t *args, jvalue_t *out);
+  void enum_upsert(const jobj_t *args, jvalue_t *out);
+  void read_struct(const jobj_t *args, jvalue_t *out);
+  void declare_stack(const jobj_t *args, jvalue_t *out);
+  void delete_stack(const jobj_t *args, jvalue_t *out);
+  void callgraph(const jobj_t *args, jvalue_t *out);
+  void func_profile(const jobj_t *args, jvalue_t *out);
+  void export_funcs(const jobj_t *args, jvalue_t *out);
+  void search_text(const jobj_t *args, jvalue_t *out);
+  void list_strings(const jobj_t *args, jvalue_t *out);
+  void get_int(const jobj_t *args, jvalue_t *out);
+  void put_int(const jobj_t *args, jvalue_t *out);
+  void int_convert(const jobj_t *args, jvalue_t *out);
+  void get_global_value(const jobj_t *args, jvalue_t *out);
+  void add_bookmark(const jobj_t *args, jvalue_t *out);
+  void append_comments(const jobj_t *args, jvalue_t *out);
 
 private:
   bool badcall_at(ea_t fea, ea_t *errea);
@@ -62,6 +80,7 @@ public:
 private:
   bool is_open = false;
   bool hexrays_ok = false;
+  mutable qstring cached_module;   // see module_name(); resolved once, cleared on close
   uint64 processed = 0;            // functions handled so far (for the live status line)
   uint64 t_start_100ns = 0;        // KUSER InterruptTime at open, for the live elapsed/rate readout
 

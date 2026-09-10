@@ -32,13 +32,70 @@ void McpCommands::status(const char *op, ea_t ea, const char *name)
 }
 
 //-------------------------------------------------------------------------
+// Which binary this database is of.
+//
+// get_root_filename() reads the input file name out of the root netnode, and on a 374 MB database it
+// came back empty in 3 of 250 opens -- while ready, hexrays and a function count of 10,109 all said
+// the database was fine and stderr was byte-identical to a good open. module_name() then returned
+// its "target" fallback, which reads like a real name, so an export could be filed under the wrong
+// binary with nothing anywhere saying so.
+//
+// Measured further: it is STICKY, not a transient read. Four health calls in one affected session
+// all returned "target", and list_databases agreed. So retrying inside the session cannot help --
+// that whole session simply has no readable root filename.
+//
+// But the database PATH is never in doubt: hexport passed it to open_database itself, and
+// get_path(PATH_TYPE_IDB) hands it straight back. "hexx64 - Copy.dll.i64" minus the database
+// suffix is "hexx64 - Copy.dll", which is exactly what the root netnode would have said. So fall
+// back to that before falling back to a name that means nothing.
+//
+// Cached on success: the answer cannot change while a database is open, and re-reading a netnode on
+// every server_health call was work for nothing.
 qstring McpCommands::module_name() const
 {
-  char buf[QMAXPATH];
-  if ( get_root_filename(buf, sizeof(buf)) <= 0 )
-    return qstring("target");
+  if ( !cached_module.empty() )
+    return cached_module;
 
-  return qstring(hexport::clean_module_name(buf).c_str());
+  char buf[QMAXPATH];
+  buf[0] = 0;
+  ssize_t n = get_root_filename(buf, sizeof(buf));
+  if ( n > 0 && buf[0] != 0 )
+  {
+    cached_module = qstring(hexport::clean_module_name(buf).c_str());
+    return cached_module;
+  }
+
+  // Second source: the database path we opened. Strip the database suffix, then let
+  // clean_module_name do the rest (it splits the path and trims a " - Copy" tail).
+  const char *idb = get_path(PATH_TYPE_IDB);
+  if ( idb != nullptr && idb[0] != 0 )
+  {
+    qstring p(idb);
+    static const char *const DB_SUFFIX[] = { ".i64", ".idb" };
+    for ( size_t i = 0; i < qnumber(DB_SUFFIX); ++i )
+    {
+      size_t sl = qstrlen(DB_SUFFIX[i]);
+      if ( p.length() > sl && qstrcmp(p.c_str() + p.length() - sl, DB_SUFFIX[i]) == 0 )
+      {
+        p.resize(p.length() - sl);
+        break;
+      }
+    }
+    if ( !p.empty() )
+    {
+      qstring m;
+      m.sprnt("hexport: root filename unreadable (get_root_filename returned %d); "
+              "naming the module from the database path instead" "\n", int(n));
+      write_err(m);
+      cached_module = qstring(hexport::clean_module_name(p.c_str()).c_str());
+      return cached_module;
+    }
+  }
+
+  // Neither source worked. Do not cache this: it is a failure, not an answer.
+  write_err(qstring("hexport: WARNING neither the root filename nor the database path is "
+                    "readable; module reported as \"target\"" "\n"));
+  return qstring("target");
 }
 
 //-------------------------------------------------------------------------
@@ -56,6 +113,7 @@ bool McpCommands::open(const char *file_path, bool run_auto)
   is_open = true;
   processed = 0;
   t_start_100ns = KUser::get_instance().clock.interrupt_time_100ns();   // start the KUSER elapsed timer
+  module_name();                  // resolve it once, now, while the database is settled
   hexrays_ok = init_hexrays_plugin();
   if ( !hexrays_ok )
   {
@@ -96,6 +154,7 @@ void McpCommands::close(bool save)
   unmute_stdout();
   is_open = false;
   hexrays_ok = false;
+  cached_module.clear();          // belongs to the database that just closed
 }
 
 //-------------------------------------------------------------------------
@@ -1874,6 +1933,1377 @@ void McpCommands::revert_decisions(const jobj_t *args, jvalue_t *out)
   func_t *pfn = get_func(start);
   result->put("function_after", pfn != nullptr);
   out->set_obj(result);
+}
+
+// ---- local types, structures, enums, stack frames ---------------------------------------------
+//
+// Ported from ida-pro-mcp. These are the tools that let a caller BUILD understanding rather than
+// just read it out: name a stack slot, declare the struct a pointer really points at, extend an
+// enum as constants are worked out. All of it is in-session; nothing reaches disk unless save_as or
+// close_database(save=true) is asked for it.
+//
+// IDA 9 has no separate struct/enum API any more -- both are tinfo_t in the local type library, so
+// everything here goes through get_idati().
+
+static void put_hex(jobj_t *o, const char *key, ea_t ea)
+{
+  qstring a;
+  a.sprnt("0x%" FMT_64 "x", uint64(ea));
+  o->put(key, a);
+}
+
+// One named type out of the local library, or a failure the caller can read.
+static bool named_type(tinfo_t *out, const qstring &name)
+{
+  return !name.empty() && out->get_named_type(get_idati(), name.c_str());
+}
+
+static const char *tinfo_kind(const tinfo_t &t)
+{
+  if ( t.is_enum() )      return "enum";
+  if ( t.is_union() )     return "union";
+  if ( t.is_struct() )    return "struct";
+  if ( t.is_typedef() )   return "typedef";
+  if ( t.is_func() )      return "func";
+  if ( t.is_ptr() )       return "ptr";
+  if ( t.is_array() )     return "array";
+  return "scalar";
+}
+
+// Members of a struct/union, or constants of an enum. Both are worth reporting the same way: a name,
+// where it sits, and how big it is.
+static void emit_members(jobj_t *o, const tinfo_t &tif, int64 max_members)
+{
+  if ( tif.is_enum() )
+  {
+    enum_type_data_t ed;
+    if ( !tif.get_enum_details(&ed) )
+      return;
+    jarr_t *arr = new jarr_t;
+    for ( size_t i = 0; i < ed.size() && int64(i) < max_members; ++i )
+    {
+      jobj_t *e = new jobj_t;
+      e->put("name", ed[i].name);
+      qstring v;
+      v.sprnt("0x%" FMT_64 "x", ed[i].value);
+      e->put("value", v);
+      if ( !ed[i].cmt.empty() )
+        e->put("comment", ed[i].cmt);
+      arr->values.push_back().set_obj(e);
+    }
+    o->put("member_count", int64(ed.size()));
+    o->get_value_or_new("members")->set_arr(arr);
+    return;
+  }
+
+  udt_type_data_t udt;
+  if ( !tif.get_udt_details(&udt) )
+    return;
+  jarr_t *arr = new jarr_t;
+  for ( size_t i = 0; i < udt.size() && int64(i) < max_members; ++i )
+  {
+    const udm_t &m = udt[i];
+    jobj_t *e = new jobj_t;
+    e->put("name", m.name);
+    e->put("offset", int64(m.offset / 8));      // udm_t offsets are in BITS
+    e->put("size", int64(m.size / 8));
+    qstring ts;
+    m.type.print(&ts);
+    e->put("type", ts);
+    if ( !m.cmt.empty() )
+      e->put("comment", m.cmt);
+    arr->values.push_back().set_obj(e);
+  }
+  o->put("member_count", int64(udt.size()));
+  o->get_value_or_new("members")->set_arr(arr);
+}
+
+void McpCommands::declare_type(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  // Accept one declaration or many, the way ida-pro-mcp does: a header pasted in one go is the
+  // common case, and splitting it up would break declarations that reference each other.
+  qvector<qstring> decls;
+  const jvalue_t *v = args != nullptr ? args->get_value("decls", JT_ARR) : nullptr;
+  if ( v != nullptr )
+  {
+    const jarr_t &a = v->arr();
+    for ( size_t i = 0; i < a.values.size(); ++i )
+      if ( a.values[i].type() == JT_STR )
+        decls.push_back(a.values[i].qstr());
+  }
+  else
+  {
+    qstring one = args != nullptr ? jstr(*args, "decls") : qstring();
+    if ( !one.empty() )
+      decls.push_back(one);
+  }
+  if ( decls.empty() )
+  {
+    result->put("error", "decls is required (a C declaration, or an array of them)");
+    out->set_obj(result);
+    return;
+  }
+
+  jarr_t *arr = new jarr_t;
+  int64 errors = 0;
+  for ( size_t i = 0; i < decls.size(); ++i )
+  {
+    mute_stdout();
+    int n = parse_decls(get_idati(), decls[i].c_str(), nullptr, HTI_DCL);
+    unmute_stdout();
+    jobj_t *e = new jobj_t;
+    e->put("decl", decls[i]);
+    e->put("errors", int64(n));               // parse_decls returns the NUMBER OF ERRORS, not a count of types
+    e->put("status", n == 0 ? "ok" : "failed");
+    if ( n != 0 )
+      ++errors;
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("failed", errors);
+  result->get_value_or_new("results")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::type_inspect(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  const jarr_t *qs = args != nullptr ? jsubarr(*args, "queries") : nullptr;
+  qvector<const jobj_t *> items;
+  if ( qs != nullptr )
+  {
+    for ( size_t i = 0; i < qs->values.size(); ++i )
+      if ( qs->values[i].type() == JT_OBJ )
+        items.push_back(&qs->values[i].obj());
+  }
+  else
+  {
+    const jobj_t *one = args != nullptr ? jsub(*args, "queries") : nullptr;
+    if ( one != nullptr )
+      items.push_back(one);
+  }
+
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    qstring name = jstr(q, "name");
+    e->put("name", name);
+    tinfo_t tif;
+    if ( !is_open || !named_type(&tif, name) )
+    {
+      e->put("error", !is_open ? "no database is open" : "no such type");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    e->put("kind", tinfo_kind(tif));
+    e->put("size", int64(tif.get_size()));
+    qstring decl;
+    tif.print(&decl, name.c_str(), PRTYPE_MULTI | PRTYPE_TYPE | PRTYPE_SEMI);
+    e->put("declaration", decl);
+    if ( jbool(q, "include_members", true) )
+      emit_members(e, tif, jint(q, "max_members", 256));
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+void McpCommands::type_query(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  const jobj_t *q = args != nullptr ? jsub(*args, "queries") : nullptr;
+  qstring filter = q != nullptr ? jstr(*q, "filter") : qstring();
+  qstring kind = q != nullptr ? jstr(*q, "kind", "any") : qstring("any");
+  int64 offset = q != nullptr ? jint(*q, "offset", 0) : 0;
+  int64 count = q != nullptr ? jint(*q, "count", 100) : 100;
+  bool want_decl = q != nullptr ? jbool(*q, "include_decl", false) : false;
+  bool want_members = q != nullptr ? jbool(*q, "include_members", false) : false;
+
+  jarr_t *arr = new jarr_t;
+  const til_t *til = get_idati();
+  uint32 limit = get_ordinal_limit(til);
+  int64 seen = 0;
+  int64 emitted = 0;
+  int64 total = 0;
+  for ( uint32 ord = 1; ord < limit; ++ord )
+  {
+    const char *nm = get_numbered_type_name(til, ord);
+    if ( nm == nullptr )
+      continue;
+    if ( !filter.empty() && strstr(nm, filter.c_str()) == nullptr )
+      continue;
+    tinfo_t tif;
+    if ( !tif.get_numbered_type(til, ord) )
+      continue;
+    if ( kind != "any" && kind != tinfo_kind(tif) )
+      continue;
+    ++total;
+    if ( seen++ < offset || (count > 0 && emitted >= count) )
+      continue;
+    jobj_t *e = new jobj_t;
+    e->put("ordinal", int64(ord));
+    e->put("name", nm);
+    e->put("kind", tinfo_kind(tif));
+    e->put("size", int64(tif.get_size()));
+    if ( want_decl )
+    {
+      qstring decl;
+      tif.print(&decl, nm, PRTYPE_MULTI | PRTYPE_TYPE | PRTYPE_SEMI);
+      e->put("declaration", decl);
+    }
+    if ( want_members )
+      emit_members(e, tif, q != nullptr ? jint(*q, "max_members", 64) : 64);
+    arr->values.push_back().set_obj(e);
+    ++emitted;
+  }
+  result->put("total_matching", total);
+  result->put("ordinal_limit", int64(limit));
+  result->get_value_or_new("types")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::enum_upsert(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  const jobj_t *q = args != nullptr ? jsub(*args, "queries") : nullptr;
+  qstring name = q != nullptr ? jstr(*q, "name") : qstring();
+  if ( !is_open || name.empty() )
+  {
+    result->put("error", !is_open ? "no database is open" : "queries.name is required");
+    out->set_obj(result);
+    return;
+  }
+
+  // Upsert, not replace. An enum being built up over a session gets members added a few at a time,
+  // and a create-or-overwrite would silently drop everything worked out so far.
+  tinfo_t tif;
+  enum_type_data_t ed;
+  bool existed = named_type(&tif, name) && tif.get_enum_details(&ed);
+  const bool want_bitfield = q != nullptr && jbool(*q, "bitfield", false);
+
+  int64 added = 0;
+  int64 updated = 0;
+  const jarr_t *ms = q != nullptr ? jsubarr(*q, "members") : nullptr;
+  if ( ms != nullptr )
+  {
+    for ( size_t i = 0; i < ms->values.size(); ++i )
+    {
+      if ( ms->values[i].type() != JT_OBJ )
+        continue;
+      const jobj_t &m = ms->values[i].obj();
+      qstring mn = jstr(m, "name");
+      if ( mn.empty() )
+        continue;
+      // Values arrive as a number or as a "0x..." string; both are normal in a JSON client.
+      uint64 val = 0;
+      const jvalue_t *vv = m.get_value("value", JT_NUM);
+      if ( vv != nullptr )
+        val = uint64(vv->num());
+      else
+        val = uint64(strtoull(jstr(m, "value", "0").c_str(), nullptr, 0));
+
+      bool found = false;
+      for ( size_t k = 0; k < ed.size(); ++k )
+      {
+        if ( ed[k].name == mn )
+        {
+          if ( ed[k].value != val )
+          {
+            ed[k].value = val;
+            ++updated;
+          }
+          found = true;
+          break;
+        }
+      }
+      if ( !found )
+      {
+        edm_t &e = ed.push_back();
+        e.name = mn;
+        e.value = val;
+        ++added;
+      }
+    }
+  }
+
+  // create_enum() takes a non-const reference and consumes what it is given, so ed.size() reads 0
+  // afterwards. Count before handing it over -- reporting member_count 0 on a successful upsert made
+  // the tool look like it had silently dropped everything.
+  const int64 member_count = int64(ed.size());
+  mute_stdout();
+  tinfo_t nt;
+  bool ok = nt.create_enum(ed) && nt.set_named_type(get_idati(), name.c_str(), NTF_REPLACE) == TERR_OK;
+  // 'bitmask' is a property of the stored type, not a field of enum_type_data_t, so it can only be
+  // set once the type has a name to hang off.
+  bool bitfield_ok = !want_bitfield;
+  if ( ok && want_bitfield )
+  {
+    tinfo_t stored;
+    if ( named_type(&stored, name) )
+      bitfield_ok = stored.set_enum_is_bitmask(tinfo_t::ENUMBM_ON) == TERR_OK;
+  }
+  unmute_stdout();
+
+  result->put("status", ok ? "ok" : "failed");
+  result->put("name", name);
+  if ( want_bitfield )
+    result->put("bitfield", bitfield_ok);
+  result->put("existed", existed);
+  result->put("added", added);
+  result->put("updated", updated);
+  result->put("member_count", member_count);
+  out->set_obj(result);
+}
+
+void McpCommands::read_struct(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  const jarr_t *qs = args != nullptr ? jsubarr(*args, "queries") : nullptr;
+  qvector<const jobj_t *> items;
+  if ( qs != nullptr )
+  {
+    for ( size_t i = 0; i < qs->values.size(); ++i )
+      if ( qs->values[i].type() == JT_OBJ )
+        items.push_back(&qs->values[i].obj());
+  }
+  else
+  {
+    const jobj_t *one = args != nullptr ? jsub(*args, "queries") : nullptr;
+    if ( one != nullptr )
+      items.push_back(one);
+  }
+
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    ea_t ea = resolve_ea(jstr(q, "addr").c_str());
+    put_hex(e, "addr", ea);
+    qstring sname = jstr(q, "struct");
+    tinfo_t tif;
+    // With no struct named, use whatever type is already applied at the address. That is the
+    // common case after infer_types or a set_type, and guessing anything else would be a fiction.
+    bool have = !sname.empty() ? named_type(&tif, sname) : get_tinfo(&tif, ea);
+    if ( !is_open || ea == BADADDR || !have || !tif.is_udt() )
+    {
+      e->put("error", !is_open ? "no database is open"
+                    : ea == BADADDR ? "bad address"
+                    : !have ? (sname.empty()
+                                 ? "no type applied here; pass struct, or run infer_types first"
+                                 : "no such type in the local type library")
+                            : "the type here is not a structure or union");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    qstring tn;
+    tif.print(&tn);
+    e->put("struct", tn);
+
+    udt_type_data_t udt;
+    if ( !tif.get_udt_details(&udt) )
+    {
+      e->put("error", "could not read the structure layout");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    jarr_t *arr = new jarr_t;
+    for ( size_t k = 0; k < udt.size(); ++k )
+    {
+      const udm_t &m = udt[k];
+      jobj_t *f = new jobj_t;
+      f->put("name", m.name);
+      asize_t off = asize_t(m.offset / 8);
+      asize_t sz = asize_t(m.size / 8);
+      f->put("offset", int64(off));
+      qstring ts;
+      m.type.print(&ts);
+      f->put("type", ts);
+      // Only whole small scalars get a value; anything else is reported by shape, not invented.
+      if ( sz >= 1 && sz <= 8 && (m.size % 8) == 0 )
+      {
+        uint64 raw = 0;
+        if ( ::get_bytes(&raw, size_t(sz), ea + off) == ssize_t(sz) )
+        {
+          qstring hv;
+          hv.sprnt("0x%" FMT_64 "x", raw);
+          f->put("value", hv);
+          f->put("value_dec", int64(raw));
+        }
+        else
+        {
+          f->put("error", "unreadable");
+        }
+      }
+      else
+      {
+        f->put("size", int64(sz));
+      }
+      arr->values.push_back().set_obj(f);
+    }
+    e->get_value_or_new("fields")->set_arr(arr);
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+// Collect {addr,...} items that may arrive as one object or an array of them. Every ported tool
+// below takes that shape, because ida-pro-mcp's batch tools all do.
+static void collect_items(const jobj_t *args, const char *key, qvector<const jobj_t *> *items)
+{
+  const jarr_t *a = args != nullptr ? jsubarr(*args, key) : nullptr;
+  if ( a != nullptr )
+  {
+    for ( size_t i = 0; i < a->values.size(); ++i )
+      if ( a->values[i].type() == JT_OBJ )
+        items->push_back(&a->values[i].obj());
+    return;
+  }
+  const jobj_t *one = args != nullptr ? jsub(*args, key) : nullptr;
+  if ( one != nullptr )
+    items->push_back(one);
+}
+
+void McpCommands::declare_stack(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<const jobj_t *> items;
+  collect_items(args, "items", &items);
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    ea_t fea = resolve_ea(jstr(q, "addr").c_str());
+    func_t *pfn = fea != BADADDR ? get_func(fea) : nullptr;
+    qstring name = jstr(q, "name");
+    qstring ty = jstr(q, "ty");
+    e->put("addr", jstr(q, "addr"));
+    e->put("name", name);
+    if ( !is_open || pfn == nullptr || name.empty() || ty.empty() )
+    {
+      e->put("error", !is_open ? "no database is open"
+                    : pfn == nullptr ? "no function at address"
+                                     : "name and ty are both required");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    // Offsets are strings here because they are routinely negative (locals sit below the frame
+    // pointer) and clients disagree about how to encode a negative in JSON.
+    sval_t off = sval_t(strtoll(jstr(q, "offset", "0").c_str(), nullptr, 0));
+
+    tinfo_t tif;
+    qstring nm;
+    qstring decl(ty);
+    decl.append(" x;");
+    if ( !parse_decl(&tif, &nm, get_idati(), decl.c_str(), PT_SIL) )
+    {
+      e->put("error", "could not parse the type");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    mute_stdout();
+    bool ok = add_frame_member_ea(pfn->start_ea, name.c_str(), uval_t(off), tif);
+    if ( !ok )                                 // already there: retype it rather than fail
+      ok = set_frame_member_type_ea(pfn->start_ea, uval_t(off), tif);
+    unmute_stdout();
+    e->put("status", ok ? "ok" : "failed");
+    e->put("offset", jstr(q, "offset", "0"));
+    e->put("type", ty);
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+void McpCommands::delete_stack(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<const jobj_t *> items;
+  collect_items(args, "items", &items);
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    ea_t fea = resolve_ea(jstr(q, "addr").c_str());
+    func_t *pfn = fea != BADADDR ? get_func(fea) : nullptr;
+    qstring name = jstr(q, "name");
+    e->put("addr", jstr(q, "addr"));
+    e->put("name", name);
+    tinfo_t frame;
+    if ( !is_open || pfn == nullptr || name.empty() || !get_func_frame_ea(&frame, pfn->start_ea) )
+    {
+      e->put("error", !is_open ? "no database is open"
+                    : pfn == nullptr ? "no function at address"
+                    : name.empty() ? "name is required"
+                                   : "this function has no frame");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    // Delete by NAME, which is what a caller has, by looking the offset up in the frame first.
+    udt_type_data_t udt;
+    bool found = false;
+    uint64 lo = 0, hi = 0;
+    if ( frame.get_udt_details(&udt) )
+    {
+      for ( size_t k = 0; k < udt.size(); ++k )
+      {
+        if ( udt[k].name == name )
+        {
+          lo = udt[k].offset / 8;
+          hi = lo + (udt[k].size / 8);
+          found = true;
+          break;
+        }
+      }
+    }
+    if ( !found )
+    {
+      e->put("error", "no stack variable with that name");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    mute_stdout();
+    bool ok = delete_frame_members_ea(pfn->start_ea, uval_t(lo), uval_t(hi > lo ? hi : lo + 1));
+    unmute_stdout();
+    e->put("status", ok ? "ok" : "failed");
+    e->put("offset", int64(lo));
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+// ---- call graph, profiling, search, strings, integers, annotations ----------------------------
+//
+// The second half of the ida-pro-mcp port. Everything here is read-mostly except add_bookmark and
+// append_comments, and all of it stays in the session.
+
+// qstring has no case-folding of its own, and qstrlwr works on a char buffer in place.
+static void lower_in_place(qstring *s)
+{
+  if ( !s->empty() )
+    qstrlwr(s->begin());
+}
+
+void McpCommands::callgraph(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  // Roots may be one name/address or a list. A call graph with no root is the whole binary, which
+  // is never what anyone means.
+  qvector<ea_t> roots;
+  const jarr_t *ra = args != nullptr ? jsubarr(*args, "roots") : nullptr;
+  if ( ra != nullptr )
+  {
+    for ( size_t i = 0; i < ra->values.size(); ++i )
+      if ( ra->values[i].type() == JT_STR )
+      {
+        ea_t ea = resolve_ea(ra->values[i].qstr().c_str());
+        func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+        if ( pfn != nullptr && !roots.has(pfn->start_ea) )
+          roots.push_back(pfn->start_ea);
+      }
+  }
+  else
+  {
+    ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "roots").c_str() : "");
+    func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+    if ( pfn != nullptr )
+      roots.push_back(pfn->start_ea);
+  }
+  if ( roots.empty() )
+  {
+    result->put("error", "roots is required (a function address or name, or a list of them)");
+    out->set_obj(result);
+    return;
+  }
+
+  const int64 max_depth = args != nullptr ? jint(*args, "max_depth", 5) : 5;
+  const int64 max_nodes = args != nullptr ? jint(*args, "max_nodes", 1000) : 1000;
+  const int64 max_edges = args != nullptr ? jint(*args, "max_edges", 5000) : 5000;
+  const int64 max_per   = args != nullptr ? jint(*args, "max_edges_per_func", 200) : 200;
+
+  // Breadth-first, so max_depth means what it says and the truncation is even across the frontier
+  // rather than dropping whole subtrees the way a depth-first walk would.
+  qvector<ea_t> seen = roots;
+  qvector<ea_t> frontier = roots;
+  jarr_t *edges = new jarr_t;
+  int64 nedges = 0;
+  bool truncated = false;
+  for ( int64 depth = 0; depth < max_depth && !frontier.empty() && !truncated; ++depth )
+  {
+    qvector<ea_t> next;
+    for ( size_t i = 0; i < frontier.size() && !truncated; ++i )
+    {
+      func_t *pfn = get_func(frontier[i]);
+      if ( pfn == nullptr )
+        continue;
+      int64 here = 0;
+      for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
+      {
+        for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+        {
+          if ( t >= pfn->start_ea && t < pfn->end_ea )
+            continue;                          // internal branch, not a call
+          func_t *tf = get_func(t);
+          if ( tf == nullptr )
+            continue;
+          if ( here >= max_per )
+            break;
+          jobj_t *e = new jobj_t;
+          qstring a;
+          a.sprnt("0x%" FMT_64 "x", uint64(pfn->start_ea));
+          e->put("from", a);
+          a.sprnt("0x%" FMT_64 "x", uint64(tf->start_ea));
+          e->put("to", a);
+          qstring nm;
+          if ( get_func_name(&nm, tf->start_ea) > 0 )
+            e->put("to_name", nm);
+          edges->values.push_back().set_obj(e);
+          ++here;
+          if ( ++nedges >= max_edges )
+          {
+            truncated = true;
+            break;
+          }
+          if ( !seen.has(tf->start_ea) )
+          {
+            if ( int64(seen.size()) >= max_nodes )
+            {
+              truncated = true;
+              break;
+            }
+            seen.push_back(tf->start_ea);
+            next.push_back(tf->start_ea);
+          }
+        }
+        if ( truncated )
+          break;
+      }
+    }
+    frontier = next;
+  }
+
+  jarr_t *nodes = new jarr_t;
+  for ( size_t i = 0; i < seen.size(); ++i )
+  {
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(seen[i]));
+    e->put("addr", a);
+    qstring nm;
+    if ( get_func_name(&nm, seen[i]) > 0 )
+      e->put("name", nm);
+    nodes->values.push_back().set_obj(e);
+  }
+  result->put("node_count", int64(seen.size()));
+  result->put("edge_count", nedges);
+  result->put("truncated", truncated);        // say so rather than let a partial graph read as whole
+  result->get_value_or_new("nodes")->set_arr(nodes);
+  result->get_value_or_new("edges")->set_arr(edges);
+  out->set_obj(result);
+}
+
+void McpCommands::func_profile(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  const jobj_t *q = args != nullptr ? jsub(*args, "queries") : nullptr;
+  qstring want = q != nullptr ? jstr(*q, "addr") : qstring();
+  qstring filter = q != nullptr ? jstr(*q, "filter") : qstring();
+  int64 offset = q != nullptr ? jint(*q, "offset", 0) : 0;
+  int64 count = q != nullptr ? jint(*q, "count", 100) : 100;
+  bool want_proto = q != nullptr ? jbool(*q, "include_prototype", true) : true;
+  bool want_lists = q != nullptr ? jbool(*q, "include_lists", false) : false;
+  int64 max_items = q != nullptr ? jint(*q, "max_items", 32) : 32;
+
+  qvector<ea_t> targets;
+  if ( !want.empty() && want != "*" )
+  {
+    ea_t ea = resolve_ea(want.c_str());
+    func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+    if ( pfn != nullptr )
+      targets.push_back(pfn->start_ea);
+  }
+  else
+  {
+    size_t n = get_func_qty();
+    for ( size_t i = 0; i < n; ++i )
+    {
+      func_t *pfn = getn_func(i);
+      if ( pfn == nullptr )
+        continue;
+      if ( !filter.empty() )
+      {
+        qstring nm;
+        if ( get_func_name(&nm, pfn->start_ea) <= 0 || strstr(nm.c_str(), filter.c_str()) == nullptr )
+          continue;
+      }
+      targets.push_back(pfn->start_ea);
+    }
+  }
+
+  jarr_t *arr = new jarr_t;
+  int64 emitted = 0;
+  for ( size_t i = size_t(offset < 0 ? 0 : offset);
+        i < targets.size() && (count <= 0 || emitted < count); ++i )
+  {
+    func_t *pfn = get_func(targets[i]);
+    if ( pfn == nullptr )
+      continue;
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(pfn->start_ea));
+    e->put("addr", a);
+    qstring nm;
+    get_func_name(&nm, pfn->start_ea);
+    e->put("name", nm);
+    e->put("size", int64(pfn->end_ea - pfn->start_ea));
+
+    qflow_chart_t fc;
+    fc.create("profile", pfn, pfn->start_ea, pfn->end_ea, FC_NOEXT);
+    e->put("blocks", int64(fc.size()));
+
+    int64 ncallees = 0;
+    qvector<ea_t> callee_list;
+    for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
+    {
+      for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+      {
+        if ( t >= pfn->start_ea && t < pfn->end_ea )
+          continue;
+        if ( get_func(t) == nullptr || callee_list.has(t) )
+          continue;
+        callee_list.push_back(t);
+        ++ncallees;
+      }
+    }
+    int64 ncallers = 0;
+    qvector<ea_t> caller_list;
+    xrefblk_t xb;
+    for ( bool ok = xb.first_to(pfn->start_ea, XREF_ALL); ok; ok = xb.next_to() )
+    {
+      func_t *cf = get_func(xb.from);
+      if ( cf == nullptr || caller_list.has(cf->start_ea) )
+        continue;
+      caller_list.push_back(cf->start_ea);
+      ++ncallers;
+    }
+    e->put("callees", ncallees);
+    e->put("callers", ncallers);
+    if ( want_proto )
+    {
+      tinfo_t tif;
+      qstring proto;
+      if ( get_tinfo(&tif, pfn->start_ea) && tif.print(&proto, nm.c_str()) )
+        e->put("prototype", proto);
+    }
+    if ( want_lists )
+    {
+      jarr_t *cl = new jarr_t;
+      for ( size_t k = 0; k < callee_list.size() && int64(k) < max_items; ++k )
+      {
+        qstring cn;
+        get_func_name(&cn, callee_list[k]);
+        cl->values.push_back().set_str(cn.c_str());
+      }
+      e->get_value_or_new("callee_names")->set_arr(cl);
+      jarr_t *pl = new jarr_t;
+      for ( size_t k = 0; k < caller_list.size() && int64(k) < max_items; ++k )
+      {
+        qstring cn;
+        get_func_name(&cn, caller_list[k]);
+        pl->values.push_back().set_str(cn.c_str());
+      }
+      e->get_value_or_new("caller_names")->set_arr(pl);
+    }
+    arr->values.push_back().set_obj(e);
+    ++emitted;
+  }
+  result->put("total_matching", int64(targets.size()));
+  result->get_value_or_new("functions")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::export_funcs(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  qvector<ea_t> addrs;
+  const jarr_t *aa = args != nullptr ? jsubarr(*args, "addrs") : nullptr;
+  if ( aa != nullptr )
+  {
+    for ( size_t i = 0; i < aa->values.size(); ++i )
+      if ( aa->values[i].type() == JT_STR )
+      {
+        ea_t ea = resolve_ea(aa->values[i].qstr().c_str());
+        func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+        if ( pfn != nullptr )
+          addrs.push_back(pfn->start_ea);
+      }
+  }
+  else
+  {
+    ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addrs").c_str() : "");
+    func_t *pfn = ea != BADADDR ? get_func(ea) : nullptr;
+    if ( pfn != nullptr )
+      addrs.push_back(pfn->start_ea);
+  }
+  if ( addrs.empty() )
+  {
+    result->put("error", "addrs is required (a function address or name, or a list of them)");
+    out->set_obj(result);
+    return;
+  }
+  qstring format = args != nullptr ? jstr(*args, "format", "json") : qstring("json");
+
+  // c_header and prototypes are both text a caller can paste straight into a build; json keeps the
+  // fields separate for anything that wants to process them.
+  if ( format == "c_header" || format == "prototypes" )
+  {
+    qstring text;
+    if ( format == "c_header" )
+      text.append("/* generated by hexport export_funcs */\n\n");
+    for ( size_t i = 0; i < addrs.size(); ++i )
+    {
+      qstring nm;
+      get_func_name(&nm, addrs[i]);
+      tinfo_t tif;
+      qstring proto;
+      if ( get_tinfo(&tif, addrs[i]) && tif.print(&proto, nm.c_str()) )
+        text.append(proto);
+      else
+        text.append(qstring("void ") + nm + "()");
+      text.append(";\n");
+    }
+    result->put("format", format);
+    result->put("text", text);
+    result->put("count", int64(addrs.size()));
+    out->set_obj(result);
+    return;
+  }
+
+  jarr_t *arr = new jarr_t;
+  for ( size_t i = 0; i < addrs.size(); ++i )
+  {
+    func_t *pfn = get_func(addrs[i]);
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(addrs[i]));
+    e->put("addr", a);
+    qstring nm;
+    get_func_name(&nm, addrs[i]);
+    e->put("name", nm);
+    if ( pfn != nullptr )
+      e->put("size", int64(pfn->end_ea - pfn->start_ea));
+    tinfo_t tif;
+    qstring proto;
+    if ( get_tinfo(&tif, addrs[i]) && tif.print(&proto, nm.c_str()) )
+      e->put("prototype", proto);
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("format", "json");
+  result->get_value_or_new("functions")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::search_text(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring pattern = args != nullptr ? jstr(*args, "pattern") : qstring();
+  if ( !is_open || pattern.empty() )
+  {
+    result->put("error", !is_open ? "no database is open" : "pattern is required");
+    out->set_obj(result);
+    return;
+  }
+  const bool cs = args != nullptr ? jbool(*args, "case_sensitive", false) : false;
+  const bool code_only = args != nullptr ? jbool(*args, "code_only", true) : true;
+  int64 limit = args != nullptr ? jint(*args, "limit", 30) : 30;
+  if ( limit > 500 )
+    limit = 500;
+  qstring s_start = args != nullptr ? jstr(*args, "start") : qstring();
+  qstring s_end = args != nullptr ? jstr(*args, "end") : qstring();
+  ea_t lo = s_start.empty() ? inf_get_min_ea() : resolve_ea(s_start.c_str());
+  ea_t hi = s_end.empty() ? inf_get_max_ea() : resolve_ea(s_end.c_str());
+  if ( lo == BADADDR )
+    lo = inf_get_min_ea();
+  if ( hi == BADADDR )
+    hi = inf_get_max_ea();
+
+  qstring needle = pattern;
+  if ( !cs )
+    lower_in_place(&needle);
+
+  jarr_t *arr = new jarr_t;
+  int64 hits = 0;
+  int64 scanned = 0;
+  for ( ea_t p = lo; p < hi && p != BADADDR && hits < limit; p = next_head(p, hi) )
+  {
+    if ( code_only && !is_code(get_flags(p)) )
+      continue;
+    ++scanned;
+    qstring line;
+    if ( !generate_disasm_line(&line, p, GENDSM_REMOVE_TAGS) )
+      continue;
+    qstring hay = line;
+    if ( !cs )
+      lower_in_place(&hay);
+    if ( strstr(hay.c_str(), needle.c_str()) == nullptr )
+      continue;
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(p));
+    e->put("addr", a);
+    e->put("line", line);
+    qstring fn;
+    func_t *pfn = get_func(p);
+    if ( pfn != nullptr && get_func_name(&fn, pfn->start_ea) > 0 )
+      e->put("function", fn);
+    arr->values.push_back().set_obj(e);
+    ++hits;
+  }
+  result->put("pattern", pattern);
+  result->put("hits", hits);
+  result->put("items_scanned", scanned);
+  result->put("truncated", hits >= limit);
+  result->get_value_or_new("results")->set_arr(arr);
+  out->set_obj(result);
+}
+
+// hexport had no way to enumerate strings at all -- get_string reads one address. The string list is
+// built on demand because build_strlist() walks the whole image.
+void McpCommands::list_strings(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  qstring filter = args != nullptr ? jstr(*args, "filter") : qstring();
+  const bool cs = args != nullptr ? jbool(*args, "case_sensitive", false) : false;
+  int64 offset = args != nullptr ? jint(*args, "offset", 0) : 0;
+  int64 limit = args != nullptr ? jint(*args, "limit", 100) : 100;
+  int64 min_len = args != nullptr ? jint(*args, "min_length", 0) : 0;
+
+  mute_stdout();
+  build_strlist();
+  unmute_stdout();
+
+  if ( !cs )
+    lower_in_place(&filter);
+
+  jarr_t *arr = new jarr_t;
+  size_t total = get_strlist_qty();
+  int64 matched = 0;
+  int64 emitted = 0;
+  for ( size_t i = 0; i < total && (limit <= 0 || emitted < limit); ++i )
+  {
+    string_info_t si;
+    if ( !get_strlist_item(&si, i) )
+      continue;
+    if ( si.length < min_len )
+      continue;
+    qstring text;
+    if ( get_strlit_contents(&text, si.ea, size_t(-1), int32(-1)) < 0 )
+      continue;
+    if ( !filter.empty() )
+    {
+      qstring hay = text;
+      if ( !cs )
+        lower_in_place(&hay);
+      if ( strstr(hay.c_str(), filter.c_str()) == nullptr )
+        continue;
+    }
+    if ( matched++ < offset )
+      continue;
+    jobj_t *e = new jobj_t;
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(si.ea));
+    e->put("addr", a);
+    e->put("length", int64(si.length));
+    e->put("text", text);
+    arr->values.push_back().set_obj(e);
+    ++emitted;
+  }
+  result->put("total_strings", int64(total));
+  result->put("matched", matched);
+  result->get_value_or_new("strings")->set_arr(arr);
+  out->set_obj(result);
+}
+
+// ---- integers ---------------------------------------------------------------------------------
+//
+// "i32", "u8", "i16be" and so on. Endianness matters here: a big-endian field inside a little-endian
+// image is common in network and file-format code, and reading it the wrong way round produces a
+// number that looks plausible and is wrong.
+static bool parse_int_class(const qstring &ty, int *size, bool *is_signed, bool *big_endian)
+{
+  if ( ty.length() < 2 )
+    return false;
+  const char *s = ty.c_str();
+  if ( *s != 'i' && *s != 'u' )
+    return false;
+  *is_signed = (*s == 'i');
+  ++s;
+  int bits = 0;
+  while ( *s >= '0' && *s <= '9' )
+    bits = bits * 10 + (*s++ - '0');
+  if ( bits != 8 && bits != 16 && bits != 32 && bits != 64 )
+    return false;
+  *size = bits / 8;
+  *big_endian = qstrcmp(s, "be") == 0;
+  if ( *s != 0 && qstrcmp(s, "be") != 0 && qstrcmp(s, "le") != 0 )
+    return false;
+  return true;
+}
+
+static uint64 swap_bytes(uint64 v, int size)
+{
+  uint64 r = 0;
+  for ( int i = 0; i < size; ++i )
+    r = (r << 8) | ((v >> (8 * i)) & 0xFF);
+  return r;
+}
+
+static int64 sign_extend(uint64 v, int size)
+{
+  const int shift = 64 - 8 * size;
+  return int64(v << shift) >> shift;
+}
+
+void McpCommands::get_int(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<const jobj_t *> items;
+  collect_items(args, "queries", &items);
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    ea_t ea = resolve_ea(jstr(q, "addr").c_str());
+    qstring ty = jstr(q, "ty", "u32");
+    e->put("addr", jstr(q, "addr"));
+    e->put("ty", ty);
+    int size = 0;
+    bool sgn = false, be = false;
+    if ( !is_open || ea == BADADDR || !parse_int_class(ty, &size, &sgn, &be) )
+    {
+      e->put("error", !is_open ? "no database is open"
+                    : ea == BADADDR ? "bad address"
+                                    : "ty must look like i8/u16/i32be/u64le");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    uint64 raw = 0;
+    if ( ::get_bytes(&raw, size_t(size), ea) != ssize_t(size) )
+    {
+      e->put("error", "unreadable at this address");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    if ( be )
+      raw = swap_bytes(raw, size);
+    qstring hv;
+    hv.sprnt("0x%" FMT_64 "x", raw);
+    e->put("hex", hv);
+    e->put("value", sgn ? sign_extend(raw, size) : int64(raw));
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+void McpCommands::put_int(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<const jobj_t *> items;
+  collect_items(args, "items", &items);
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    ea_t ea = resolve_ea(jstr(q, "addr").c_str());
+    qstring ty = jstr(q, "ty", "u32");
+    e->put("addr", jstr(q, "addr"));
+    e->put("ty", ty);
+    int size = 0;
+    bool sgn = false, be = false;
+    if ( !is_open || ea == BADADDR || !parse_int_class(ty, &size, &sgn, &be) )
+    {
+      e->put("error", !is_open ? "no database is open"
+                    : ea == BADADDR ? "bad address"
+                                    : "ty must look like i8/u16/i32be/u64le");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    // Values arrive as strings so a negative or a 0x form survives whatever JSON the client speaks.
+    qstring vs = jstr(q, "value", "0");
+    uint64 v = vs.length() > 0 && vs[0] == '-'
+             ? uint64(strtoll(vs.c_str(), nullptr, 0))
+             : strtoull(vs.c_str(), nullptr, 0);
+    if ( be )
+      v = swap_bytes(v, size);
+    mute_stdout();
+    put_bytes(ea, &v, size_t(size));         // returns void; failure shows up as unchanged bytes
+    uint64 back = 0;
+    bool ok = ::get_bytes(&back, size_t(size), ea) == ssize_t(size) && back == v;
+    unmute_stdout();
+    e->put("status", ok ? "ok" : "failed");
+    e->put("wrote_bytes", int64(size));
+    // The database is edited in memory only. Nothing here reaches the .i64 without save_as or an
+    // explicit close_database(save=true).
+    e->put("saved", false);
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+void McpCommands::int_convert(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<const jobj_t *> items;
+  collect_items(args, "inputs", &items);
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    qstring text = jstr(q, "text");
+    int64 size = jint(q, "size", 0);
+    e->put("input", text);
+    if ( text.empty() )
+    {
+      e->put("error", "text is required");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    bool neg = text[0] == '-';
+    uint64 v = neg ? uint64(strtoll(text.c_str(), nullptr, 0))
+                   : strtoull(text.c_str(), nullptr, 0);
+    if ( size <= 0 )
+      size = v > 0xFFFFFFFFull ? 8 : v > 0xFFFF ? 4 : v > 0xFF ? 2 : 1;
+    if ( size > 8 )
+      size = 8;
+    uint64 masked = size >= 8 ? v : (v & ((1ull << (8 * size)) - 1));
+
+    qstring hex;
+    hex.sprnt("0x%" FMT_64 "x", masked);
+    e->put("hex", hex);
+    e->put("decimal", int64(masked));
+    e->put("signed", sign_extend(masked, int(size)));
+    e->put("size", size);
+
+    qstring bin;
+    for ( int b = int(8 * size) - 1; b >= 0; --b )
+    {
+      bin.append(((masked >> b) & 1) ? '1' : '0');
+      if ( b != 0 && (b % 8) == 0 )
+        bin.append('_');
+    }
+    e->put("binary", bin);
+
+    // Bytes as they would sit in memory, plus the printable form: the usual reason for converting a
+    // constant is finding out it is four ASCII characters.
+    qstring ascii;
+    for ( int k = 0; k < int(size); ++k )
+    {
+      char c = char((masked >> (8 * k)) & 0xFF);
+      ascii.append(c >= 0x20 && c < 0x7F ? c : '.');
+    }
+    e->put("ascii_le", ascii);
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+void McpCommands::get_global_value(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<qstring> names;
+  const jarr_t *qa = args != nullptr ? jsubarr(*args, "queries") : nullptr;
+  if ( qa != nullptr )
+  {
+    for ( size_t i = 0; i < qa->values.size(); ++i )
+      if ( qa->values[i].type() == JT_STR )
+        names.push_back(qa->values[i].qstr());
+  }
+  else
+  {
+    qstring one = args != nullptr ? jstr(*args, "queries") : qstring();
+    if ( !one.empty() )
+      names.push_back(one);
+  }
+
+  for ( size_t i = 0; i < names.size(); ++i )
+  {
+    jobj_t *e = new jobj_t;
+    e->put("query", names[i]);
+    ea_t ea = resolve_ea(names[i].c_str());
+    if ( !is_open || ea == BADADDR )
+    {
+      e->put("error", !is_open ? "no database is open" : "no such address or name");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    qstring a;
+    a.sprnt("0x%" FMT_64 "x", uint64(ea));
+    e->put("addr", a);
+    qstring nm;
+    if ( get_name(&nm, ea) > 0 )
+      e->put("name", nm);
+
+    // Size comes from the applied type when there is one; otherwise from how the item is defined.
+    // Reading eight bytes off a defined dword would report neighbouring data as part of the value.
+    tinfo_t tif;
+    asize_t sz = 0;
+    if ( get_tinfo(&tif, ea) )
+    {
+      qstring ts;
+      tif.print(&ts);
+      e->put("type", ts);
+      sz = asize_t(tif.get_size());
+    }
+    if ( sz == 0 || sz == asize_t(BADSIZE) )
+      sz = get_item_size(ea);
+    e->put("size", int64(sz));
+
+    if ( is_strlit(get_flags(ea)) )
+    {
+      qstring s;
+      if ( get_strlit_contents(&s, ea, size_t(-1), int32(-1)) >= 0 )
+        e->put("string", s);
+    }
+    else if ( sz >= 1 && sz <= 8 )
+    {
+      uint64 raw = 0;
+      if ( ::get_bytes(&raw, size_t(sz), ea) == ssize_t(sz) )
+      {
+        qstring hv;
+        hv.sprnt("0x%" FMT_64 "x", raw);
+        e->put("hex", hv);
+        e->put("value", int64(raw));
+      }
+      else
+      {
+        e->put("error", "unreadable");
+      }
+    }
+    else
+    {
+      e->put("note", "too large to read inline; use get_bytes");
+    }
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
+}
+
+void McpCommands::add_bookmark(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  qstring name = args != nullptr ? jstr(*args, "name") : qstring();
+  if ( !is_open || ea == BADADDR || name.empty() )
+  {
+    result->put("error", !is_open ? "no database is open"
+                       : ea == BADADDR ? "bad address" : "name is required");
+    out->set_obj(result);
+    return;
+  }
+  qstring prefix = args != nullptr ? jstr(*args, "prefix", "hexport: ") : qstring("hexport: ");
+  qstring title = prefix + name;
+
+  lochist_entry_t le;
+  le.set_place(idaplace_t(ea, 0));
+  le.renderer_info().pos.cx = 0;
+  le.renderer_info().pos.cy = 0;
+  mute_stdout();
+  uint32 slot = bookmarks_t::mark(le, uint32(-1), title.c_str(), nullptr, nullptr);
+  unmute_stdout();
+
+  result->put("status", slot != uint32(-1) ? "ok" : "failed");
+  result->put("slot", int64(int32(slot)));
+  result->put("title", title);
+  put_hex(result, "addr", ea);
+  out->set_obj(result);
+}
+
+void McpCommands::append_comments(const jobj_t *args, jvalue_t *out)
+{
+  jarr_t *outer = new jarr_t;
+  qvector<const jobj_t *> items;
+  collect_items(args, "items", &items);
+  for ( size_t i = 0; i < items.size(); ++i )
+  {
+    const jobj_t &q = *items[i];
+    jobj_t *e = new jobj_t;
+    ea_t ea = resolve_ea(jstr(q, "addr").c_str());
+    qstring text = jstr(q, "comment");
+    e->put("addr", jstr(q, "addr"));
+    if ( !is_open || ea == BADADDR || text.empty() )
+    {
+      e->put("error", !is_open ? "no database is open"
+                    : ea == BADADDR ? "bad address" : "comment is required");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    // "auto" means a function comment when the address starts one, a line comment otherwise, which
+    // is what a caller annotating a function actually wants.
+    qstring scope = jstr(q, "scope", "auto");
+    func_t *pfn = get_func(ea);
+    bool as_func = scope == "func" || (scope == "auto" && pfn != nullptr && pfn->start_ea == ea);
+
+    qstring existing;
+    if ( as_func )
+      get_func_cmt_ea(&existing, ea, false);
+    else
+      get_cmt(&existing, ea, false);
+    if ( jbool(q, "dedupe", true) && !existing.empty()
+      && strstr(existing.c_str(), text.c_str()) != nullptr )
+    {
+      e->put("status", "skipped");
+      e->put("reason", "identical text is already there");
+      outer->values.push_back().set_obj(e);
+      continue;
+    }
+    qstring merged = existing;
+    if ( !merged.empty() )
+      merged.append('\n');
+    merged.append(text);
+
+    mute_stdout();
+    bool ok = as_func ? set_func_cmt_ea(ea, merged.c_str(), false)
+                      : set_cmt(ea, merged.c_str(), false);
+    unmute_stdout();
+    e->put("status", ok ? "ok" : "failed");
+    e->put("scope", as_func ? "func" : "line");
+    outer->values.push_back().set_obj(e);
+  }
+  out->set_arr(outer);
 }
 
 void McpCommands::decompile(const jobj_t *args, jvalue_t *out)

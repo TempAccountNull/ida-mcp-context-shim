@@ -34,5 +34,7 @@
 #include <lines.hpp>
 #include <frame.hpp>    // stack frames
 #include <gdl.hpp>      // qflow_chart_t, for basic blocks
+#include <strlist.hpp>  // build_strlist, for list_strings
+#include <moves.hpp>    // bookmarks_t, for add_bookmark
 #include <hexrays.hpp>
 #include <parsejson.hpp>

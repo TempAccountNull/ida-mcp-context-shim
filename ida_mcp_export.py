@@ -538,7 +538,8 @@ class HexportStdioClient:
                 # Exporting is a READ. It must not write the caller's database back, and the
                 # default here used to be save=True -- which silently rewrote a 374 MB .i64 on
                 # every run, and rewrote it with whichever idalib version hexport was built
-                # against. Only a tool that means to edit (repair_types.py --in-place) passes True.
+                # against. Nothing in this repo passes True: repairs persist via the save_as tool,
+                # which writes to a NEW path and leaves the opened database byte-identical.
                 vlog(2, "HEXPORT", f"closing database (save={self.save_on_close})")
                 self._post("tools/call",
                            {"name": "close_database", "arguments": {"save": self.save_on_close}})
@@ -2393,6 +2394,69 @@ def decompile_failure_record(info, analysis: dict, err: Any) -> dict[str, Any]:
     return rec
 
 
+def repair_badcall_failures(clients, failures, want_asm, want_cpp, page_size, retries,
+                            retry_delay, stats, health):
+    """Give Hex-Rays the prototypes it is missing, then re-export what that recovered.
+
+    MERR_BADCALL means the decompiler could not work out the arguments of a call and abandoned the
+    whole function. It is not transient: on hexx64.dll a plain retry and a force_recompile each
+    recovered 0 of 38. What recovers them is typing whatever the call reaches, which is a database
+    edit -- so it runs inside the session, through the repair_badcall tool, and never touches the
+    .i64 on disk.
+
+    The addresses come from the export that just ran, so the tool skips its own scan. That scan
+    decompiles every function in the binary to find the failures (292s on hexx64.dll); handed the
+    38 addresses instead, the repair takes about a second.
+
+    Returns (recovered_infos, report) where report is the tool's own answer, or None when there was
+    nothing to do.
+    """
+    badcall = []
+    seen: set[int | str] = set()
+    for fail in failures:
+        if fail.get("merror") != -12:
+            continue
+        addr = str(fail.get("addr") or "")
+        if not addr:
+            continue
+        key = addr_key(addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        badcall.append(FunctionInfo(addr, str(fail.get("name") or addr), 1, "repair"))
+    if not badcall:
+        return [], None
+
+    console_print(color(f"Repairing {len(badcall):,} MERR_BADCALL function(s) in-session "
+                        f"(the database on disk is not modified)", Colors.CYAN))
+    report = normalize_tool_item(clients.get().call_tool(
+        "repair_badcall", {"addrs": [f.addr for f in badcall], "apply": True}))
+    if not isinstance(report, dict):
+        status("WARN", "repair_badcall returned nothing usable; skipping the repair pass",
+               tone="yellow")
+        return [], None
+    if report.get("error"):
+        status("WARN", f"repair_badcall: {report['error']}", tone="yellow")
+        return [], report
+
+    recovered = int(report.get("recovered") or 0)
+    still = int(report.get("still_failing") or 0)
+    for fix in report.get("fixes") or []:
+        console_print(f"    {fix.get('culprit_name', '?'):32s} {fix.get('applied', '?'):38s} "
+                      f"{fix.get('kind', '')}")
+    status("OK" if still == 0 else "WARN",
+           f"repair_badcall recovered {recovered:,} of {len(badcall):,}"
+           + (f"; {still:,} still failing" if still else ""),
+           tone="green" if still == 0 else "yellow")
+    if recovered <= 0:
+        return [], report
+
+    # Only re-export the ones that actually decompile now. Re-running the whole set would spend a
+    # full decompile attempt per function to reach the identical failure.
+    unfixed = {addr_key(str(u.get("addr") or "")) for u in (report.get("unfixed") or [])}
+    return [f for f in badcall if addr_key(f.addr) not in unfixed], report
+
+
 def make_client(args: argparse.Namespace):
     """One MCP session: hexport over stdio when available, else curl over HTTP."""
     exe = resolve_transport(args)
@@ -2723,6 +2787,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hexport", default=None, metavar="EXE",
                    help="Override the hexport executable (default: mcp/hexport/build/hexport.exe "
                         "next to this script)")
+    p.add_argument("--repair", action="store_true",
+                   help="After exporting, give Hex-Rays the prototypes it is missing for "
+                        "MERR_BADCALL functions and re-export the ones that recovers. Runs in the "
+                        "loaded session only; the database on disk is never written. hexport mode only")
+    p.add_argument("--repair-save-as", default=None, metavar="PATH",
+                   help="With --repair, also write the repaired database to PATH. A NEW file: the "
+                        "database that was opened is left byte-identical")
     p.add_argument("--list-tools", action="store_true", help="Print enabled MCP tools and exit")
     p.add_argument(
         "--verbose", nargs="?", const=1, default=0, type=int, choices=range(0, 7), metavar="LEVEL",
@@ -3260,6 +3331,47 @@ def main() -> int:
     if export_status:
         export_status.finish()
     vlog(1, "EXPORT", f"Export extraction complete functions={len(results)} failures={len(failures)}")
+
+    repair_report = None
+    if args.repair:
+        if "repair_badcall" not in tools:
+            status("WARN", "--repair needs the repair_badcall tool, which only hexport provides; "
+                           "skipping the repair pass", tone="yellow")
+        else:
+            retry_infos, repair_report = repair_badcall_failures(
+                clients, failures, want_asm, want_cpp, args.page_size, args.retries,
+                args.retry_delay, stats, health)
+            if retry_infos:
+                stage_console.switch("Repair Re-export")
+                repaired_keys = {addr_key(i.addr) for i in retry_infos}
+                # Drop the old failure rows for these; they describe a state that no longer exists.
+                failures = [f for f in failures
+                            if addr_key(str(f.get("addr") or "")) not in repaired_keys
+                            or f.get("stage") != "decompile"]
+                with ThreadPoolExecutor(max_workers=max(1, workers),
+                                        thread_name_prefix="ida-repair") as ex:
+                    futs = [ex.submit(export_one, clients, health, info, args.page_size,
+                                      args.retries, args.retry_delay, stats, None,
+                                      want_asm, want_cpp)
+                            for info in retry_infos]
+                    for fut in futs:
+                        info, asm, pseudo, local_failures = fut.result()
+                        failures.extend(local_failures)
+                        results[addr_key(info.addr)] = (info, asm, pseudo)
+                vlog(1, "REPAIR", f"Re-exported {len(retry_infos)} repaired function(s)")
+
+            # Persisting is opt-in and always to a NEW path. close_database still runs with
+            # save=false, so the file that was opened is never rewritten.
+            if args.repair_save_as and repair_report and (repair_report.get("recovered") or 0) > 0:
+                saved = normalize_tool_item(clients.get().call_tool(
+                    "save_as", {"path": args.repair_save_as}))
+                if isinstance(saved, dict) and saved.get("status") == "ok":
+                    status("OK", f"Repaired database written to {args.repair_save_as} "
+                                 f"(the opened database is unchanged)", tone="green")
+                else:
+                    status("WARN", f"save_as failed: "
+                                   f"{(saved or {}).get('error', 'unknown error')}", tone="yellow")
+
     stats.export_finished = time.monotonic()
     health.stop()
     if VERBOSE.panel is not None:
@@ -3349,6 +3461,7 @@ def main() -> int:
             "root": {"addr": root.addr, "name": root.name},
             "recursive_traversal": "all_reachable_direct_calls_and_cross_function_tail_jumps",
             "parallel_workers": workers,
+            **({"repair": repair_report} if repair_report is not None else {}),
             "request_timeout_seconds": args.timeout,
             "retries": args.retries,
             "retry_delay_seconds": args.retry_delay,

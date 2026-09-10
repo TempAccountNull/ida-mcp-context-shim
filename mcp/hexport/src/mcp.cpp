@@ -18,7 +18,12 @@
   X(define_code) X(make_data) X(list_globals) \
   X(find_bytes) X(basic_blocks) X(stack_frame) X(set_op_type) X(imports) \
   X(type_apply_batch) X(repair_badcall) X(microcode) X(make_sigs) \
-  X(save_as) X(revert_decisions)
+  X(save_as) X(revert_decisions) \
+  X(declare_type) X(type_inspect) X(type_query) X(enum_upsert) X(read_struct) \
+  X(declare_stack) X(delete_stack) \
+  X(callgraph) X(func_profile) X(export_funcs) X(search_text) X(list_strings) \
+  X(get_int) X(put_int) X(int_convert) X(get_global_value) \
+  X(add_bookmark) X(append_comments)
 
 //-------------------------------------------------------------------------
 static void set_id(jobj_t &resp, const jvalue_t *id)
@@ -133,6 +138,24 @@ void Mcp::call_tool(const jobj_t &params, jvalue_t *result_out, bool *is_error, 
     case "make_sigs"_h:       cmds.make_sigs(args, result_out);        break;
     case "save_as"_h:         cmds.save_as(args, result_out);          break;
     case "revert_decisions"_h: cmds.revert_decisions(args, result_out); break;
+    case "declare_type"_h:    cmds.declare_type(args, result_out);     break;
+    case "type_inspect"_h:    cmds.type_inspect(args, result_out);     break;
+    case "type_query"_h:      cmds.type_query(args, result_out);       break;
+    case "enum_upsert"_h:     cmds.enum_upsert(args, result_out);      break;
+    case "read_struct"_h:     cmds.read_struct(args, result_out);      break;
+    case "declare_stack"_h:   cmds.declare_stack(args, result_out);    break;
+    case "delete_stack"_h:    cmds.delete_stack(args, result_out);     break;
+    case "callgraph"_h:       cmds.callgraph(args, result_out);        break;
+    case "func_profile"_h:    cmds.func_profile(args, result_out);     break;
+    case "export_funcs"_h:    cmds.export_funcs(args, result_out);     break;
+    case "search_text"_h:     cmds.search_text(args, result_out);      break;
+    case "list_strings"_h:    cmds.list_strings(args, result_out);     break;
+    case "get_int"_h:         cmds.get_int(args, result_out);          break;
+    case "put_int"_h:         cmds.put_int(args, result_out);          break;
+    case "int_convert"_h:     cmds.int_convert(args, result_out);      break;
+    case "get_global_value"_h: cmds.get_global_value(args, result_out); break;
+    case "add_bookmark"_h:    cmds.add_bookmark(args, result_out);     break;
+    case "append_comments"_h: cmds.append_comments(args, result_out);  break;
     default:
       *is_error = true;
       errmsg->sprnt("unknown tool: %s", name.c_str());
