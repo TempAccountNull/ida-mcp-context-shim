@@ -23,7 +23,8 @@
   X(declare_stack) X(delete_stack) \
   X(callgraph) X(func_profile) X(export_funcs) X(search_text) X(list_strings) \
   X(get_int) X(put_int) X(int_convert) X(get_global_value) \
-  X(add_bookmark) X(append_comments)
+  X(add_bookmark) X(append_comments) \
+  X(segments) X(exports) X(xrefs_from) X(insn_query) X(search_structs) X(stack_xrefs)
 
 //-------------------------------------------------------------------------
 static void set_id(jobj_t &resp, const jvalue_t *id)
@@ -156,6 +157,12 @@ void Mcp::call_tool(const jobj_t &params, jvalue_t *result_out, bool *is_error, 
     case "get_global_value"_h: cmds.get_global_value(args, result_out); break;
     case "add_bookmark"_h:    cmds.add_bookmark(args, result_out);     break;
     case "append_comments"_h: cmds.append_comments(args, result_out);  break;
+    case "segments"_h:        cmds.segments(args, result_out);         break;
+    case "exports"_h:         cmds.exports(args, result_out);          break;
+    case "xrefs_from"_h:      cmds.xrefs_from(args, result_out);       break;
+    case "insn_query"_h:      cmds.insn_query(args, result_out);       break;
+    case "search_structs"_h:  cmds.search_structs(args, result_out);   break;
+    case "stack_xrefs"_h:     cmds.stack_xrefs(args, result_out);      break;
     default:
       *is_error = true;
       errmsg->sprnt("unknown tool: %s", name.c_str());

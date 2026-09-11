@@ -6,6 +6,46 @@
 #include "kuser.hpp"
 
 //-------------------------------------------------------------------------
+// Every address that leaves this server goes out as "0x...". It was written out by hand in three
+// dozen places and, in one of them, with a different format specifier -- so the same address could
+// come back looking different depending on which tool answered.
+static qstring hexstr(ea_t ea)
+{
+  qstring a;
+  a.sprnt("0x%" FMT_64 "x", uint64(ea));
+  return a;
+}
+
+static void put_hex(jobj_t *o, const char *key, ea_t ea)
+{
+  o->put(key, hexstr(ea));
+}
+
+// What this function calls. Code references that leave the function body are calls; ones that stay
+// inside are branches. Written out four times before this -- in callees, callgraph, func_profile and
+// the badcall search -- and every copy had to remember the same distinction.
+static void collect_callees(const func_t *pfn, qvector<ea_t> *targets)
+{
+  if ( pfn == nullptr )
+    return;
+  for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
+  {
+    for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+    {
+      if ( t >= pfn->start_ea && t < pfn->end_ea )
+        continue;                            // stays inside: a branch, not a call
+      if ( get_func(t) != nullptr && !targets->has(t) )
+        targets->push_back(t);
+    }
+  }
+}
+
+// One named type out of the local library, or a failure the caller can read.
+static bool named_type(tinfo_t *out, const qstring &name)
+{
+  return !name.empty() && out->get_named_type(get_idati(), name.c_str());
+}
+
 static ea_t resolve_ea(const char *s)
 {
   if ( s == nullptr || *s == '\0' )
@@ -264,12 +304,9 @@ static void collect_functions(qvector<fnrow_t> &rows)
 static jobj_t *make_entry(const fnrow_t &r)
 {
   jobj_t *e = new jobj_t;
-  qstring tmp;
-  tmp.sprnt("0x%" FMT_64 "x", uint64(r.ea));
-  e->put("addr", tmp);
+  e->put("addr", hexstr(r.ea));
   e->put("name", r.name);
-  tmp.sprnt("0x%" FMT_64 "x", uint64(r.size));
-  e->put("size", tmp);
+  e->put("size", hexstr(r.size));
   return e;
 }
 
@@ -804,9 +841,7 @@ void McpCommands::define_func(const jobj_t *args, jvalue_t *out)
   result->put("created_by_call", made);
   if ( now != nullptr )
   {
-    qstring s;
-    s.sprnt("0x%" FMT_64 "x", uint64(now->end_ea));
-    result->put("end", s);
+    result->put("end", hexstr(now->end_ea));
     qstring nm;
     get_func_name(&nm, now->start_ea);
     result->put("name", nm);
@@ -913,9 +948,7 @@ void McpCommands::xrefs_to(const jobj_t *args, jvalue_t *out)
   for ( bool ok = xb.first_to(ea, XREF_ALL); ok && n < limit; ok = xb.next_to(), ++n )
   {
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(xb.from));
-    e->put("from", a);
+    e->put("from", hexstr(xb.from));
     e->put("code", xb.iscode != 0);
     e->put("type", int64(xb.type));
     qstring fn;
@@ -940,26 +973,18 @@ void McpCommands::callees(const jobj_t *args, jvalue_t *out)
     out->set_obj(result);
     return;
   }
-  // Walk the function's own instructions and take every code reference that leaves it. Cheaper and
-  // more precise than scanning all xrefs, and it keeps tail chunks out of the answer.
+  // Cheaper and more precise than scanning all xrefs, and it keeps tail chunks out of the answer.
+  qvector<ea_t> targets;
+  collect_callees(pfn, &targets);
   jarr_t *arr = new jarr_t;
-  for ( ea_t p = pfn->start_ea; p < pfn->end_ea; p = next_head(p, pfn->end_ea) )
+  for ( size_t i = 0; i < targets.size(); ++i )
   {
-    if ( p == BADADDR )
-      break;
-    for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
-    {
-      if ( t >= pfn->start_ea && t < pfn->end_ea )
-        continue;                              // stays inside: a branch, not a call
-      jobj_t *e = new jobj_t;
-      qstring a;
-      a.sprnt("0x%" FMT_64 "x", uint64(t));
-      e->put("addr", a);
-      qstring nm;
-      if ( get_func_name(&nm, t) > 0 )
-        e->put("name", nm);
-      arr->values.push_back().set_obj(e);
-    }
+    jobj_t *e = new jobj_t;
+    e->put("addr", hexstr(targets[i]));
+    qstring nm;
+    if ( get_func_name(&nm, targets[i]) > 0 )
+      e->put("name", nm);
+    arr->values.push_back().set_obj(e);
   }
   qstring fn;
   get_func_name(&fn, pfn->start_ea);
@@ -1057,9 +1082,7 @@ void McpCommands::list_globals(const jobj_t *args, jvalue_t *out)
     if ( seen++ < offset )
       continue;
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(ea));
-    e->put("addr", a);
+    e->put("addr", hexstr(ea));
     e->put("name", nm);
     arr->values.push_back().set_obj(e);
     ++emitted;
@@ -1140,9 +1163,7 @@ void McpCommands::find_bytes(const jobj_t *args, jvalue_t *out)
     if ( hit == BADADDR )
       break;
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(hit));
-    e->put("addr", a);
+    e->put("addr", hexstr(hit));
     qstring fn;
     func_t *pfn = get_func(hit);
     if ( pfn != nullptr && get_func_name(&fn, pfn->start_ea) > 0 )
@@ -1175,18 +1196,13 @@ void McpCommands::basic_blocks(const jobj_t *args, jvalue_t *out)
   {
     const qbasic_block_t &b = fc.blocks[i];
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(b.start_ea));
-    e->put("start", a);
-    a.sprnt("0x%" FMT_64 "x", uint64(b.end_ea));
-    e->put("end", a);
+    e->put("start", hexstr(b.start_ea));
+    e->put("end", hexstr(b.end_ea));
     jarr_t *succ = new jarr_t;
     for ( int k = 0; k < fc.nsucc(i); ++k )
     {
       int s = fc.succ(i, k);
-      qstring sa;
-      sa.sprnt("0x%" FMT_64 "x", uint64(fc.blocks[s].start_ea));
-      succ->values.push_back().set_str(sa.c_str());
+      succ->values.push_back().set_str(hexstr(fc.blocks[s].start_ea).c_str());
     }
     e->get_value_or_new("succs")->set_arr(succ);
     arr->values.push_back().set_obj(e);
@@ -1300,9 +1316,7 @@ void McpCommands::imports(const jobj_t *args, jvalue_t *out)
         if ( name != nullptr && (c->filter == nullptr || strstr(name, c->filter) != nullptr) )
         {
           jobj_t *e = new jobj_t;
-          qstring a;
-          a.sprnt("0x%" FMT_64 "x", uint64(ea));
-          e->put("addr", a);
+          e->put("addr", hexstr(ea));
           e->put("name", name != nullptr ? name : "");
           e->put("module", c->module != nullptr ? c->module : "");
           e->put("ordinal", int64(ord));
@@ -1553,9 +1567,7 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
     jarr_t *fs = new jarr_t;
     for ( size_t i = 0; i < failing.size(); ++i )
     {
-      qstring a;
-      a.sprnt("0x%" FMT_64 "x", uint64(failing[i]));
-      fs->values.push_back().set_str(a.c_str());
+      fs->values.push_back().set_str(hexstr(failing[i]).c_str());
     }
     result->get_value_or_new("functions")->set_arr(fs);
     out->set_obj(result);
@@ -1600,21 +1612,17 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
           if ( decompiles_now(fea) )
           {
             jobj_t *e = new jobj_t;
-            qstring a;
-            a.sprnt("0x%" FMT_64 "x", uint64(fea));
-            e->put("function", a);
+            e->put("function", hexstr(fea));
             qstring fn;
             get_func_name(&fn, fea);
             e->put("name", fn);
-            a.sprnt("0x%" FMT_64 "x", uint64(cands[c]));
-            e->put("culprit", a);
+            e->put("culprit", hexstr(cands[c]));
             qstring cn;
             get_name(&cn, cands[c]);
             e->put("culprit_name", cn);
             e->put("kind", phase == 0 ? "indirect call through a global" : "direct call");
             e->put("applied", protos[k]);
-            a.sprnt("0x%" FMT_64 "x", uint64(failing_at[i]));
-            e->put("failed_at", a);        // the call Hex-Rays named, not a guess
+            e->put("failed_at", hexstr(failing_at[i]));   // the call Hex-Rays named, not a guess
             qstring renamed;
             if ( do_rename && phase == 0 && name_as_fptr(cands[c], &renamed) )
               e->put("renamed", renamed);
@@ -1640,9 +1648,7 @@ void McpCommands::repair_badcall(const jobj_t *args, jvalue_t *out)
       continue;
     ++still;
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(failing[i]));
-    e->put("addr", a);
+    e->put("addr", hexstr(failing[i]));
     qstring fn;
     get_func_name(&fn, failing[i]);
     e->put("name", fn);
@@ -1742,9 +1748,7 @@ void McpCommands::microcode(const jobj_t *args, jvalue_t *out)
     result->put("merror_code", int64(hf.code));
     if ( hf.errea != BADADDR )
     {
-      qstring h;
-      h.sprnt("0x%" FMT_64 "x", uint64(hf.errea));
-      result->put("error_addr", h);
+      result->put("error_addr", hexstr(hf.errea));
     }
     out->set_obj(result);
     return;
@@ -1924,11 +1928,8 @@ void McpCommands::revert_decisions(const jobj_t *args, jvalue_t *out)
     auto_wait_range(start, end);
   unmute_stdout();
 
-  qstring a;
-  a.sprnt("0x%" FMT_64 "x", uint64(start));
-  result->put("start", a);
-  a.sprnt("0x%" FMT_64 "x", uint64(end));
-  result->put("end", a);
+  result->put("start", hexstr(start));
+  result->put("end", hexstr(end));
   result->put("status", "ok");
   func_t *pfn = get_func(start);
   result->put("function_after", pfn != nullptr);
@@ -1944,19 +1945,6 @@ void McpCommands::revert_decisions(const jobj_t *args, jvalue_t *out)
 //
 // IDA 9 has no separate struct/enum API any more -- both are tinfo_t in the local type library, so
 // everything here goes through get_idati().
-
-static void put_hex(jobj_t *o, const char *key, ea_t ea)
-{
-  qstring a;
-  a.sprnt("0x%" FMT_64 "x", uint64(ea));
-  o->put(key, a);
-}
-
-// One named type out of the local library, or a failure the caller can read.
-static bool named_type(tinfo_t *out, const qstring &name)
-{
-  return !name.empty() && out->get_named_type(get_idati(), name.c_str());
-}
 
 static const char *tinfo_kind(const tinfo_t &t)
 {
@@ -2552,47 +2540,32 @@ void McpCommands::callgraph(const jobj_t *args, jvalue_t *out)
       func_t *pfn = get_func(frontier[i]);
       if ( pfn == nullptr )
         continue;
-      int64 here = 0;
-      for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
+      qvector<ea_t> targets;
+      collect_callees(pfn, &targets);
+      for ( size_t k = 0; k < targets.size() && int64(k) < max_per && !truncated; ++k )
       {
-        for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
+        const ea_t to = targets[k];
+        jobj_t *e = new jobj_t;
+        e->put("from", hexstr(pfn->start_ea));
+        e->put("to", hexstr(to));
+        qstring nm;
+        if ( get_func_name(&nm, to) > 0 )
+          e->put("to_name", nm);
+        edges->values.push_back().set_obj(e);
+        if ( ++nedges >= max_edges )
         {
-          if ( t >= pfn->start_ea && t < pfn->end_ea )
-            continue;                          // internal branch, not a call
-          func_t *tf = get_func(t);
-          if ( tf == nullptr )
-            continue;
-          if ( here >= max_per )
-            break;
-          jobj_t *e = new jobj_t;
-          qstring a;
-          a.sprnt("0x%" FMT_64 "x", uint64(pfn->start_ea));
-          e->put("from", a);
-          a.sprnt("0x%" FMT_64 "x", uint64(tf->start_ea));
-          e->put("to", a);
-          qstring nm;
-          if ( get_func_name(&nm, tf->start_ea) > 0 )
-            e->put("to_name", nm);
-          edges->values.push_back().set_obj(e);
-          ++here;
-          if ( ++nedges >= max_edges )
-          {
-            truncated = true;
-            break;
-          }
-          if ( !seen.has(tf->start_ea) )
-          {
-            if ( int64(seen.size()) >= max_nodes )
-            {
-              truncated = true;
-              break;
-            }
-            seen.push_back(tf->start_ea);
-            next.push_back(tf->start_ea);
-          }
-        }
-        if ( truncated )
+          truncated = true;
           break;
+        }
+        if ( seen.has(to) )
+          continue;
+        if ( int64(seen.size()) >= max_nodes )
+        {
+          truncated = true;
+          break;
+        }
+        seen.push_back(to);
+        next.push_back(to);
       }
     }
     frontier = next;
@@ -2602,9 +2575,7 @@ void McpCommands::callgraph(const jobj_t *args, jvalue_t *out)
   for ( size_t i = 0; i < seen.size(); ++i )
   {
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(seen[i]));
-    e->put("addr", a);
+    e->put("addr", hexstr(seen[i]));
     qstring nm;
     if ( get_func_name(&nm, seen[i]) > 0 )
       e->put("name", nm);
@@ -2671,9 +2642,7 @@ void McpCommands::func_profile(const jobj_t *args, jvalue_t *out)
     if ( pfn == nullptr )
       continue;
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(pfn->start_ea));
-    e->put("addr", a);
+    e->put("addr", hexstr(pfn->start_ea));
     qstring nm;
     get_func_name(&nm, pfn->start_ea);
     e->put("name", nm);
@@ -2683,20 +2652,9 @@ void McpCommands::func_profile(const jobj_t *args, jvalue_t *out)
     fc.create("profile", pfn, pfn->start_ea, pfn->end_ea, FC_NOEXT);
     e->put("blocks", int64(fc.size()));
 
-    int64 ncallees = 0;
     qvector<ea_t> callee_list;
-    for ( ea_t p = pfn->start_ea; p < pfn->end_ea && p != BADADDR; p = next_head(p, pfn->end_ea) )
-    {
-      for ( ea_t t = get_first_cref_from(p); t != BADADDR; t = get_next_cref_from(p, t) )
-      {
-        if ( t >= pfn->start_ea && t < pfn->end_ea )
-          continue;
-        if ( get_func(t) == nullptr || callee_list.has(t) )
-          continue;
-        callee_list.push_back(t);
-        ++ncallees;
-      }
-    }
+    collect_callees(pfn, &callee_list);
+    int64 ncallees = int64(callee_list.size());
     int64 ncallers = 0;
     qvector<ea_t> caller_list;
     xrefblk_t xb;
@@ -2812,9 +2770,7 @@ void McpCommands::export_funcs(const jobj_t *args, jvalue_t *out)
   {
     func_t *pfn = get_func(addrs[i]);
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(addrs[i]));
-    e->put("addr", a);
+    e->put("addr", hexstr(addrs[i]));
     qstring nm;
     get_func_name(&nm, addrs[i]);
     e->put("name", nm);
@@ -2876,9 +2832,7 @@ void McpCommands::search_text(const jobj_t *args, jvalue_t *out)
     if ( strstr(hay.c_str(), needle.c_str()) == nullptr )
       continue;
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(p));
-    e->put("addr", a);
+    e->put("addr", hexstr(p));
     e->put("line", line);
     qstring fn;
     func_t *pfn = get_func(p);
@@ -2944,9 +2898,7 @@ void McpCommands::list_strings(const jobj_t *args, jvalue_t *out)
     if ( matched++ < offset )
       continue;
     jobj_t *e = new jobj_t;
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(si.ea));
-    e->put("addr", a);
+    e->put("addr", hexstr(si.ea));
     e->put("length", int64(si.length));
     e->put("text", text);
     arr->values.push_back().set_obj(e);
@@ -3170,9 +3122,7 @@ void McpCommands::get_global_value(const jobj_t *args, jvalue_t *out)
       outer->values.push_back().set_obj(e);
       continue;
     }
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(ea));
-    e->put("addr", a);
+    e->put("addr", hexstr(ea));
     qstring nm;
     if ( get_name(&nm, ea) > 0 )
       e->put("name", nm);
@@ -3306,6 +3256,337 @@ void McpCommands::append_comments(const jobj_t *args, jvalue_t *out)
   out->set_arr(outer);
 }
 
+// ---- the gaps ---------------------------------------------------------------------------------
+//
+// Third porting pass, and deliberately not more wrappers. Each of these answers a question hexport
+// previously could not answer at all:
+//
+//   segments      what is in this image, and where
+//   exports       what it offers outward (imports existed; its mirror did not)
+//   xrefs_from    what an address reaches (xrefs_to existed; its mirror did not)
+//   insn_query    where a given instruction occurs across the image
+//   search_structs which type has a member by this name
+//   stack_xrefs   what touches a stack slot
+//
+// The composite tools in ida-pro-mcp's set (survey_binary, analyze_component, trace_data_flow) stay
+// unported: they are these primitives glued together, and a caller gluing them chooses its own
+// limits instead of inheriting someone else's.
+
+void McpCommands::segments(const jobj_t *, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  jarr_t *arr = new jarr_t;
+  int n = get_segm_qty();
+  for ( int i = 0; i < n; ++i )
+  {
+    segment_t *s = getnseg(i);
+    if ( s == nullptr )
+      continue;
+    jobj_t *e = new jobj_t;
+    qstring nm;
+    get_segm_name(&nm, s);
+    e->put("name", nm);
+    qstring cls;
+    get_segm_class(&cls, s);
+    e->put("class", cls);
+    e->put("start", hexstr(s->start_ea));
+    e->put("end", hexstr(s->end_ea));
+    e->put("size", int64(s->end_ea - s->start_ea));
+    // Permissions as letters rather than a number: "rwx" is read at a glance, 7 is not.
+    qstring perm;
+    perm.append((s->perm & SEGPERM_READ) != 0 ? 'r' : '-');
+    perm.append((s->perm & SEGPERM_WRITE) != 0 ? 'w' : '-');
+    perm.append((s->perm & SEGPERM_EXEC) != 0 ? 'x' : '-');
+    e->put("perm", perm);
+    e->put("bitness", int64(s->abits()));
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("count", int64(n));
+  result->get_value_or_new("segments")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::exports(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  if ( !is_open )
+  {
+    result->put("error", "no database is open");
+    out->set_obj(result);
+    return;
+  }
+  qstring filter = args != nullptr ? jstr(*args, "filter") : qstring();
+  int64 limit = args != nullptr ? jint(*args, "limit", 500) : 500;
+  int64 offset = args != nullptr ? jint(*args, "offset", 0) : 0;
+
+  jarr_t *arr = new jarr_t;
+  size_t total = get_entry_qty();
+  int64 matched = 0;
+  int64 emitted = 0;
+  for ( size_t i = 0; i < total && (limit <= 0 || emitted < limit); ++i )
+  {
+    uval_t ord = get_entry_ordinal(i);
+    ea_t ea = get_entry(ord);
+    if ( ea == BADADDR )
+      continue;
+    qstring nm;
+    get_entry_name(&nm, ord);
+    if ( !filter.empty() && strstr(nm.c_str(), filter.c_str()) == nullptr )
+      continue;
+    if ( matched++ < offset )
+      continue;
+    jobj_t *e = new jobj_t;
+    e->put("addr", hexstr(ea));
+    e->put("name", nm);
+    // The ordinal is only meaningful when it is not just the address again, which is how IDA
+    // records an entry point that has no ordinal of its own.
+    if ( uint64(ord) != uint64(ea) )
+      e->put("ordinal", int64(ord));
+    e->put("is_function", get_func(ea) != nullptr);
+    arr->values.push_back().set_obj(e);
+    ++emitted;
+  }
+  result->put("total", int64(total));
+  result->put("matched", matched);
+  result->get_value_or_new("exports")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::xrefs_from(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  if ( !is_open || ea == BADADDR )
+  {
+    result->put("error", !is_open ? "no database is open" : "bad address");
+    out->set_obj(result);
+    return;
+  }
+  int64 limit = args != nullptr ? jint(*args, "limit", 200) : 200;
+  jarr_t *arr = new jarr_t;
+  xrefblk_t xb;
+  int64 n = 0;
+  for ( bool ok = xb.first_from(ea, XREF_ALL); ok && n < limit; ok = xb.next_from(), ++n )
+  {
+    jobj_t *e = new jobj_t;
+    e->put("to", hexstr(xb.to));
+    e->put("code", xb.iscode != 0);
+    e->put("type", int64(xb.type));
+    qstring nm;
+    if ( get_name(&nm, xb.to) > 0 )
+      e->put("name", nm);
+    func_t *pfn = get_func(xb.to);
+    if ( pfn != nullptr && pfn->start_ea == xb.to )
+      e->put("is_function", true);
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("addr", hexstr(ea));
+  result->put("count", n);
+  result->get_value_or_new("xrefs")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::insn_query(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring mnem = args != nullptr ? jstr(*args, "mnem") : qstring();
+  if ( !is_open || mnem.empty() )
+  {
+    result->put("error", !is_open ? "no database is open" : "mnem is required (e.g. \"wrmsr\")");
+    out->set_obj(result);
+    return;
+  }
+  // Mnemonics are matched case-insensitively and exactly. A substring match would make "mov" also
+  // report "movzx" and "movsd", which is never what someone hunting a specific instruction wants.
+  lower_in_place(&mnem);
+  qstring operand = args != nullptr ? jstr(*args, "operand") : qstring();
+  lower_in_place(&operand);
+  int64 limit = args != nullptr ? jint(*args, "limit", 200) : 200;
+  qstring s_start = args != nullptr ? jstr(*args, "start") : qstring();
+  qstring s_end = args != nullptr ? jstr(*args, "end") : qstring();
+  ea_t lo = s_start.empty() ? inf_get_min_ea() : resolve_ea(s_start.c_str());
+  ea_t hi = s_end.empty() ? inf_get_max_ea() : resolve_ea(s_end.c_str());
+  if ( lo == BADADDR )
+    lo = inf_get_min_ea();
+  if ( hi == BADADDR )
+    hi = inf_get_max_ea();
+
+  jarr_t *arr = new jarr_t;
+  int64 hits = 0;
+  int64 scanned = 0;
+  for ( ea_t p = lo; p < hi && p != BADADDR && hits < limit; p = next_head(p, hi) )
+  {
+    if ( !is_code(get_flags(p)) )
+      continue;
+    ++scanned;
+    qstring m;
+    if ( !print_insn_mnem(&m, p) )
+      continue;
+    lower_in_place(&m);
+    if ( m != mnem )
+      continue;
+    qstring line;
+    generate_disasm_line(&line, p, GENDSM_REMOVE_TAGS);
+    if ( !operand.empty() )
+    {
+      qstring hay = line;
+      lower_in_place(&hay);
+      if ( strstr(hay.c_str(), operand.c_str()) == nullptr )
+        continue;
+    }
+    jobj_t *e = new jobj_t;
+    e->put("addr", hexstr(p));
+    e->put("line", line);
+    func_t *pfn = get_func(p);
+    if ( pfn != nullptr )
+    {
+      qstring fn;
+      if ( get_func_name(&fn, pfn->start_ea) > 0 )
+        e->put("function", fn);
+    }
+    arr->values.push_back().set_obj(e);
+    ++hits;
+  }
+  result->put("mnem", mnem);
+  result->put("hits", hits);
+  result->put("instructions_scanned", scanned);
+  result->put("truncated", hits >= limit);
+  result->get_value_or_new("results")->set_arr(arr);
+  out->set_obj(result);
+}
+
+void McpCommands::search_structs(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  qstring member = args != nullptr ? jstr(*args, "member") : qstring();
+  if ( !is_open || member.empty() )
+  {
+    result->put("error", !is_open ? "no database is open"
+                                  : "member is required (the field name to look for)");
+    out->set_obj(result);
+    return;
+  }
+  // type_query filters on the TYPE's name. This filters on member names, which is the question you
+  // have when a field turns up in pseudocode and you do not know which struct it belongs to.
+  int64 limit = args != nullptr ? jint(*args, "limit", 100) : 100;
+  const bool exact = args != nullptr ? jbool(*args, "exact", false) : false;
+
+  jarr_t *arr = new jarr_t;
+  const til_t *til = get_idati();
+  uint32 ord_limit = get_ordinal_limit(til);
+  int64 hits = 0;
+  int64 types_scanned = 0;
+  for ( uint32 ord = 1; ord < ord_limit && hits < limit; ++ord )
+  {
+    const char *tn = get_numbered_type_name(til, ord);
+    if ( tn == nullptr )
+      continue;
+    tinfo_t tif;
+    if ( !tif.get_numbered_type(til, ord) || !tif.is_udt() )
+      continue;
+    ++types_scanned;
+    udt_type_data_t udt;
+    if ( !tif.get_udt_details(&udt) )
+      continue;
+    for ( size_t k = 0; k < udt.size() && hits < limit; ++k )
+    {
+      const udm_t &m = udt[k];
+      bool match = exact ? (m.name == member)
+                         : strstr(m.name.c_str(), member.c_str()) != nullptr;
+      if ( !match )
+        continue;
+      jobj_t *e = new jobj_t;
+      e->put("type", tn);
+      e->put("member", m.name);
+      e->put("offset", int64(m.offset / 8));
+      e->put("size", int64(m.size / 8));
+      qstring ts;
+      m.type.print(&ts);
+      e->put("member_type", ts);
+      arr->values.push_back().set_obj(e);
+      ++hits;
+    }
+  }
+  result->put("member", member);
+  result->put("hits", hits);
+  result->put("types_scanned", types_scanned);
+  result->put("truncated", hits >= limit);
+  result->get_value_or_new("results")->set_arr(arr);
+  out->set_obj(result);
+}
+
+// ida-pro-mcp's xrefs_to_field covers struct fields generally. IDA 9 moved structures into tinfo_t
+// and there is no exported equivalent for a global struct member, so that stays unported -- but the
+// STACK frame case does have one, build_stkvar_xrefs_ea, and it is the case that actually comes up:
+// "what touches this local?". Named for what it really does rather than borrowing a name for a
+// wider promise it cannot keep.
+void McpCommands::stack_xrefs(const jobj_t *args, jvalue_t *out)
+{
+  jobj_t *result = new jobj_t;
+  ea_t fea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
+  func_t *pfn = fea != BADADDR ? get_func(fea) : nullptr;
+  qstring name = args != nullptr ? jstr(*args, "name") : qstring();
+  tinfo_t frame;
+  if ( !is_open || pfn == nullptr || name.empty() || !get_func_frame_ea(&frame, pfn->start_ea) )
+  {
+    result->put("error", !is_open ? "no database is open"
+                       : pfn == nullptr ? "no function at address"
+                       : name.empty() ? "name is required (the stack variable)"
+                                      : "this function has no frame");
+    out->set_obj(result);
+    return;
+  }
+  udt_type_data_t udt;
+  uint64 lo = 0, hi = 0;
+  bool found = false;
+  if ( frame.get_udt_details(&udt) )
+  {
+    for ( size_t k = 0; k < udt.size(); ++k )
+    {
+      if ( udt[k].name == name )
+      {
+        lo = udt[k].offset / 8;
+        hi = lo + (udt[k].size / 8);
+        found = true;
+        break;
+      }
+    }
+  }
+  if ( !found )
+  {
+    result->put("error", "no stack variable with that name");
+    out->set_obj(result);
+    return;
+  }
+
+  xreflist_t xl;
+  build_stkvar_xrefs_ea(&xl, pfn->start_ea, uval_t(lo), uval_t(hi > lo ? hi : lo + 1));
+
+  jarr_t *arr = new jarr_t;
+  for ( size_t i = 0; i < xl.size(); ++i )
+  {
+    jobj_t *e = new jobj_t;
+    e->put("addr", hexstr(xl[i].ea));
+    e->put("operand", int64(xl[i].opnum));
+    e->put("type", int64(xl[i].type));
+    qstring line;
+    if ( generate_disasm_line(&line, xl[i].ea, GENDSM_REMOVE_TAGS) )
+      e->put("line", line);
+    arr->values.push_back().set_obj(e);
+  }
+  result->put("name", name);
+  result->put("offset", int64(lo));
+  result->put("count", int64(xl.size()));
+  result->get_value_or_new("xrefs")->set_arr(arr);
+  out->set_obj(result);
+}
+
 void McpCommands::decompile(const jobj_t *args, jvalue_t *out)
 {
   ea_t ea = resolve_ea(args != nullptr ? jstr(*args, "addr").c_str() : "");
@@ -3336,9 +3617,7 @@ void McpCommands::decompile(const jobj_t *args, jvalue_t *out)
     result->put("merror_code", int64(merr));
     if ( errea != BADADDR )
     {
-      qstring hex;
-      hex.sprnt("0x%a", errea);
-      result->put("error_addr", hex);
+      result->put("error_addr", hexstr(errea));
     }
   }
   else
@@ -3369,9 +3648,7 @@ void McpCommands::analyze_batch(const jvalue_t *queries, jvalue_t *out)
     }
     qstring name;
     get_func_name(&name, pfn->start_ea);
-    qstring a;
-    a.sprnt("0x%" FMT_64 "x", uint64(pfn->start_ea));
-    item->put("addr", a);
+    item->put("addr", hexstr(pfn->start_ea));
     item->put("name", name);
     ++processed;
 
@@ -3410,9 +3687,7 @@ void McpCommands::analyze_batch(const jvalue_t *queries, jvalue_t *out)
         analysis->put("decompile_merror", int64(merr));
         if ( errea != BADADDR )
         {
-          qstring eh;
-          eh.sprnt("0x%" FMT_64 "x", uint64(errea));
-          analysis->put("decompile_error_addr", eh);
+          analysis->put("decompile_error_addr", hexstr(errea));
         }
       }
       else
@@ -3457,9 +3732,7 @@ void McpCommands::lookup_funcs(const jvalue_t *queries, jvalue_t *out)
       qstring name;
       get_func_name(&name, pfn->start_ea);
       jobj_t *fn = new jobj_t;
-      qstring a;
-      a.sprnt("0x%" FMT_64 "x", uint64(pfn->start_ea));
-      fn->put("addr", a);
+      fn->put("addr", hexstr(pfn->start_ea));
       fn->put("name", name);
       entry->put("fn", fn);
     }

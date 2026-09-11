@@ -1,6 +1,6 @@
 # Porting the rest of the ida-pro-mcp tools
 
-hexport went from 37 tools to 55. This records what was ported, what was deliberately not, and why
+hexport went from 37 tools to 61, in three passes. This records what was ported, what was deliberately not, and why
 — because "we skipped it" and "we forgot it" look identical six months later.
 
 Schemas came from the live ida-pro-mcp servers rather than from guesswork, so argument names and
@@ -69,3 +69,76 @@ an error check and is useless.
 `save=false`.
 
 `test_hexport.ps1`: 40 passed, 0 failed.
+
+---
+
+# Third pass: the gaps (6)
+
+Deliberately not more wrappers. Each of these answers a question hexport could not answer at all.
+Three of them are the missing halves of tools that already existed, which is the kind of gap that
+hides in plain sight — you notice `imports` and never notice there is no `exports`.
+
+| tool | the gap it closes |
+|---|---|
+| `segments` | there was no way to ask what is in the image or where. Permissions come back as `rwx` letters, not a number: `r-x` reads at a glance, `5` does not. |
+| `exports` | `imports` existed; its mirror did not. Reports the ordinal only when it is not just the address repeated, which is how IDA records an entry point that has no ordinal of its own. |
+| `xrefs_from` | `xrefs_to` existed; its mirror did not. Per-**address**, exactly like `xrefs_to` — for a whole function's outward edges the tool is `callees`. |
+| `insn_query` | "where does this image use `wrmsr`?" was unanswerable. Mnemonics match **exactly** and case-insensitively; a substring match would make `mov` also report `movzx` and `movsd`. |
+| `search_structs` | `type_query` filters on the *type's* name. This filters on *member* names — the question you have when a field shows up in pseudocode and you do not know which struct owns it. |
+| `stack_xrefs` | what touches a given local. |
+
+## Why `stack_xrefs` and not `xrefs_to_field`
+
+ida-pro-mcp's `xrefs_to_field` covers struct fields in general. IDA 9 moved structures into `tinfo_t`
+and exports no equivalent for a global struct member, so that promise cannot be kept here.
+
+The **stack frame** case does have an exported API (`build_stkvar_xrefs_ea`) and is the case that
+actually comes up. So it ships under its own name rather than borrowing a wider one it could not
+honour. A tool named for more than it does is worse than a missing tool.
+
+## Still not ported, unchanged
+
+`patch_asm` (no assembler is exported), `py_eval`/`py_exec_file` (no interpreter, by design),
+`idb_save` (saves in place), `open_file`/`list_instances`/`select_instance` (different process
+model), the signature-generation variants (no pattern generator exported), and the composites —
+`survey_binary`, `analyze_component`, `analyze_function`, `trace_data_flow`, `diff_before_after`,
+`find_xref_signatures`. Those last are these primitives glued together, and a caller doing the
+gluing picks its own limits instead of inheriting someone else's.
+
+## Measured
+
+`tools/test_gaps.py`, on a copy of the 60-function fixture. 16 checks, all passing.
+
+The one that matters most is the round trip, because it tests two tools against each other rather
+than against my expectations:
+
+```
+xrefs_from resolves a call site to its target     PASS   0x14000102f -> _set_app_type
+xrefs_from and xrefs_to agree on the same edge    PASS   0x14000102f -> 0x140001ab2 and back
+segments lists the image's sections               PASS   5: ['.text', '.idata', '.rdata', '.data', '.pdata']
+.text is present and executable                   PASS   perm 'r-x', 64-bit
+insn_query matches mnemonics exactly              PASS   100 mov hits, none of them movzx/movsd
+search_structs reports the offset in bytes        PASS   hx_probe_t.beta_field at 4
+stack_xrefs rejects an unknown variable by name   PASS
+```
+
+**A test bug worth recording.** The first version of the round-trip check asked `xrefs_from` for a
+function's start address and expected the function's outward calls. It got one reference and failed.
+The tool was right and the test was wrong: a function start is a single instruction, and
+`xrefs_from` is per-address by design. The fix was to find a real call site with `insn_query` first —
+which makes it a better test, since it now exercises three tools against each other.
+
+# Duplication removed
+
+- **`repair_types.py` deleted.** The `repair_badcall` tool does the same job in-session, recovers 38
+  of 38 where the script managed 37, needs no database copies, and cannot write to disk. Keeping a
+  strictly worse second path only invites someone to run it.
+- **One hex formatter.** 29 hand-rolled `sprnt("0x%" FMT_64 "x", uint64(ea))` sites, plus one lone
+  `"0x%a"` that formatted the same thing differently — so the same address could come back looking
+  different depending on which tool answered. Now `hexstr(ea)`.
+- **One call-target walk.** `callees`, `callgraph`, `func_profile` and the badcall search each had
+  their own copy of "walk the instructions, take the code refs that leave the function", and every
+  copy had to independently remember that an internal branch is not a call. Now `collect_callees()`.
+
+`mcp_commands.cpp`: 3,535 → 3,291 lines, with six new tools added in the same span. All three suites
+pass unchanged, which is the point — a dedupe that changes behaviour is a rewrite.

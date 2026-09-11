@@ -69,6 +69,12 @@ public:
   void get_global_value(const jobj_t *args, jvalue_t *out);
   void add_bookmark(const jobj_t *args, jvalue_t *out);
   void append_comments(const jobj_t *args, jvalue_t *out);
+  void segments(const jobj_t *args, jvalue_t *out);
+  void exports(const jobj_t *args, jvalue_t *out);
+  void xrefs_from(const jobj_t *args, jvalue_t *out);
+  void insn_query(const jobj_t *args, jvalue_t *out);
+  void search_structs(const jobj_t *args, jvalue_t *out);
+  void stack_xrefs(const jobj_t *args, jvalue_t *out);
 
 private:
   bool badcall_at(ea_t fea, ea_t *errea);
